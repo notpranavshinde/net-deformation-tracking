@@ -123,7 +123,7 @@ Useful calibration flags:
 ```text
 --scale 1.0              processing scale; must match between mono, stereo, and rectify
 --cols 8 --rows 6        checkerboard inner-corner count for the current board
---square-mm 25.0         checker square size
+--square-mm 40.0         checker square size
 --workers 16             multiprocessing workers for stats-index reuse paths
 --reuse-stats-indices    reuse positive detections from stats for faster mono/stereo
 --use-cuda               use OpenCV CUDA where supported, with CPU fallback
