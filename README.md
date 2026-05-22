@@ -13,14 +13,55 @@ folders as needed. Do not commit raw recordings.
 
 ## Environment
 
-Core pipeline dependencies:
+Use Python 3.11. This is the version the current SAM2 workflow has been tested
+with locally.
+
+### Windows
+
+From an Anaconda/Miniconda PowerShell:
 
 ```powershell
-pip install opencv-python numpy tqdm scipy scikit-image pandas
+conda create -n sam2py311 python=3.11 -y
+conda activate sam2py311
+python -m pip install --upgrade pip
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
+pip install opencv-python numpy tqdm scipy scikit-image pandas matplotlib pillow hydra-core iopath huggingface_hub
+cd sam2\sam2
+pip install -e .
 ```
 
-SAM2 runs need a PyTorch/CUDA environment and SAM2 model weights available
-locally. Model weights are intentionally not tracked in Git.
+Optional but recommended for faster frame extraction:
+
+```powershell
+winget install Gyan.FFmpeg
+```
+
+### Linux
+
+From a terminal:
+
+```bash
+conda create -n sam2py311 python=3.11 -y
+conda activate sam2py311
+python -m pip install --upgrade pip
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
+pip install opencv-python numpy tqdm scipy scikit-image pandas matplotlib pillow hydra-core iopath huggingface_hub
+cd sam2/sam2
+pip install -e .
+```
+
+Optional but recommended for faster frame extraction:
+
+```bash
+sudo apt update
+sudo apt install -y ffmpeg
+```
+
+SAM2 model weights are not tracked in Git. The SAM2 scripts use Hugging Face
+`from_pretrained(...)`, so weights should download automatically on the first
+run and then stay cached on that machine. DINO external repos are also not
+tracked; the DINO prompt scripts need their separate setup again if you return
+to them later.
 
 ## Calibration
 
