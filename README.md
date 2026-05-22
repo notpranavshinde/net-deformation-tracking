@@ -76,9 +76,9 @@ Then run from `calibration`:
 
 ```powershell
 python .\stereo_checker_debug.py sync --sync-mode audio
-python .\stereo_checker_debug.py stats --step 50 --max-scan 1000 --cols 8 --rows 6 --workers 16
-python .\stereo_checker_debug.py mono --step 2 --max-scan 10000 --cols 8 --rows 6 --reuse-stats-indices --workers 16
-python .\stereo_checker_debug.py stereo --step 25 --max-pairs 50 --cols 8 --rows 6 --reuse-stats-indices --workers 16
+python .\stereo_checker_debug.py stats --step 50 --max-scan 1000 --cols 9 --rows 7 --workers 16
+python .\stereo_checker_debug.py mono --max-scan 100 --cols 9 --rows 7 --reuse-stats-indices --workers 16
+python .\stereo_checker_debug.py stereo --max-pairs 50 --cols 9 --rows 7 --reuse-stats-indices --workers 16
 python .\stereo_checker_debug.py rectify --frame-offset 150 --alpha 0.2
 ```
 
@@ -86,10 +86,21 @@ Linux uses the same arguments with `/` paths:
 
 ```bash
 python stereo_checker_debug.py sync --sync-mode audio
-python stereo_checker_debug.py stats --step 50 --max-scan 1000 --cols 8 --rows 6 --workers 16
-python stereo_checker_debug.py mono --step 2 --max-scan 10000 --cols 8 --rows 6 --reuse-stats-indices --workers 16
-python stereo_checker_debug.py stereo --step 25 --max-pairs 50 --cols 8 --rows 6 --reuse-stats-indices --workers 16
+python stereo_checker_debug.py stats --step 50 --max-scan 1000 --cols 9 --rows 7 --workers 16
+python stereo_checker_debug.py mono --max-scan 100 --cols 9 --rows 7 --reuse-stats-indices --workers 16
+python stereo_checker_debug.py stereo --max-pairs 50 --cols 9 --rows 7 --reuse-stats-indices --workers 16
 python stereo_checker_debug.py rectify --frame-offset 150 --alpha 0.2
+```
+
+If you want stats to scan every frame instead of adaptively narrowing around
+detections, use the same worker count explicitly:
+
+```powershell
+python .\stereo_checker_debug.py stats --step 1 --max-scan 100000 --cols 9 --rows 7 --workers 16 --no-adaptive
+```
+
+```bash
+python stereo_checker_debug.py stats --step 1 --max-scan 100000 --cols 9 --rows 7 --workers 16 --no-adaptive
 ```
 
 By default, `stereo_checker_debug.py` uses:
@@ -126,12 +137,17 @@ Useful calibration flags:
 
 ```text
 --scale 1.0              processing scale; must match between mono, stereo, and rectify
---cols 8 --rows 6        checkerboard inner-corner count for the current board
+--cols 9 --rows 7        checkerboard inner-corner count for the current board
 --square-mm 40.0         checker square size
 --workers 16             worker processes for stats, mono reuse, and stereo reuse paths
 --reuse-stats-indices    reuse positive detections from stats for faster mono/stereo
 --use-cuda               use OpenCV CUDA where supported, with CPU fallback
 ```
+
+In the recommended workflow, `--step` is only used by `stats`. When `mono` or
+`stereo` are run with `--reuse-stats-indices`, they use the positive detections
+from `work/stats` instead of scanning by step. If you run `mono` or `stereo`
+without `--reuse-stats-indices`, then `--step` matters again.
 
 `stats`, `mono`, and `stereo` use Rich progress bars. Left and right detection
 show separate progress where they run in parallel.
@@ -182,6 +198,7 @@ From the repository root:
 python .\triangulation\points_to_3d.py
 python .\triangulation\points_to_3d.py --visualize
 python .\triangulation\points_to_3d.py --visualize --workers 16 --viz-encoder auto
+python .\triangulation\points_to_3d.py --viz-only --visualize --workers 16
 python .\triangulation\points_to_3d.py --sync-mode audio --visualize --workers 16
 ```
 
@@ -200,6 +217,7 @@ Useful triangulation flags:
 --quality-min 0.0       minimum 2D track quality before triangulation
 --max-reproj 20.0       maximum mean reprojection error in pixels
 --visualize             write verification videos
+--viz-only              visualize existing --out-csv without triangulating again
 --viz-mode scene        scene writes *_left.mp4, *_iso.mp4, and *_topdown.mp4
 --workers 0             scene visualization workers; 0=auto CPU count
 --viz-encoder auto      auto chooses NVENC when ffmpeg is present, else mp4v

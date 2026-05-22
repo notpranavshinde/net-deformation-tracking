@@ -1,4 +1,4 @@
-"""
+r"""
 Triangulate SAM2 2D tracks into 3D points using stereo calibration.
 
 Pipeline context:
@@ -80,9 +80,17 @@ python points_to_3d.py \
     --out-csv work/tracks_3d.csv \
     --out-summary work/triang_summary.json
 
+5) Visualization only from an existing triangulated CSV
+python points_to_3d.py \
+    --viz-only \
+    --visualize \
+    --out-csv triangulation/out/triangulated_3d.csv \
+    --left-video sam2/sam2/in/left.mp4 \
+    --viz-out triangulation/out/triangulated_3d_viz.mp4
+
     python .\triangulation\points_to_3d.py --stereo .\calibration\work\stereo.npz --left .\sam2\sam2\out\left\trals_2d_left.csv --right .\sam2\sam2\out\right\tracks_2d_right.csv --left-video .\sam2\sam2\in\left.MP4 --right-video .\sam2\sam2\in\right.MP4 --sync-mode audio --visualize --viz-out .\triangulation\out\3d_out.mp4 --viz-max-frames 10000 --out-csv .\triangulation\out\triangulated_3d.csv --out-summary .\triangulation\out\summary.json
 
-5) Manual sync (if you already know drops)
+6) Manual sync (if you already know drops)
 python points_to_3d.py \
     --stereo work/stereo.npz \
     --left sam2/tracks_L.csv \
@@ -126,6 +134,9 @@ KEY FLAGS
 --visualize / --viz-out / --viz-max-frames:
     Generate side-by-side left/right verification video with observed points,
     reprojected points, per-object depth (Z), and reprojection error.
+
+--viz-only:
+    Skip triangulation and render visualization from an existing --out-csv.
 
 --workers:
     Worker processes for scene visualization iso/topdown rendering. 0=auto.
@@ -476,20 +487,26 @@ def depth_to_bgr(z: float, z_min: float, z_max: float):
     return (int(rgb[2]), int(rgb[1]), int(rgb[0]))
 
 
-def draw_colorbar(img: np.ndarray, z_min: float, z_max: float,
-                  x: int, y: int, w: int = 18, h: int = 180):
+def draw_value_colorbar(img: np.ndarray, value_min: float, value_max: float,
+                        x: int, y: int, w: int = 18, h: int = 180,
+                        label: str = "value"):
     for i in range(h):
         t = 1.0 - (i / max(h - 1, 1))
-        z = z_min + t * (z_max - z_min)
-        col = depth_to_bgr(z, z_min, z_max)
+        value = value_min + t * (value_max - value_min)
+        col = depth_to_bgr(value, value_min, value_max)
         cv2.rectangle(img, (x, y + i), (x + w, y + i + 1), col, -1)
     cv2.rectangle(img, (x, y), (x + w, y + h), (255, 255, 255), 1)
-    cv2.putText(img, f"Z={z_max:.2f}", (x + w + 6, y + 12),
+    cv2.putText(img, f"{value_max:.3f}", (x + w + 6, y + 12),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
-    cv2.putText(img, f"Z={z_min:.2f}", (x + w + 6, y + h),
+    cv2.putText(img, f"{value_min:.3f}", (x + w + 6, y + h),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
-    cv2.putText(img, "depth", (x - 4, y - 8),
+    cv2.putText(img, label, (x - 4, y - 8),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
+
+
+def draw_colorbar(img: np.ndarray, z_min: float, z_max: float,
+                  x: int, y: int, w: int = 18, h: int = 180):
+    draw_value_colorbar(img, z_min, z_max, x, y, w=w, h=h, label="depth")
 
 
 def draw_cross(img: np.ndarray, x: int, y: int, color, size: int = 6, thickness: int = 2):
@@ -597,19 +614,27 @@ def create_3d_visualization_video(out_rows: list,
 
 
 _WORKER = {}
+VIZ_CMAP = "viridis"
 
 
-def _worker_init(kind, w, h, x_lim, y_lim, z_lim, z_min, z_max):
+def _worker_init(kind, w, h, x_lim, y_lim, z_lim, z_min, z_max, disp_max, iso_azim):
     """Initialize a reusable matplotlib figure inside each worker process."""
     import matplotlib
     matplotlib.use("Agg", force=True)
     import matplotlib.pyplot as plt
+    from matplotlib import cm, colors
     from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
 
     dpi = 100
-    fig = plt.figure(figsize=(w / dpi, h / dpi), dpi=dpi, facecolor="black")
+    disp_max = max(float(disp_max), 1e-9)
+    norm = colors.Normalize(vmin=0.0, vmax=disp_max)
+    cmap = plt.get_cmap(VIZ_CMAP)
+    sm = cm.ScalarMappable(norm=norm, cmap=cmap)
+    sm.set_array([])
+
+    fig = plt.figure(figsize=(w / dpi, h / dpi), dpi=dpi, facecolor="white")
     if kind == "iso":
-        ax = fig.add_subplot(111, projection="3d", facecolor="black")
+        ax = fig.add_subplot(111, projection="3d", facecolor="white")
         x_lo, x_hi = x_lim
         y_lo, y_hi = y_lim
         z_lo, z_hi = z_lim
@@ -617,44 +642,66 @@ def _worker_init(kind, w, h, x_lim, y_lim, z_lim, z_min, z_max):
         ax.set_ylim(y_lo, y_hi)
         ax.set_zlim(z_lo, z_hi)
         ax.set_box_aspect((x_hi - x_lo, y_hi - y_lo, z_hi - z_lo))
-        ax.set_xlabel("X", color="w", fontsize=22, labelpad=18)
-        ax.set_ylabel("Y", color="w", fontsize=22, labelpad=18)
-        ax.set_zlabel("Z (depth)", color="w", fontsize=22, labelpad=18)
-        ax.tick_params(colors="w", labelsize=18)
-        ax.view_init(elev=30, azim=-60)
+        ax.set_xlabel("x (m)", color="black", fontsize=22, labelpad=18)
+        ax.set_ylabel("y (m)", color="black", fontsize=22, labelpad=18)
+        ax.set_zlabel("z (m)", color="black", fontsize=22, labelpad=18)
+        ax.tick_params(colors="black", labelsize=18)
+        ax.view_init(elev=30, azim=float(iso_azim))
         for axis in (ax.xaxis, ax.yaxis, ax.zaxis):
-            axis.pane.set_facecolor((0, 0, 0, 0))
-            axis.pane.set_edgecolor((0.35, 0.35, 0.35, 1))
-        scatter = ax.scatter([], [], [], s=120, depthshade=True,
-                             edgecolors="white", linewidths=0.8)
-        fig.subplots_adjust(left=0.02, right=0.98, top=0.98, bottom=0.04)
+            axis.pane.set_facecolor((1, 1, 1, 1))
+            axis.pane.set_edgecolor((0.75, 0.75, 0.75, 1))
+            axis._axinfo["grid"]["color"] = (0.78, 0.78, 0.78, 1)
+            axis._axinfo["grid"]["linewidth"] = 1.0
+        ax.grid(True)
+        yy, zz = np.meshgrid(
+            np.linspace(y_lo, y_hi, 2),
+            np.linspace(z_lo, z_hi, 2),
+        )
+        xx = np.zeros_like(yy)
+        ax.plot_surface(
+            xx, yy, zz,
+            color=(0.86, 0.86, 0.86, 0.25),
+            edgecolor=(0.50, 0.50, 0.50, 0.80),
+            linewidth=1.0,
+            shade=False,
+            alpha=0.25,
+            zorder=0,
+        )
+        scatter = ax.scatter([], [], [], s=88, c=[], cmap=cmap, norm=norm,
+                             depthshade=False, edgecolors="black", linewidths=0.25)
+        cbar = fig.colorbar(sm, ax=ax, fraction=0.035, pad=0.05)
+        cbar.set_label("|Δpos from t0| (m)", color="black", fontsize=18)
+        cbar.ax.tick_params(colors="black", labelsize=14)
+        fig.subplots_adjust(left=0.02, right=0.94, top=0.98, bottom=0.04)
     else:
-        ax = fig.add_subplot(111, facecolor="black")
+        ax = fig.add_subplot(111, facecolor="white")
         ax.set_xlim(x_lim)
         ax.set_ylim(z_lim)
         ax.set_aspect("equal", adjustable="box")
-        ax.set_xlabel("X", color="w", fontsize=26, labelpad=14)
-        ax.set_ylabel("Z (depth, toward camera = small)", color="w", fontsize=24, labelpad=14)
-        ax.tick_params(colors="w", labelsize=20, width=1.5, length=7)
-        ax.grid(True, color=(0.3, 0.3, 0.3), linestyle=":", linewidth=0.8)
+        ax.set_xlabel("")
+        ax.set_ylabel("z (m)", color="black", fontsize=24, labelpad=14)
+        ax.xaxis.tick_top()
+        ax.text(0.0, 1.08, "x (m)", transform=ax.transAxes,
+                color="black", fontsize=26, ha="left", va="bottom")
+        ax.yaxis.tick_right()
+        ax.yaxis.set_label_position("right")
+        ax.tick_params(colors="black", labelsize=20, width=1.5, length=7)
+        ax.grid(True, color=(0.78, 0.78, 0.78), linestyle="-", linewidth=1.0)
+        ax.axvline(0.0, color=(0.45, 0.45, 0.45), linestyle="--", linewidth=1.5)
         for spine in ax.spines.values():
-            spine.set_color("w")
+            spine.set_color("black")
             spine.set_linewidth(1.5)
-        scatter = ax.scatter([], [], s=110, edgecolors="white", linewidths=0.8)
-        fig.subplots_adjust(left=0.10, right=0.98, top=0.96, bottom=0.10)
+        scatter = ax.scatter([], [], s=88, c=[], cmap=cmap, norm=norm,
+                             edgecolors="black", linewidths=0.25)
+        cbar = fig.colorbar(sm, ax=ax, fraction=0.035, pad=0.08)
+        cbar.set_label("|Δpos from t0| (m)", color="black", fontsize=18)
+        cbar.ax.tick_params(colors="black", labelsize=14)
+        fig.subplots_adjust(left=0.10, right=0.90, top=0.90, bottom=0.10)
 
     _WORKER.update(dict(
         kind=kind, fig=fig, ax=ax, scatter=scatter,
-        w=w, h=h, z_min=z_min, z_max=z_max,
+        w=w, h=h, cmap=cmap, norm=norm,
     ))
-
-
-def _rgb_from_z(zs, z_min, z_max):
-    out = np.empty((len(zs), 3), dtype=np.float32)
-    for i, z in enumerate(zs):
-        b, g, r = depth_to_bgr(float(z), z_min, z_max)
-        out[i] = (r / 255.0, g / 255.0, b / 255.0)
-    return out
 
 
 def _has_ffmpeg():
@@ -700,25 +747,26 @@ def _draw_chunk(args):
     scatter = _WORKER["scatter"]
     w = _WORKER["w"]
     h = _WORKER["h"]
-    z_min = _WORKER["z_min"]
-    z_max = _WORKER["z_max"]
+    cmap = _WORKER["cmap"]
+    norm = _WORKER["norm"]
 
     writer = _open_writer(segment_path, fps, w, h, encoder)
 
-    for fid, (Xs, Ys, Zs) in zip(frame_ids, chunk_xyz):
-        rgb = _rgb_from_z(Zs, z_min, z_max) if len(Zs) > 0 else np.zeros((0, 3), dtype=np.float32)
-
+    for fid, (Xs, Ys, Zs, Ds) in zip(frame_ids, chunk_xyz):
+        colors = cmap(norm(Ds)) if len(Ds) > 0 else np.zeros((0, 4), dtype=np.float32)
         if kind == "iso":
             scatter._offsets3d = (Xs, Ys, Zs)
-            scatter.set_facecolor(rgb)
-            scatter.set_edgecolor("white")
+            scatter.set_array(np.asarray(Ds, dtype=np.float64))
+            scatter.set_facecolor(colors)
+            scatter.set_edgecolor(colors)
         else:
             if len(Xs) > 0:
                 scatter.set_offsets(np.column_stack([Xs, Zs]))
             else:
                 scatter.set_offsets(np.zeros((0, 2)))
-            scatter.set_facecolor(rgb)
-            scatter.set_edgecolor("white")
+            scatter.set_array(np.asarray(Ds, dtype=np.float64))
+            scatter.set_facecolor(colors)
+            scatter.set_edgecolor(colors)
 
         fig.canvas.draw()
         buf = np.frombuffer(fig.canvas.buffer_rgba(), dtype=np.uint8)
@@ -728,13 +776,126 @@ def _draw_chunk(args):
         if img.shape[1] != w or img.shape[0] != h:
             img = cv2.resize(img, (w, h))
 
-        title = "3D isometric" if kind == "iso" else "Top-down (X vs Z)"
+        title = "Local net frame: out-of-plane x" if kind == "iso" else "Top-down: x deformation vs z"
         cv2.putText(img, f"{title}  frame={fid}", (24, 40),
-                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2)
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, (20, 20, 20), 2)
         _writer_write(writer, img)
 
     _writer_close(writer)
     return segment_path
+
+
+def _reference_positions(valid_rows):
+    refs = {}
+    for r in sorted(valid_rows, key=lambda row: (int(row["frame_L"]), int(row["obj_id"]))):
+        obj_id = int(r["obj_id"])
+        if obj_id not in refs:
+            refs[obj_id] = np.array([float(r["X"]), float(r["Y"]), float(r["Z"])], dtype=np.float64)
+    return refs
+
+
+def _attach_displacements(valid_rows):
+    refs = _reference_positions(valid_rows)
+    by_obj = {}
+    disp_max = 0.0
+    for r in valid_rows:
+        obj_id = int(r["obj_id"])
+        xyz = np.array([float(r["X"]), float(r["Y"]), float(r["Z"])], dtype=np.float64)
+        disp = float(np.linalg.norm(xyz - refs[obj_id]))
+        r["_disp_m"] = disp
+        by_obj.setdefault(obj_id, []).append(disp)
+        disp_max = max(disp_max, disp)
+
+    motion = {obj_id: float(np.percentile(vals, 95)) for obj_id, vals in by_obj.items()}
+    if not motion:
+        return refs, set(), max(disp_max, 1e-9)
+    cutoff = float(np.percentile(list(motion.values()), 15))
+    fixed_ids = {obj_id for obj_id, value in motion.items() if value <= cutoff}
+    return refs, fixed_ids, max(disp_max, 1e-9)
+
+
+def _build_net_reference_frame(refs, fixed_ids):
+    ref_items = sorted(refs.items())
+    ref_xyz = np.array([xyz for _obj_id, xyz in ref_items], dtype=np.float64)
+    origin = ref_xyz.mean(axis=0)
+    centered = ref_xyz - origin
+    if len(ref_xyz) >= 3:
+        _vals, vecs = np.linalg.eigh(np.cov(centered.T))
+        normal = vecs[:, 0]
+        plane_y = vecs[:, 2]
+        plane_z = vecs[:, 1]
+    else:
+        normal = np.array([1.0, 0.0, 0.0], dtype=np.float64)
+        plane_y = np.array([0.0, 1.0, 0.0], dtype=np.float64)
+        plane_z = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+
+    fixed_xyz = np.array(
+        [refs[obj_id] for obj_id in fixed_ids if obj_id in refs],
+        dtype=np.float64,
+    )
+    if fixed_xyz.size == 0:
+        fixed_xyz = ref_xyz
+
+    ref_local = np.column_stack([
+        centered @ normal,
+        centered @ plane_y,
+        centered @ plane_z,
+    ])
+    fixed_centered = fixed_xyz - origin
+    fixed_local = np.column_stack([
+        fixed_centered @ normal,
+        fixed_centered @ plane_y,
+        fixed_centered @ plane_z,
+    ])
+
+    # Put the low-motion fixed end toward small y and high z in the local net plane.
+    if float(np.mean(fixed_local[:, 1])) > float(np.mean(ref_local[:, 1])):
+        plane_y = -plane_y
+        ref_local[:, 1] *= -1.0
+        fixed_local[:, 1] *= -1.0
+    if float(np.mean(fixed_local[:, 2])) < float(np.mean(ref_local[:, 2])):
+        plane_z = -plane_z
+        ref_local[:, 2] *= -1.0
+        fixed_local[:, 2] *= -1.0
+
+    basis = np.vstack([normal, plane_y, plane_z])
+    return origin, basis, ref_local, fixed_local
+
+
+def _to_local_xyz(xyz, origin, basis):
+    return (np.asarray(xyz, dtype=np.float64) - origin) @ basis.T
+
+
+def _choose_iso_azim(ref_local, fixed_local):
+    """Pick an azimuth that projects the low-motion fixed end to top-left."""
+    import matplotlib
+    matplotlib.use("Agg", force=True)
+    import matplotlib.pyplot as plt
+    from mpl_toolkits.mplot3d import proj3d
+
+    candidates = [-150, -120, -90, -60, -30, 0, 30, 60, 90, 120, 150, 180]
+    x_lim = (float(ref_local[:, 0].min()), float(ref_local[:, 0].max()))
+    y_lim = (float(ref_local[:, 1].min()), float(ref_local[:, 1].max()))
+    z_lim = (float(ref_local[:, 2].min()), float(ref_local[:, 2].max()))
+    best = (-1e18, -120)
+    fig = plt.figure(figsize=(4, 3))
+    ax = fig.add_subplot(111, projection="3d")
+    ax.set_xlim(x_lim); ax.set_ylim(y_lim); ax.set_zlim(z_lim)
+    all_center = ref_local.mean(axis=0)
+    fixed_center = fixed_local.mean(axis=0)
+    for azim in candidates:
+        ax.view_init(elev=30, azim=azim)
+        fig.canvas.draw()
+        fx, fy, _ = proj3d.proj_transform(*fixed_center, ax.get_proj())
+        axc, ayc, _ = proj3d.proj_transform(*all_center, ax.get_proj())
+        # Match the rendered image: fixed end should project left and high, while
+        # keeping an oblique view so out-of-plane deformation remains visible.
+        oblique_preference = -0.006 * abs(azim - 60) / 60.0
+        score = (fx - axc) + (fy - ayc) + oblique_preference
+        if score > best[0]:
+            best = (float(score), int(azim))
+    plt.close(fig)
+    return best[1]
 
 
 def _concat_segments(segments, out_path):
@@ -759,7 +920,7 @@ def _concat_segments(segments, out_path):
 
 def _render_panel_parallel(kind, frame_ids, per_frame_xyz, fps, out_path,
                            w, h, x_lim, y_lim, z_lim, z_min, z_max,
-                           workers, encoder):
+                           workers, encoder, disp_max, iso_azim):
     n = len(frame_ids)
     if n == 0:
         return
@@ -776,13 +937,13 @@ def _render_panel_parallel(kind, frame_ids, per_frame_xyz, fps, out_path,
         chunks.append((kind, frame_ids[s:e], per_frame_xyz[s:e], fps, str(seg), encoder))
 
     if workers == 1:
-        _worker_init(kind, w, h, x_lim, y_lim, z_lim, z_min, z_max)
+        _worker_init(kind, w, h, x_lim, y_lim, z_lim, z_min, z_max, disp_max, iso_azim)
         segments = [_draw_chunk(c) for c in chunks]
     else:
         with Pool(
             processes=workers,
             initializer=_worker_init,
-            initargs=(kind, w, h, x_lim, y_lim, z_lim, z_min, z_max),
+            initargs=(kind, w, h, x_lim, y_lim, z_lim, z_min, z_max, disp_max, iso_azim),
         ) as pool:
             segments = pool.map(_draw_chunk, chunks)
 
@@ -827,9 +988,21 @@ def create_3d_scene_visualization(out_rows: list,
         create_3d_visualization_video(out_rows, left_video, out_path, max_frames)
         return
 
-    Zs_all = np.array([r["Z"] for r in valid_rows], dtype=np.float64)
-    Xs_all = np.array([r["X"] for r in valid_rows], dtype=np.float64)
-    Ys_all = np.array([r["Y"] for r in valid_rows], dtype=np.float64)
+    refs, fixed_ids, disp_max = _attach_displacements(valid_rows)
+    origin, basis, ref_local, fixed_local = _build_net_reference_frame(refs, fixed_ids)
+    iso_azim = _choose_iso_azim(ref_local, fixed_local)
+    print(
+        f"[VIS] displacement color scale: 0-{disp_max:.4f} m; "
+        f"fixed_ids={len(fixed_ids)}; iso_azim={iso_azim}"
+    )
+
+    local_all = np.array([
+        _to_local_xyz([float(r["X"]), float(r["Y"]), float(r["Z"])], origin, basis)
+        for r in valid_rows
+    ], dtype=np.float64)
+    Xs_all = local_all[:, 0]
+    Ys_all = local_all[:, 1]
+    Zs_all = local_all[:, 2]
     z_min, z_max = float(np.percentile(Zs_all, 2)), float(np.percentile(Zs_all, 98))
     if z_max - z_min < 1e-6:
         z_max = z_min + 1.0
@@ -839,7 +1012,11 @@ def create_3d_scene_visualization(out_rows: list,
         pad = 0.1 * (hi - lo + 1e-6)
         return (lo - pad, hi + pad)
 
-    x_lim = pad_lim(Xs_all)
+    def include_zero(lim):
+        lo, hi = lim
+        return (min(lo, 0.0), max(hi, 0.0))
+
+    x_lim = include_zero(pad_lim(Xs_all))
     y_lim = pad_lim(Ys_all)
     z_lim = pad_lim(Zs_all)
 
@@ -907,31 +1084,38 @@ def create_3d_scene_visualization(out_rows: list,
                     continue
                 valid = int(r["valid_3d"]) == 1
                 if valid:
-                    col = depth_to_bgr(float(r["Z"]), z_min, z_max)
+                    disp = float(r.get("_disp_m", 0.0))
+                    col = depth_to_bgr(disp, 0.0, disp_max)
                     cv2.circle(vis_left, (u, v), 10, col, -1)
                     cv2.circle(vis_left, (u, v), 11, (255, 255, 255), 2)
-                    cv2.putText(vis_left, f"{float(r['Z']):.2f}", (u + 12, v - 10),
+                    cv2.putText(vis_left, f"{disp:.3f}", (u + 12, v - 10),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, col, 2, cv2.LINE_AA)
                 else:
                     cv2.circle(vis_left, (u, v), 4, (120, 120, 120), -1)
 
-            cv2.putText(vis_left, "Left view (depth-colored)", (24, 40),
+            cv2.putText(vis_left, "Left view (displacement-colored)", (24, 40),
                         cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2)
             cv2.putText(vis_left,
                         f"frame={next_target}  nodes={len(rows)}  valid={len(valid_here)}",
                         (24, 78), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
-            draw_colorbar(vis_left, z_min, z_max, x=w_single - 130, y=110, w=28, h=260)
+            draw_value_colorbar(vis_left, 0.0, disp_max, x=w_single - 130, y=110, w=28, h=260, label="|d| m")
             _writer_write(writer_left, vis_left)
 
             if valid_here:
-                Xs = np.array([r["X"] for r in valid_here], dtype=np.float64)
-                Ys = np.array([r["Y"] for r in valid_here], dtype=np.float64)
-                Zs = np.array([r["Z"] for r in valid_here], dtype=np.float64)
+                local = np.array([
+                    _to_local_xyz([float(r["X"]), float(r["Y"]), float(r["Z"])], origin, basis)
+                    for r in valid_here
+                ], dtype=np.float64)
+                Xs = local[:, 0]
+                Ys = local[:, 1]
+                Zs = local[:, 2]
+                Ds = np.array([float(r.get("_disp_m", 0.0)) for r in valid_here], dtype=np.float64)
             else:
                 Xs = np.zeros(0)
                 Ys = np.zeros(0)
                 Zs = np.zeros(0)
-            per_frame_xyz.append((Xs, Ys, Zs))
+                Ds = np.zeros(0)
+            per_frame_xyz.append((Xs, Ys, Zs, Ds))
 
             target_ptr += 1
             if target_ptr >= len(target_frames):
@@ -954,14 +1138,51 @@ def create_3d_scene_visualization(out_rows: list,
     print("[VIS] rendering iso panel (parallel)...")
     _render_panel_parallel("iso", target_frames, per_frame_xyz, fps, iso_path,
                            w_single, h, x_lim, y_lim, z_lim, z_min, z_max,
-                           workers=workers, encoder=enc)
+                           workers=workers, encoder=enc, disp_max=disp_max, iso_azim=iso_azim)
     print(f"[OK] Wrote {iso_path}")
 
     print("[VIS] rendering topdown panel (parallel)...")
     _render_panel_parallel("topdown", target_frames, per_frame_xyz, fps, top_path,
                            w_single, h, x_lim, y_lim, z_lim, z_min, z_max,
-                           workers=workers, encoder=enc)
+                           workers=workers, encoder=enc, disp_max=disp_max, iso_azim=iso_azim)
     print(f"[OK] Wrote {top_path}")
+
+
+def visualize_existing_rows(args, out_rows):
+    if not args.left_video:
+        print("[VIS] --visualize requested but --left-video not provided. Skipping visualization.")
+        return
+    if args.viz_mode == "scene":
+        create_3d_scene_visualization(
+            out_rows=out_rows,
+            left_video=args.left_video,
+            out_path=args.viz_out,
+            max_frames=args.viz_max_frames,
+            trail_len=args.viz_trail,
+            workers=args.workers,
+            encoder=args.viz_encoder,
+        )
+    else:
+        create_3d_visualization_video(
+            out_rows=out_rows,
+            left_video=args.left_video,
+            out_path=args.viz_out,
+            max_frames=args.viz_max_frames,
+        )
+
+
+def load_existing_triangulation_csv(path: str):
+    csv_path = Path(path)
+    if not csv_path.exists():
+        raise FileNotFoundError(f"--viz-only requested but CSV does not exist: {csv_path}")
+    df = pd.read_csv(csv_path)
+    required = ["frame_L", "obj_id", "uL", "vL", "X", "Y", "Z", "valid_3d"]
+    missing = [col for col in required if col not in df.columns]
+    if missing:
+        raise ValueError(f"{csv_path} is missing required visualization columns: {missing}")
+    rows = df.to_dict(orient="records")
+    print(f"[VIS] Loaded existing triangulation CSV: {csv_path} rows={len(rows)}")
+    return rows
 
 
 def main():
@@ -983,6 +1204,8 @@ def main():
     ap.add_argument("--out-csv", default="triangulation/out/triangulated_3d.csv")
     ap.add_argument("--out-summary", default="triangulation/out/summary.json")
     ap.add_argument("--visualize", action="store_true", help="Generate side-by-side original + CSV reconstruction video")
+    ap.add_argument("--viz-only", action="store_true",
+                    help="Skip triangulation and render visualization from an existing --out-csv")
     ap.add_argument("--viz-out", default="triangulation/out/triangulated_3d_viz.mp4", help="Output path for visualization video")
     ap.add_argument("--viz-max-frames", type=int, default=-1, help="Max rendered frames with tracked nodes (-1=all)")
     ap.add_argument("--viz-mode", choices=["scene", "sidebyside"], default="scene",
@@ -995,6 +1218,13 @@ def main():
     ap.add_argument("--quality-min", type=float, default=0.0, help="Filter 2D points by quality >= this")
     ap.add_argument("--max-reproj", type=float, default=20.0, help="Reject if mean reproj err > this (px)")
     args = ap.parse_args()
+
+    if args.viz_only:
+        if not args.visualize:
+            raise ValueError("--viz-only requires --visualize.")
+        out_rows = load_existing_triangulation_csv(args.out_csv)
+        visualize_existing_rows(args, out_rows)
+        return
 
     stereo = np.load(args.stereo, allow_pickle=True)
     K1 = stereo["K1"].astype(np.float64)
@@ -1207,25 +1437,7 @@ def main():
     print(f"[OK] Wrote {out_summary}")
 
     if args.visualize:
-        if not args.left_video:
-            print("[VIS] --visualize requested but --left-video not provided. Skipping visualization.")
-        elif args.viz_mode == "scene":
-            create_3d_scene_visualization(
-                out_rows=out_rows,
-                left_video=args.left_video,
-                out_path=args.viz_out,
-                max_frames=args.viz_max_frames,
-                trail_len=args.viz_trail,
-                workers=args.workers,
-                encoder=args.viz_encoder,
-            )
-        else:
-            create_3d_visualization_video(
-                out_rows=out_rows,
-                left_video=args.left_video,
-                out_path=args.viz_out,
-                max_frames=args.viz_max_frames,
-            )
+        visualize_existing_rows(args, out_rows)
 
 
 if __name__ == "__main__":
