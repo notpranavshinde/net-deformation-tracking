@@ -90,6 +90,13 @@ Memory-friendly batched run:
 python .\run_sam2_objectwise.py --scale 0.5 --gpu-mode 4090-only --batch-size 24
 ```
 
+Dual-GPU live preview is parent-owned: GPU workers do SAM2 compute and the
+main process owns the OpenCV preview/correction windows. The current preview
+transport sends rendered preview frames through multiprocessing queues. If this
+becomes the bottleneck on the Linux/Ada machine, keep the user workflow the same
+and replace only that transport layer with `multiprocessing.shared_memory` or
+another shared-memory image buffer.
+
 Both SAM2 scripts write triangulation-compatible 2D tracks:
 
 ```text
