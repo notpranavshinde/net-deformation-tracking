@@ -11,7 +11,14 @@ from threading import Thread
 import numpy as np
 import torch
 from PIL import Image
-from tqdm import tqdm
+from rich.progress import (
+    BarColumn,
+    MofNCompleteColumn,
+    Progress,
+    TextColumn,
+    TimeElapsedColumn,
+    TimeRemainingColumn,
+)
 
 
 def get_sdpa_settings():
@@ -101,6 +108,26 @@ def _load_img_as_tensor(img_path, image_size):
     return img, video_height, video_width
 
 
+def _progress_side_label(video_path):
+    parts = [p.lower() for p in os.path.normpath(str(video_path)).split(os.sep)]
+    if any("left" == p or p.startswith("left_") or p.endswith("_left") for p in parts):
+        return "LEFT frame loading (JPEG)"
+    if any("right" == p or p.startswith("right_") or p.endswith("_right") for p in parts):
+        return "RIGHT frame loading (JPEG)"
+    return "frame loading (JPEG)"
+
+
+def _make_progress():
+    return Progress(
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        MofNCompleteColumn(),
+        TextColumn("{task.percentage:>3.0f}%"),
+        TimeElapsedColumn(),
+        TimeRemainingColumn(),
+    )
+
+
 class AsyncVideoFrameLoader:
     """
     A list of video frames to be load asynchronously without blocking session start.
@@ -136,8 +163,11 @@ class AsyncVideoFrameLoader:
         # load the rest of frames asynchronously without blocking the session start
         def _load_frames():
             try:
-                for n in tqdm(range(len(self.images)), desc="frame loading (JPEG)"):
-                    self.__getitem__(n)
+                with _make_progress() as progress:
+                    task = progress.add_task(_progress_side_label(img_paths[0]), total=len(self.images))
+                    for n in range(len(self.images)):
+                        self.__getitem__(n)
+                        progress.update(task, advance=1)
             except Exception as e:
                 self.exception = e
 
@@ -265,8 +295,11 @@ def load_video_frames_from_jpg_images(
         return lazy_images, lazy_images.video_height, lazy_images.video_width
 
     images = torch.zeros(num_frames, 3, image_size, image_size, dtype=torch.float32)
-    for n, img_path in enumerate(tqdm(img_paths, desc="frame loading (JPEG)")):
-        images[n], video_height, video_width = _load_img_as_tensor(img_path, image_size)
+    with _make_progress() as progress:
+        task = progress.add_task(_progress_side_label(video_path), total=num_frames)
+        for n, img_path in enumerate(img_paths):
+            images[n], video_height, video_width = _load_img_as_tensor(img_path, image_size)
+            progress.update(task, advance=1)
     if not offload_video_to_cpu:
         images = images.to(compute_device)
         img_mean = img_mean.to(compute_device)

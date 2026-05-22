@@ -9,7 +9,7 @@ import time
 
 import numpy as np
 import torch
-from tqdm import tqdm
+from rich.progress import track
 
 from sam2.build_sam import build_sam2_video_predictor
 
@@ -71,7 +71,8 @@ _, out_obj_ids, out_mask_logits = predictor.add_new_points_or_box(
 # Warmup and then average FPS over several runs
 with torch.autocast("cuda", torch.bfloat16):
     with torch.inference_mode():
-        for i in tqdm(range(runs), disable=not verbose, desc="Benchmarking"):
+        run_iter = track(range(runs), description="Benchmarking") if verbose else range(runs)
+        for i in run_iter:
             start = time.time()
             # Start tracking
             for (

@@ -681,6 +681,8 @@ def main():
     args = parse_args()
     if args.scale <= 0:
         raise RuntimeError("--scale must be > 0")
+    args.left_input = sam2run.resolve_video_path(args.left_input)
+    args.right_input = sam2run.resolve_video_path(args.right_input)
 
     setup = load_setup(args)
     out_root = Path(args.out)

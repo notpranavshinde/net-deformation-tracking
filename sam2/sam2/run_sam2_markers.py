@@ -83,6 +83,17 @@ def str_to_bool(value):
     return str(value).strip().lower() in ("true", "1", "yes", "y", "on")
 
 
+def resolve_video_path(video_path):
+    path = Path(video_path)
+    candidates = [path]
+    if path.suffix:
+        candidates.extend([path.with_suffix(path.suffix.lower()), path.with_suffix(path.suffix.upper())])
+    for candidate in dict.fromkeys(candidates):
+        if candidate.exists():
+            return str(candidate)
+    return str(path)
+
+
 def parse_crop_arg(crop_arg: str):
     """
     Parse crop string in x,y,w,h format. The literal "none" disables cropping.
@@ -3959,8 +3970,8 @@ def main():
     if (args.setup or args.modify_setup) and Path(args.out) == DEFAULT_OUT_DIR:
         args.out = str(DEFAULT_LOCAL_SETUP_DIR)
 
-    left_video = args.left_input
-    right_video = args.right_input
+    left_video = resolve_video_path(args.left_input)
+    right_video = resolve_video_path(args.right_input)
     out_root = Path(args.out)
 
     offload_video_to_cpu = args.offload_video_to_cpu

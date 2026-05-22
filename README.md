@@ -25,7 +25,7 @@ conda create -n sam2py311 python=3.11 -y
 conda activate sam2py311
 python -m pip install --upgrade pip
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
-pip install opencv-python numpy tqdm scipy scikit-image pandas matplotlib pillow hydra-core iopath huggingface_hub
+pip install opencv-python numpy rich scipy scikit-image pandas matplotlib pillow hydra-core iopath huggingface_hub
 cd sam2\sam2
 pip install -e .
 ```
@@ -45,7 +45,7 @@ conda create -n sam2py311 python=3.11 -y
 conda activate sam2py311
 python -m pip install --upgrade pip
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
-pip install opencv-python numpy tqdm scipy scikit-image pandas matplotlib pillow hydra-core iopath huggingface_hub
+pip install opencv-python numpy rich scipy scikit-image pandas matplotlib pillow hydra-core iopath huggingface_hub
 cd sam2/sam2
 pip install -e .
 ```

@@ -15,7 +15,14 @@ from typing import List, Tuple, Optional
 
 import cv2
 import numpy as np
-from tqdm import tqdm
+from rich.progress import (
+    BarColumn,
+    MofNCompleteColumn,
+    Progress,
+    TextColumn,
+    TimeElapsedColumn,
+    TimeRemainingColumn,
+)
 
 
 _CUDA_STATUS: Optional[bool] = None
@@ -30,6 +37,68 @@ DEFAULT_STATS_DIR = "work/stats"
 DEFAULT_MONO_NPZ = "work/mono.npz"
 DEFAULT_STEREO_NPZ = "work/stereo.npz"
 DEFAULT_RECTIFY_DIR = "work/rectify"
+
+
+class RichProgressBar:
+    def __init__(self, total=None, desc="", unit="it", disable=False, **_kwargs):
+        self._total = total
+        self.disable = bool(disable)
+        self.desc = desc
+        self.unit = unit
+        self.progress = None
+        self.task = None
+        if not self.disable:
+            self.progress = Progress(
+                TextColumn("[progress.description]{task.description}"),
+                BarColumn(),
+                MofNCompleteColumn(),
+                TextColumn("{task.percentage:>3.0f}%"),
+                TimeElapsedColumn(),
+                TimeRemainingColumn(),
+            )
+            self.progress.start()
+            self.task = self.progress.add_task(desc, total=total)
+
+    @property
+    def total(self):
+        return self._total
+
+    @total.setter
+    def total(self, value):
+        self._total = value
+        if self.progress is not None and self.task is not None:
+            self.progress.update(self.task, total=value)
+
+    def update(self, n=1):
+        if self.progress is not None and self.task is not None:
+            self.progress.update(self.task, advance=int(n))
+
+    def refresh(self):
+        if self.progress is not None:
+            self.progress.refresh()
+
+    def write(self, msg):
+        if self.progress is not None:
+            self.progress.console.print(msg)
+        else:
+            print(msg)
+
+    def close(self):
+        if self.progress is not None:
+            self.progress.stop()
+            self.progress = None
+            self.task = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.close()
+        return False
+
+
+def progress_bar(*args, **kwargs):
+    return RichProgressBar(*args, **kwargs)
 
 
 # -----------------------------
@@ -152,10 +221,26 @@ def remap_pair_with_backend(fL: np.ndarray, fR: np.ndarray,
 # Video helpers
 # -----------------------------
 def open_video(path: str):
-    cap = cv2.VideoCapture(path)
-    if not cap.isOpened():
-        raise RuntimeError(f"Could not open video: {path}")
-    return cap
+    requested = Path(path)
+    candidates = [requested]
+    suffix = requested.suffix
+    if suffix:
+        candidates.extend([
+            requested.with_suffix(suffix.lower()),
+            requested.with_suffix(suffix.upper()),
+        ])
+    # Preserve order while removing duplicates.
+    candidates = list(dict.fromkeys(candidates))
+
+    for candidate in candidates:
+        cap = cv2.VideoCapture(str(candidate))
+        if cap.isOpened():
+            return cap
+        cap.release()
+
+    path_hint = ", ".join(str(p) for p in candidates)
+    cwd = os.getcwd()
+    raise RuntimeError(f"Could not open video: {path} (cwd={cwd}; tried: {path_hint})")
 
 def read_frame_at(cap: cv2.VideoCapture, idx: int):
     cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
@@ -517,7 +602,7 @@ def brightness_curve(video_path: str, scale: float, step: int, max_frames: int, 
     effective_total = stepped_iteration_count(max_scan, 0, step)
 
     means, idxs = [], []
-    pbar = tqdm(total=effective_total, desc="[Brightness scan]", unit="frame")
+    pbar = progress_bar(total=effective_total, desc="[Brightness scan]", unit="frame")
     i = 0
     next_idx = None
     while i < max_scan:
@@ -641,8 +726,8 @@ def collect_samples_checker(video_path: str,
                             use_cuda: bool = False,
                             frame_indices: Optional[List[int]] = None,
                             no_adaptive: bool = False,
-                            tqdm_position: int = 0,
-                            show_tqdm: bool = True,
+                            progress_position: int = 0,
+                            show_progress: bool = True,
                             progress_queue=None,
                             quiet: bool = False):
     ensure_dir(out_dir)
@@ -671,12 +756,12 @@ def collect_samples_checker(video_path: str,
 
         if progress_queue is not None:
             progress_queue.put(("total", len(idx_list)))
-        pbar = tqdm(
+        pbar = progress_bar(
             total=len(idx_list),
             desc=f"[{label} detection]",
             unit="frame",
-            position=tqdm_position,
-            disable=not show_tqdm,
+            position=progress_position,
+            disable=not show_progress,
         )
         next_idx = None
         for idx in idx_list:
@@ -735,12 +820,12 @@ def collect_samples_checker(video_path: str,
                 )
             if progress_queue is not None:
                 progress_queue.put(("total", len(idx_list)))
-            pbar = tqdm(
+            pbar = progress_bar(
                 total=len(idx_list),
                 desc=f"[{label} detection s={pass_step}]",
                 unit="frame",
-                position=tqdm_position,
-                disable=not show_tqdm,
+                position=progress_position,
+                disable=not show_progress,
             )
 
             for idx in idx_list:
@@ -1033,7 +1118,7 @@ def collect_stats_worker(params: dict):
         out_dir=params["out_dir"],
         use_cuda=params["use_cuda"],
         no_adaptive=params["no_adaptive"],
-        show_tqdm=params["show_tqdm"],
+        show_progress=params["show_progress"],
         progress_queue=params["progress_queue"],
         quiet=params["quiet"],
     )
@@ -1218,6 +1303,19 @@ def drain_progress_queue(progress_queue, pbar):
             pbar.refresh()
         elif event == "update":
             pbar.update(int(value))
+
+
+def drain_progress_queue_to_task(progress_queue, progress, task_id, totals):
+    while True:
+        try:
+            event, value = progress_queue.get_nowait()
+        except queue.Empty:
+            break
+        if event == "total":
+            totals[task_id] = int(totals.get(task_id) or 0) + int(value)
+            progress.update(task_id, total=totals[task_id])
+        elif event == "update":
+            progress.update(task_id, advance=int(value))
 
 
 def collect_stats_parallel_side(params: dict, workers: int, progress_queue=None, pbar=None):
@@ -1487,7 +1585,7 @@ def cmd_stats(args):
             "out_dir": os.path.join(args.out, "debug_left"),
             "use_cuda": args.use_cuda,
             "no_adaptive": args.no_adaptive,
-            "show_tqdm": False,
+            "show_progress": False,
             "progress_queue": None,
             "quiet": True,
         },
@@ -1504,7 +1602,7 @@ def cmd_stats(args):
             "out_dir": os.path.join(args.out, "debug_right"),
             "use_cuda": args.use_cuda,
             "no_adaptive": args.no_adaptive,
-            "show_tqdm": False,
+            "show_progress": False,
             "progress_queue": None,
             "quiet": True,
         },
@@ -1534,24 +1632,38 @@ def cmd_stats(args):
             progress_queue = manager.Queue()
             jobs[0]["progress_queue"] = progress_queue
             jobs[1]["progress_queue"] = progress_queue
-            with tqdm(desc="[Stats detection]", unit="frame") as pbar:
+            with progress_bar(desc="[Stats LEFT detection]", unit="frame") as pbar:
                 stL, sizeL = collect_stats_parallel_side(jobs[0], args.workers, progress_queue, pbar)
                 drain_progress_queue(progress_queue, pbar)
+            with progress_bar(desc="[Stats RIGHT detection]", unit="frame") as pbar:
                 stR, sizeR = collect_stats_parallel_side(jobs[1], args.workers, progress_queue, pbar)
                 drain_progress_queue(progress_queue, pbar)
     else:
         with Manager() as manager:
-            progress_queue = manager.Queue()
-            jobs[0]["progress_queue"] = progress_queue
-            jobs[1]["progress_queue"] = progress_queue
+            left_progress_queue = manager.Queue()
+            right_progress_queue = manager.Queue()
+            jobs[0]["progress_queue"] = left_progress_queue
+            jobs[1]["progress_queue"] = right_progress_queue
             with ProcessPoolExecutor(max_workers=2) as executor:
                 left_future = executor.submit(collect_stats_worker, jobs[0])
                 right_future = executor.submit(collect_stats_worker, jobs[1])
-                with tqdm(desc="[Stats detection]", unit="frame") as pbar:
+                with Progress(
+                    TextColumn("[progress.description]{task.description}"),
+                    BarColumn(),
+                    MofNCompleteColumn(),
+                    TextColumn("{task.percentage:>3.0f}%"),
+                    TimeElapsedColumn(),
+                    TimeRemainingColumn(),
+                ) as progress:
+                    left_task = progress.add_task("[Stats LEFT detection]", total=None)
+                    right_task = progress.add_task("[Stats RIGHT detection]", total=None)
+                    totals = {}
                     while not (left_future.done() and right_future.done()):
-                        drain_progress_queue(progress_queue, pbar)
+                        drain_progress_queue_to_task(left_progress_queue, progress, left_task, totals)
+                        drain_progress_queue_to_task(right_progress_queue, progress, right_task, totals)
                         time.sleep(0.1)
-                    drain_progress_queue(progress_queue, pbar)
+                    drain_progress_queue_to_task(left_progress_queue, progress, left_task, totals)
+                    drain_progress_queue_to_task(right_progress_queue, progress, right_task, totals)
                 stL, sizeL = left_future.result()
                 stR, sizeR = right_future.result()
 
@@ -1585,7 +1697,7 @@ def cmd_mono(args):
     if args.workers > 1 and frame_indices_left is not None:
         with Manager() as manager:
             progress_queue = manager.Queue()
-            with tqdm(desc="[MONO LEFT detection]", unit="frame") as pbar:
+            with progress_bar(desc="[MONO LEFT detection]", unit="frame") as pbar:
                 samplesL, statsL, image_size = collect_samples_parallel_indices(
                     {
                         "video_path": args.left,
@@ -1621,7 +1733,7 @@ def cmd_mono(args):
     if args.workers > 1 and frame_indices_right is not None:
         with Manager() as manager:
             progress_queue = manager.Queue()
-            with tqdm(desc="[MONO RIGHT detection]", unit="frame") as pbar:
+            with progress_bar(desc="[MONO RIGHT detection]", unit="frame") as pbar:
                 samplesR, statsR, image_size_r = collect_samples_parallel_indices(
                     {
                         "video_path": args.right,
@@ -1739,7 +1851,7 @@ def cmd_stereo(args):
         if args.workers > 1:
             with Manager() as manager:
                 progress_queue = manager.Queue()
-                with tqdm(desc="[STEREO detection]", unit="pair") as pbar:
+                with progress_bar(desc="[STEREO detection]", unit="pair") as pbar:
                     usedL, usedR, scanned = collect_stereo_pairs_parallel(
                         args, paired_indices, pattern, square_m, args.workers, progress_queue, pbar
                     )
@@ -1750,7 +1862,7 @@ def cmd_stereo(args):
         else:
             capL = open_video(args.left)
             capR = open_video(args.right)
-            pbar = tqdm(total=len(paired_indices), desc="[Stereo pairing]", unit="frame")
+            pbar = progress_bar(total=len(paired_indices), desc="[Stereo pairing]", unit="frame")
             nextL = None
             nextR = None
             try:
@@ -1821,7 +1933,7 @@ def cmd_stereo(args):
                     f"[STEREO] {'simple' if args.no_adaptive else 'adaptive'} pass {pass_i}/{len(steps)}: "
                     f"step={pass_step}, intervals={len(intervals_g)}, pairs={len(g_list)}"
                 )
-                pbar = tqdm(total=len(g_list), desc=f"[Stereo pairing s={pass_step}]", unit="frame")
+                pbar = progress_bar(total=len(g_list), desc=f"[Stereo pairing s={pass_step}]", unit="frame")
 
                 for g in g_list:
                     idxL = trimL + int(g)
