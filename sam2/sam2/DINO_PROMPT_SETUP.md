@@ -65,14 +65,3 @@ python .\dino_detect_sam2_prompts.py --frame 150 --select-crop --click-examples
 ```powershell
 python .\dino_detect_sam2_prompts.py --frame 150 --examples .\work\dino_prompts\examples.json
 ```
-
-## Remote Machine
-
-On the SSH machine, repeat:
-
-```bash
-git clone https://github.com/facebookresearch/dinov2.git external/dinov2
-```
-
-Then copy this project, videos, crop metadata, and `work/dino_prompts/examples.json`
-to the remote machine. The heavy DINO/SAM2 computation can then run headlessly.

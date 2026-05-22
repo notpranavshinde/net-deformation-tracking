@@ -14,52 +14,11 @@ Defaults expect:
 Use --setup on the local Windows machine for manual clicking.
 Default crop is full-frame. Add --select-crop only when you want to crop.
 Use --modify-setup to load the saved setup and add more points without
-re-clicking everything. Then copy only changed files to the GPU machine.
-
-Copy the updated script:
-
-    scp -P 1112 .\run_sam2_markers.py vivian@10.206.215.208:~/net_deformation_tracking/sam2/sam2/
-
-Copy the saved crop/point setup:
-
-    scp -P 1112 -r .\work\manual_sam2_setup vivian@10.206.215.208:~/net_deformation_tracking/sam2/sam2/work/
-
-Only copy videos if they changed:
-
-    scp -P 1112 .\in\left.mp4 vivian@10.206.215.208:~/net_deformation_tracking/sam2/sam2/in/left.mp4
-    scp -P 1112 .\in\right.mp4 vivian@10.206.215.208:~/net_deformation_tracking/sam2/sam2/in/right.mp4
-
-Only copy SAM2 source/package files if they changed:
-
-    scp -P 1112 -r .\sam2 vivian@10.206.215.208:~/net_deformation_tracking/sam2/sam2/
-    scp -P 1112 .\setup.py .\pyproject.toml .\README.md .\LICENSE .\MANIFEST.in vivian@10.206.215.208:~/net_deformation_tracking/sam2/sam2/
-
-SSH into the GPU machine:
-
-    ssh -p 1112 vivian@10.206.215.208
-
-Run headless SAM2 on the GPU machine:
-
-    cd ~/net_deformation_tracking/sam2/sam2
-    ~/vtorch/bin/python run_sam2_markers.py --reuse-setup --save-masks false --save-overlay false --save-tracks true --preview false --async-loading-frames false --gpu-mode dual
+re-clicking everything.
 
 Local half-scale test with live mask preview:
 
     python run_sam2_markers.py --reuse-setup --scale 0.5 --frame-extractor auto --gpu-mode single --preview true --save-overlay false --save-masks false --save-tracks true
-
-Optional tmux run on the GPU machine, so it keeps running after disconnect:
-
-    tmux new -s sam2
-    cd ~/net_deformation_tracking/sam2/sam2
-    ~/vtorch/bin/python run_sam2_markers.py --reuse-setup --save-masks false --save-overlay false --save-tracks true --preview false --async-loading-frames false --gpu-mode dual
-
-Detach from tmux with Ctrl+B, then D. Reattach later:
-
-    tmux attach -t sam2
-
-Fetch results back from local Windows:
-
-    scp -P 1112 -r vivian@10.206.215.208:~/net_deformation_tracking/sam2/sam2/out .\out
 """
 
 import os
