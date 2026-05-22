@@ -105,6 +105,10 @@ work/stereo.npz
 work/rectify
 ```
 
+On Linux, `.mp4` and `.MP4` are different filenames. The calibration and SAM2
+scripts will try the requested suffix plus lower/upper-case variants, but using
+the standard lowercase names keeps commands predictable.
+
 That means the file input/output flags are optional for the standard layout.
 Override paths only when needed:
 
@@ -124,10 +128,13 @@ Useful calibration flags:
 --scale 1.0              processing scale; must match between mono, stereo, and rectify
 --cols 8 --rows 6        checkerboard inner-corner count for the current board
 --square-mm 40.0         checker square size
---workers 16             multiprocessing workers for stats-index reuse paths
+--workers 16             worker processes for stats, mono reuse, and stereo reuse paths
 --reuse-stats-indices    reuse positive detections from stats for faster mono/stereo
 --use-cuda               use OpenCV CUDA where supported, with CPU fallback
 ```
+
+`stats`, `mono`, and `stereo` use Rich progress bars. Left and right detection
+show separate progress where they run in parallel.
 
 ## SAM2 Tracking
 
@@ -136,21 +143,29 @@ From `sam2\sam2`:
 ```powershell
 python .\run_sam2_markers.py --setup
 python .\run_sam2_markers.py --modify-setup
-python .\run_sam2_markers.py --reuse-setup --scale 0.5 --gpu-mode 4090-only
+python .\run_sam2_markers.py --reuse-setup --scale 0.5 --gpu-mode single --single-gpu-index 0
 ```
 
 Memory-friendly batched run:
 
 ```powershell
-python .\run_sam2_objectwise.py --scale 0.5 --gpu-mode 4090-only --batch-size 24
+python .\run_sam2_objectwise.py --scale 0.5 --gpu-mode single --single-gpu-index 0 --batch-size 24
 ```
 
-Dual-GPU live preview is parent-owned: GPU workers do SAM2 compute and the
-main process owns the OpenCV preview/correction windows. The current preview
-transport sends rendered preview frames through multiprocessing queues. If this
-becomes the bottleneck on the Linux/Ada machine, keep the user workflow the same
-and replace only that transport layer with `multiprocessing.shared_memory` or
-another shared-memory image buffer.
+Useful SAM2 flags:
+
+```text
+--gpu-mode single|dual|4090-only|cpu
+--single-gpu-index N    CUDA device for single-GPU mode
+--batch-size N          objectwise only; objects per SAM2 run
+--preview true|false    live preview/correction UI
+--scale 0.5             processing scale after crop
+```
+
+Dual-GPU mode runs left and right in separate GPU worker processes while the
+main process owns the OpenCV preview/correction windows. Rich progress is used
+for propagation and frame loading; left/right frame-loading bars are labeled
+separately when both sides run.
 
 Both SAM2 scripts write triangulation-compatible 2D tracks:
 
@@ -166,7 +181,8 @@ From the repository root:
 ```powershell
 python .\triangulation\points_to_3d.py
 python .\triangulation\points_to_3d.py --visualize
-python .\triangulation\points_to_3d.py --sync-mode audio --visualize
+python .\triangulation\points_to_3d.py --visualize --workers 16 --viz-encoder auto
+python .\triangulation\points_to_3d.py --sync-mode audio --visualize --workers 16
 ```
 
 By default, triangulation uses:
@@ -176,6 +192,17 @@ calibration/work/stereo.npz
 calibration/work/sync.json
 sam2/sam2/out/left/tracks_2d.csv
 sam2/sam2/out/right/tracks_2d.csv
+```
+
+Useful triangulation flags:
+
+```text
+--quality-min 0.0       minimum 2D track quality before triangulation
+--max-reproj 20.0       maximum mean reprojection error in pixels
+--visualize             write verification videos
+--viz-mode scene        scene writes *_left.mp4, *_iso.mp4, and *_topdown.mp4
+--workers 0             scene visualization workers; 0=auto CPU count
+--viz-encoder auto      auto chooses NVENC when ffmpeg is present, else mp4v
 ```
 
 ## Video Splitting

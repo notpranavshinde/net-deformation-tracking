@@ -127,6 +127,9 @@ KEY FLAGS
     Generate side-by-side left/right verification video with observed points,
     reprojected points, per-object depth (Z), and reprojection error.
 
+--workers:
+    Worker processes for scene visualization iso/topdown rendering. 0=auto.
+
 -------------------------------------------------------------------------------
 OUTPUTS
 -------------------------------------------------------------------------------
@@ -985,7 +988,7 @@ def main():
     ap.add_argument("--viz-mode", choices=["scene", "sidebyside"], default="scene",
                     help="scene: depth-colored overlay + isometric + top-down. sidebyside: original legacy view.")
     ap.add_argument("--viz-trail", type=int, default=60, help="Recent-frames trail length in 3D panel (scene mode; currently unused)")
-    ap.add_argument("--viz-workers", type=int, default=0,
+    ap.add_argument("--workers", type=int, default=0,
                     help="Parallel workers for iso/topdown rendering. 0=auto (cpu_count).")
     ap.add_argument("--viz-encoder", choices=["auto", "nvenc", "mp4v"], default="auto",
                     help="Video encoder. auto=nvenc if ffmpeg present, else mp4v.")
@@ -1213,7 +1216,7 @@ def main():
                 out_path=args.viz_out,
                 max_frames=args.viz_max_frames,
                 trail_len=args.viz_trail,
-                workers=args.viz_workers,
+                workers=args.workers,
                 encoder=args.viz_encoder,
             )
         else:
