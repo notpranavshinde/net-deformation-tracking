@@ -139,12 +139,29 @@ def parse_args():
     parser.add_argument("--preview-max-width", type=int, default=1400)
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--gpu-mode", choices=["auto", "single", "dual", "4090-only"], default="auto")
-    parser.add_argument("--single-gpu-index", type=int, default=0)
+    parser.add_argument(
+        "--single-gpu-index",
+        type=int,
+        default=None,
+        help="GPU index used when --gpu-mode=single. If omitted with multiple GPUs, prompt interactively.",
+    )
     parser.add_argument("--offload-video-to-cpu", type=parse_bool, default=True)
     parser.add_argument("--offload-state-to-cpu", type=parse_bool, default=False)
     parser.add_argument("--async-loading-frames", type=parse_bool, default=False)
     parser.add_argument("--save-masks", type=parse_bool, default=False)
     parser.add_argument("--save-overlay", type=parse_bool, default=False)
+    parser.add_argument(
+        "--correction-restart-mode",
+        choices=["full", "reseed-from-correction-frame"],
+        default="full",
+        help="Correction restart behavior passed through to run_sam2_markers.py.",
+    )
+    parser.add_argument(
+        "--auto-pause-missing",
+        type=parse_bool,
+        default=False,
+        help="Automatically pause preview when fewer valid markers are visible than expected.",
+    )
     return parser.parse_args()
 
 
@@ -164,9 +181,15 @@ def choose_device(args, side_name=None):
     if mode == "single":
         if gpu_count <= 0:
             return "cpu"
-        if args.single_gpu_index < 0 or args.single_gpu_index >= gpu_count:
+        if args.single_gpu_index is None:
+            if not hasattr(args, "_chosen_single_gpu_index"):
+                args._chosen_single_gpu_index = sam2run.choose_single_gpu_index(gpu_names)
+            idx = int(args._chosen_single_gpu_index)
+        else:
+            idx = int(args.single_gpu_index)
+        if idx < 0 or idx >= gpu_count:
             raise RuntimeError(f"--single-gpu-index is outside 0-{gpu_count - 1}")
-        return f"cuda:{args.single_gpu_index}"
+        return f"cuda:{idx}"
     return "cuda:0" if gpu_count > 0 else "cpu"
 
 
@@ -218,32 +241,47 @@ def load_setup(args):
     }
 
 
+def count_cached_frames(frames_dir: Path) -> int:
+    if not frames_dir.exists():
+        return 0
+    return sum(1 for _ in frames_dir.glob("*.jpg"))
+
+
+def frame_cache_status(frames_dir: Path, expected_count: int):
+    cached_count = count_cached_frames(frames_dir)
+    if cached_count <= 0:
+        return False, cached_count, "no JPEG frames found"
+    if expected_count <= 0:
+        return True, cached_count, "OpenCV could not report the video frame count"
+    first_frame = frames_dir / "000000.jpg"
+    last_frame = frames_dir / f"{expected_count - 1:06d}.jpg"
+    if cached_count != expected_count:
+        return False, cached_count, f"expected {expected_count} JPEG frames, found {cached_count}"
+    if not first_frame.exists():
+        return False, cached_count, f"missing first frame {first_frame.name}"
+    if not last_frame.exists():
+        return False, cached_count, f"missing last frame {last_frame.name}"
+    return True, cached_count, ""
+
+
 def prepare_frames(side_name, video_path, crop, args, side_out: Path):
     frames_dir = side_out / "objectwise_frames"
     meta_path = side_out / "frames_objectwise_meta.json"
-    frame_meta = {
-        "video": video_signature(video_path),
-        "crop": list(crop) if crop is not None else None,
-        "scale": float(args.scale),
-        "frame_extractor": args.frame_extractor,
-    }
-    frame_hash = stable_hash(frame_meta)
-    old_hash = None
-    if meta_path.exists():
-        try:
-            old_hash = json.loads(meta_path.read_text()).get("hash")
-        except Exception:
-            old_hash = None
-
-    if args.overwrite or old_hash != frame_hash or not frames_dir.exists() or not any(frames_dir.glob("*.jpg")):
+    if args.overwrite and frames_dir.exists():
         if frames_dir.exists():
             shutil.rmtree(frames_dir)
-        print(f"[INFO][{side_name.upper()}] Extracting private objectwise frame cache...")
-        sam2run.extract_frames(video_path, frames_dir, crop=crop, scale=args.scale, frame_extractor=args.frame_extractor)
-        meta_path.write_text(json.dumps({"hash": frame_hash, **frame_meta}, indent=2))
-    else:
-        print(f"[INFO][{side_name.upper()}] Reusing private objectwise frame cache: {frames_dir}")
-    return frames_dir, len(list(frames_dir.glob("*.jpg")))
+        if meta_path.exists():
+            meta_path.unlink()
+    frames_dir, cached_count = sam2run.prepare_frame_cache(
+        video_path,
+        frames_dir,
+        crop=crop,
+        scale=args.scale,
+        frame_extractor=args.frame_extractor,
+        meta_name="frames_objectwise_meta.json",
+        label=side_name.upper(),
+    )
+    return frames_dir, cached_count
 
 
 def object_fingerprint(side_name, obj_id, point, crop, video_path, args, corrections):
@@ -394,6 +432,8 @@ def run_side(side_name, side_data, ids, args, out_root: Path, corrections, corre
                     frames_dir_override=frames_dir,
                     shared_state=shared_state,
                     release_state=False,
+                    correction_restart_mode=args.correction_restart_mode,
+                    auto_pause_missing=args.auto_pause_missing,
                 )
                 if stopped:
                     status = "stopped"
@@ -448,13 +488,199 @@ def run_side(side_name, side_data, ids, args, out_root: Path, corrections, corre
     return summary
 
 
+def _write_batch_meta(batch_dir: Path,
+                      side_name,
+                      batch_name,
+                      batch_ids,
+                      status,
+                      error,
+                      rows,
+                      frame_count,
+                      fingerprint):
+    (batch_dir / "batch_meta.json").write_text(json.dumps({
+        "side": side_name,
+        "batch": batch_name,
+        "object_ids": [int(obj_id) for obj_id in batch_ids],
+        "status": status,
+        "error": error,
+        "rows": int(rows),
+        "expected_rows": int(frame_count) * int(len(batch_ids)),
+        "frames": int(frame_count),
+        "fingerprint": fingerprint,
+    }, indent=2))
+
+
+def _merge_side_batches(side_name, side_out: Path, batches, results, frame_count, args):
+    objectwise_root = side_out / "objectwise"
+    merged_rows = []
+    for batch_ids in batches:
+        batch_name = f"batch_{batch_ids[0]:03d}_{batch_ids[-1]:03d}"
+        merged_rows.extend(load_track_rows(objectwise_root / batch_name / "tracks_2d.csv"))
+    write_track_rows(side_out / "tracks_2d.csv", merged_rows)
+    summary = {
+        "side": side_name,
+        "object_ids": [int(obj_id) for batch in batches for obj_id in batch],
+        "batch_size": int(args.batch_size),
+        "batches": batches,
+        "frames": int(frame_count),
+        "rows": len(merged_rows),
+        "ok_batches": [r["batch"] for r in results if r["status"] in ("ok", "skipped")],
+        "stopped_batches": [r["batch"] for r in results if r["status"] == "stopped"],
+        "failed_batches": [r["batch"] for r in results if r["status"] == "failed"],
+        "results": results,
+    }
+    (side_out / "objectwise_summary.json").write_text(json.dumps(summary, indent=2))
+    print(f"[OK][{side_name.upper()}] merged tracks: {side_out / 'tracks_2d.csv'} rows={len(merged_rows)}")
+    return summary
+
+
+def run_dual_preview_sides(setup, ids, args, out_root: Path):
+    gpu_count = torch.cuda.device_count() if torch.cuda.is_available() else 0
+    if gpu_count < 2:
+        raise RuntimeError("--gpu-mode dual requires at least 2 CUDA GPUs")
+
+    side_out = {
+        "left": out_root / "left",
+        "right": out_root / "right",
+    }
+    objectwise_root = {}
+    for side_name in ("left", "right"):
+        side_out[side_name].mkdir(parents=True, exist_ok=True)
+        objectwise_root[side_name] = side_out[side_name] / "objectwise"
+        objectwise_root[side_name].mkdir(parents=True, exist_ok=True)
+
+    left_frames_dir, left_frame_count = prepare_frames(
+        "left", setup["left"]["video"], setup["left"]["crop"], args, side_out["left"]
+    )
+    right_frames_dir, right_frame_count = prepare_frames(
+        "right", setup["right"]["video"], setup["right"]["crop"], args, side_out["right"]
+    )
+    batches = chunk_ids(ids, args.batch_size)
+    print(
+        f"[INFO][DUAL] LEFT->cuda:0 RIGHT->cuda:1 objects={len(ids)} "
+        f"batch_size={args.batch_size} batches={len(batches)} "
+        f"frames_left={left_frame_count} frames_right={right_frame_count}"
+    )
+    print("[INFO][DUAL] Objectwise preview/corrections apply to the currently running batch only.")
+
+    results = {"left": [], "right": []}
+    corrections = setup["corrections"]
+    corrections_path = setup["corrections_path"]
+
+    for batch_index, batch_ids in enumerate(batches, start=1):
+        batch_name = f"batch_{batch_ids[0]:03d}_{batch_ids[-1]:03d}"
+        left_batch_dir = objectwise_root["left"] / batch_name
+        right_batch_dir = objectwise_root["right"] / batch_name
+        left_fingerprint = batch_fingerprint("left", batch_ids, setup["left"], args, corrections)
+        right_fingerprint = batch_fingerprint("right", batch_ids, setup["right"], args, corrections)
+        left_complete = (
+            not args.overwrite
+            and batch_is_complete(left_batch_dir, left_fingerprint, left_frame_count, len(batch_ids))
+        )
+        right_complete = (
+            not args.overwrite
+            and batch_is_complete(right_batch_dir, right_fingerprint, right_frame_count, len(batch_ids))
+        )
+        if left_complete and right_complete:
+            print(
+                f"[SKIP][DUAL] {batch_name} ({batch_index}/{len(batches)}) "
+                f"ids={batch_ids[0]}-{batch_ids[-1]}"
+            )
+            results["left"].append({
+                "batch": batch_name,
+                "object_ids": batch_ids,
+                "status": "skipped",
+                "rows": count_track_rows(left_batch_dir / "tracks_2d.csv"),
+                "error": None,
+            })
+            results["right"].append({
+                "batch": batch_name,
+                "object_ids": batch_ids,
+                "status": "skipped",
+                "rows": count_track_rows(right_batch_dir / "tracks_2d.csv"),
+                "error": None,
+            })
+            continue
+
+        if left_complete != right_complete:
+            print(
+                f"[INFO][DUAL] {batch_name} has only one completed side; rerunning both sides "
+                "to keep dual preview paired."
+            )
+
+        print(
+            f"[RUN][DUAL] {batch_name} ({batch_index}/{len(batches)}) "
+            f"ids={batch_ids[0]}-{batch_ids[-1]} count={len(batch_ids)}"
+        )
+        left_result, right_result = sam2run.run_dual_gpu_with_parent_preview(
+            left_video=setup["left"]["video"],
+            right_video=setup["right"]["video"],
+            left_out=left_batch_dir,
+            right_out=right_batch_dir,
+            left_points=[setup["left"]["points"][obj_id] for obj_id in batch_ids],
+            right_points=[setup["right"]["points"][obj_id] for obj_id in batch_ids],
+            crop_left=setup["left"]["crop"],
+            crop_right=setup["right"]["crop"],
+            scale=args.scale,
+            frame_extractor=args.frame_extractor,
+            offload_video_to_cpu=args.offload_video_to_cpu,
+            offload_state_to_cpu=args.offload_state_to_cpu,
+            async_loading_frames=args.async_loading_frames,
+            save_masks=args.save_masks,
+            save_tracks=True,
+            save_overlay=args.save_overlay,
+            preview_max_width=args.preview_max_width,
+            corrections_payload=corrections,
+            corrections_path=corrections_path,
+            correction_restart_mode=args.correction_restart_mode,
+            auto_pause_missing=args.auto_pause_missing,
+            left_object_ids=batch_ids,
+            right_object_ids=batch_ids,
+            left_frames_dir=left_frames_dir,
+            right_frames_dir=right_frames_dir,
+        )
+        side_results = {
+            "left": (left_result, left_batch_dir, left_frame_count),
+            "right": (right_result, right_batch_dir, right_frame_count),
+        }
+        for side_name, (result, batch_dir, frame_count) in side_results.items():
+            status = "ok"
+            error = result.get("error")
+            if not result.get("ok", False):
+                status = "failed"
+            elif result.get("stopped", False):
+                status = "stopped"
+            final_fingerprint = batch_fingerprint(side_name, batch_ids, setup[side_name], args, corrections)
+            rows = count_track_rows(batch_dir / "tracks_2d.csv")
+            _write_batch_meta(
+                batch_dir,
+                side_name,
+                batch_name,
+                batch_ids,
+                status,
+                error,
+                rows,
+                frame_count,
+                final_fingerprint,
+            )
+            results[side_name].append({
+                "batch": batch_name,
+                "object_ids": batch_ids,
+                "status": status,
+                "rows": rows,
+                "error": error,
+            })
+
+    return {
+        "left": _merge_side_batches("left", side_out["left"], batches, results["left"], left_frame_count, args),
+        "right": _merge_side_batches("right", side_out["right"], batches, results["right"], right_frame_count, args),
+    }
+
+
 def main():
     args = parse_args()
     if args.scale <= 0:
         raise RuntimeError("--scale must be > 0")
-    if args.gpu_mode == "dual" and args.preview:
-        args.preview = False
-        print("[WARN] --gpu-mode dual disables preview.")
 
     setup = load_setup(args)
     out_root = Path(args.out)
@@ -464,17 +690,20 @@ def main():
     ids = parse_ids(args.ids, max_count)
     sides = ["left", "right"] if args.side == "both" else [args.side]
 
-    summaries = {}
-    for side_name in sides:
-        summaries[side_name] = run_side(
-            side_name,
-            setup[side_name],
-            ids,
-            args,
-            out_root,
-            setup["corrections"],
-            setup["corrections_path"],
-        )
+    if args.gpu_mode == "dual" and args.preview and sides == ["left", "right"]:
+        summaries = run_dual_preview_sides(setup, ids, args, out_root)
+    else:
+        summaries = {}
+        for side_name in sides:
+            summaries[side_name] = run_side(
+                side_name,
+                setup[side_name],
+                ids,
+                args,
+                out_root,
+                setup["corrections"],
+                setup["corrections_path"],
+            )
 
     (out_root / "objectwise_summary.json").write_text(json.dumps(summaries, indent=2))
     print(f"[OK] objectwise summary: {out_root / 'objectwise_summary.json'}")

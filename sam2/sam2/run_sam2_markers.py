@@ -32,11 +32,21 @@ import queue
 import time
 import subprocess
 import gc
+import hashlib
 from pathlib import Path
 import argparse
+import sys
 
 import numpy as np
 import torch
+from rich.progress import (
+    BarColumn,
+    MofNCompleteColumn,
+    Progress,
+    TextColumn,
+    TimeElapsedColumn,
+    TimeRemainingColumn,
+)
 
 # ---- CONFIG ----
 DEFAULT_OUT_DIR = Path("out")
@@ -695,6 +705,33 @@ def click_points_dual(image_left_bgr, image_right_bgr, initial_left_points=None,
         oy = (ddy / max(view["disp_h"] - 1, 1)) * view_h
         return ox, oy
 
+    def zoom_at_disp_point(view, x, y, new_zoom):
+        new_zoom = max(view["min_zoom"], min(view["max_zoom"], new_zoom))
+        if new_zoom == view["zoom"]:
+            return
+        ox, oy = map_disp_to_orig(view, x, y)
+        fx = max(0.0, min(1.0, x / max(view["disp_w"] - 1, 1)))
+        fy = max(0.0, min(1.0, y / max(view["disp_h"] - 1, 1)))
+        view["zoom"] = new_zoom
+        new_view_w = view["w"] / view["zoom"]
+        new_view_h = view["h"] / view["zoom"]
+        cx = ox + (0.5 - fx) * new_view_w
+        cy = oy + (0.5 - fy) * new_view_h
+        view["center_x"], view["center_y"] = clamp_center(view, cx, cy)
+        view["last_mouse"] = (x, y)
+
+    def pan_view_with_key(view, key):
+        step = max(10.0, 60.0 / float(view["zoom"]))
+        if key == ord("a"):
+            view["center_x"] -= step
+        elif key == ord("d"):
+            view["center_x"] += step
+        elif key == ord("w"):
+            view["center_y"] -= step
+        elif key == ord("s"):
+            view["center_y"] += step
+        view["center_x"], view["center_y"] = clamp_center(view, view["center_x"], view["center_y"])
+
     def render(view, points, title, other_count):
         x0, y0, x1, y1 = get_view_rect(view)
         crop = view["img"][y0:y1, x0:x1]
@@ -745,7 +782,7 @@ def click_points_dual(image_left_bgr, image_right_bgr, initial_left_points=None,
                     cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 255), 2)
         cv2.putText(disp, "LMB add object  RMB add negative to nearest object  wheel/+/- zoom", (10, 114),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2)
-        cv2.putText(disp, "MMB drag pan  z undo neg  x undo object pair  q done  Esc cancel  1/2 focus", (10, 140),
+        cv2.putText(disp, "MMB drag/WASD pan  z undo neg  x undo object pair  q done  Esc cancel  1/2 focus", (10, 140),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
         return disp
 
@@ -799,12 +836,8 @@ def click_points_dual(image_left_bgr, image_right_bgr, initial_left_points=None,
         elif event == cv2.EVENT_MBUTTONUP:
             view["dragging"] = False
         elif event == cv2.EVENT_MOUSEWHEEL:
-            ox, oy = map_disp_to_orig(view, x, y)
             delta = 1.1 if flags > 0 else (1 / 1.1)
-            new_zoom = max(view["min_zoom"], min(view["max_zoom"], view["zoom"] * delta))
-            if new_zoom != view["zoom"]:
-                view["zoom"] = new_zoom
-                view["center_x"], view["center_y"] = ox, oy
+            zoom_at_disp_point(view, x, y, view["zoom"] * delta)
 
     def on_left(event, x, y, flags, param):
         _mouse_common(event, x, y, flags, left_view, left_points, "left")
@@ -846,12 +879,14 @@ def click_points_dual(image_left_bgr, image_right_bgr, initial_left_points=None,
 
         if key in (ord("+"), ord("="), ord("-"), ord("_")):
             target = left_view if active_view_name == "left" else right_view
-            ox, oy = map_disp_to_orig(target, *target["last_mouse"])
             if key in (ord("+"), ord("=")):
-                target["zoom"] = max(target["min_zoom"], min(target["max_zoom"], target["zoom"] * 1.1))
+                zoom_at_disp_point(target, *target["last_mouse"], target["zoom"] * 1.1)
             else:
-                target["zoom"] = max(target["min_zoom"], min(target["max_zoom"], target["zoom"] / 1.1))
-            target["center_x"], target["center_y"] = ox, oy
+                zoom_at_disp_point(target, *target["last_mouse"], target["zoom"] / 1.1)
+
+        if key in (ord("w"), ord("a"), ord("s"), ord("d")):
+            target = left_view if active_view_name == "left" else right_view
+            pan_view_with_key(target, key)
 
         if key == ord("q"):
             if len(left_points) == 0:
@@ -880,6 +915,103 @@ def _video_size(video_path: str):
     if w <= 0 or h <= 0:
         raise RuntimeError(f"Could not read video dimensions: {video_path}")
     return w, h
+
+
+def _video_signature(video_path: str):
+    path = Path(video_path)
+    stat = path.stat()
+    cap = cv2.VideoCapture(str(path))
+    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) if cap.isOpened() else -1
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) if cap.isOpened() else -1
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) if cap.isOpened() else -1
+    fps = float(cap.get(cv2.CAP_PROP_FPS)) if cap.isOpened() else -1.0
+    cap.release()
+    return {
+        "path": str(path.resolve()),
+        "size_bytes": int(stat.st_size),
+        "mtime_ns": int(stat.st_mtime_ns),
+        "frame_count": int(frame_count),
+        "width": int(width),
+        "height": int(height),
+        "fps": float(fps),
+    }
+
+
+def _stable_hash(payload) -> str:
+    text = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _count_cached_frames(frames_dir: Path) -> int:
+    if not frames_dir.exists():
+        return 0
+    return sum(1 for _ in frames_dir.glob("*.jpg"))
+
+
+def _frame_cache_status(frames_dir: Path, expected_count: int):
+    cached_count = _count_cached_frames(frames_dir)
+    if cached_count <= 0:
+        return False, cached_count, "no JPEG frames found"
+    if expected_count <= 0:
+        return True, cached_count, "OpenCV could not report the video frame count"
+    if cached_count != expected_count:
+        return False, cached_count, f"expected {expected_count} JPEG frames, found {cached_count}"
+    first_frame = frames_dir / "000000.jpg"
+    last_frame = frames_dir / f"{expected_count - 1:06d}.jpg"
+    if not first_frame.exists():
+        return False, cached_count, f"missing first frame {first_frame.name}"
+    if not last_frame.exists():
+        return False, cached_count, f"missing last frame {last_frame.name}"
+    return True, cached_count, ""
+
+
+def _frame_cache_meta(video_path: str, crop, scale: float, frame_extractor: str):
+    return {
+        "video": _video_signature(video_path),
+        "crop": list(crop) if crop is not None else None,
+        "scale": float(scale),
+        "frame_extractor": str(frame_extractor),
+    }
+
+
+def prepare_frame_cache(video_path: str,
+                        frames_dir: Path,
+                        crop=None,
+                        scale: float = 1.0,
+                        frame_extractor: str = "auto",
+                        meta_name: str = "frames_meta.json",
+                        label: str = ""):
+    frames_dir = Path(frames_dir)
+    meta_path = frames_dir.parent / meta_name
+    frame_meta = _frame_cache_meta(video_path, crop, scale, frame_extractor)
+    frame_hash = _stable_hash(frame_meta)
+    old_hash = None
+    if meta_path.exists():
+        try:
+            old_hash = json.loads(meta_path.read_text()).get("hash")
+        except Exception:
+            old_hash = None
+
+    expected_count = int(frame_meta["video"].get("frame_count", -1))
+    cache_complete, cached_count, cache_reason = _frame_cache_status(frames_dir, expected_count)
+    prefix = f"[{label}] " if label else ""
+    if old_hash != frame_hash or not cache_complete:
+        if old_hash == frame_hash and not cache_complete and cached_count > 0:
+            print(f"[WARN]{prefix}Ignoring incomplete frame cache: {cache_reason}")
+        elif old_hash is not None and old_hash != frame_hash:
+            print(f"[INFO]{prefix}Frame cache metadata changed; rebuilding {frames_dir}")
+        if frames_dir.exists():
+            shutil.rmtree(frames_dir)
+        extract_frames(video_path, frames_dir, crop=crop, scale=scale, frame_extractor=frame_extractor)
+        cache_complete, cached_count, cache_reason = _frame_cache_status(frames_dir, expected_count)
+        if not cache_complete:
+            if frames_dir.exists():
+                shutil.rmtree(frames_dir)
+            raise RuntimeError(f"{prefix}Frame extraction incomplete: {cache_reason}. Expected video={video_path}")
+        meta_path.write_text(json.dumps({"hash": frame_hash, **frame_meta}, indent=2))
+    else:
+        print(f"[INFO]{prefix}Reusing extracted frames from {frames_dir}")
+    return frames_dir, cached_count
 
 
 def _validate_crop_for_video(video_path: str, crop):
@@ -1084,6 +1216,40 @@ def click_points(image_bgr, n_points):
         oy = (ddy / max(display_h - 1, 1)) * view_h
         return ox, oy
 
+    def zoom_at_display_point(dx, dy, new_zoom):
+        nonlocal zoom, center_x, center_y, last_mouse
+        new_zoom = max(min_zoom, min(max_zoom, new_zoom))
+        if new_zoom == zoom:
+            return
+        ox, oy = map_display_to_original(dx, dy)
+        fx = max(0.0, min(1.0, dx / max(display_w - 1, 1)))
+        fy = max(0.0, min(1.0, dy / max(display_h - 1, 1)))
+        zoom = new_zoom
+        view_w = w / zoom
+        view_h = h / zoom
+        center_x, center_y = clamp_center(
+            ox + (0.5 - fx) * view_w,
+            oy + (0.5 - fy) * view_h,
+            view_w,
+            view_h,
+        )
+        last_mouse = (dx, dy)
+
+    def pan_display_with_key(key):
+        nonlocal center_x, center_y
+        step = max(10.0, 60.0 / float(zoom))
+        if key == ord("a"):
+            center_x -= step
+        elif key == ord("d"):
+            center_x += step
+        elif key == ord("w"):
+            center_y -= step
+        elif key == ord("s"):
+            center_y += step
+        view_w = w / zoom
+        view_h = h / zoom
+        center_x, center_y = clamp_center(center_x, center_y, view_w, view_h)
+
     def render_display():
         x0, y0, x1, y1 = get_view_rect()
         crop = image_bgr[y0:y1, x0:x1]
@@ -1097,6 +1263,8 @@ def click_points(image_bgr, n_points):
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
         cv2.putText(img, f"Zoom: {zoom:.1f}x", (10, 28),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+        cv2.putText(img, "wheel/+/- zoom  MMB drag/WASD pan",
+                    (10, 56), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
         return img
 
     img = None
@@ -1134,11 +1302,9 @@ def click_points(image_bgr, n_points):
             dragging = False
         elif event == cv2.EVENT_MOUSEWHEEL:
             delta = 1.1 if flags > 0 else 1 / 1.1
-            new_zoom = max(min_zoom, min(max_zoom, zoom * delta))
-            if new_zoom != zoom:
-                ox, oy = map_display_to_original(*last_mouse)
-                zoom = new_zoom
-                center_x, center_y = ox, oy
+            old_zoom = zoom
+            zoom_at_display_point(x, y, zoom * delta)
+            if zoom != old_zoom:
                 redraw()
 
     redraw()
@@ -1149,14 +1315,13 @@ def click_points(image_bgr, n_points):
         cv2.imshow("Click markers (LMB add, RMB undo, q when done)", img)
         k = cv2.waitKey(20) & 0xFF
         if k in (ord("+"), ord("=")):
-            ox, oy = map_display_to_original(*last_mouse)
-            zoom = max(min_zoom, min(max_zoom, zoom * 1.1))
-            center_x, center_y = ox, oy
+            zoom_at_display_point(*last_mouse, zoom * 1.1)
             redraw()
         elif k in (ord("-"), ord("_")):
-            ox, oy = map_display_to_original(*last_mouse)
-            zoom = max(min_zoom, min(max_zoom, zoom / 1.1))
-            center_x, center_y = ox, oy
+            zoom_at_display_point(*last_mouse, zoom / 1.1)
+            redraw()
+        elif k in (ord("w"), ord("a"), ord("s"), ord("d")):
+            pan_display_with_key(k)
             redraw()
         if k == ord("q"):
             if len(points) == n_points:
@@ -1296,6 +1461,25 @@ def _zoom_disp_delta_to_orig(view, ddx, ddy):
     return ox, oy
 
 
+def _zoom_at_disp_point(view, x, y, new_zoom):
+    """Zoom while keeping the image point under the display cursor stationary."""
+    new_zoom = max(view["min_zoom"], min(view["max_zoom"], new_zoom))
+    if new_zoom == view["zoom"]:
+        return
+    ox, oy = _zoom_disp_to_orig(view, x, y)
+    fx = max(0.0, min(1.0, x / max(view["disp_w"] - 1, 1)))
+    fy = max(0.0, min(1.0, y / max(view["disp_h"] - 1, 1)))
+    view["zoom"] = new_zoom
+    new_view_w = view["w"] / view["zoom"]
+    new_view_h = view["h"] / view["zoom"]
+    view["center_x"], view["center_y"] = _clamp_zoom_center(
+        view,
+        ox + (0.5 - fx) * new_view_w,
+        oy + (0.5 - fy) * new_view_h,
+    )
+    view["last_mouse"] = (x, y)
+
+
 def collect_correction_clicks(frame_bgr, obj_id: int, frame_idx: int, preview_max_width: int):
     """Collect positive/negative clicks and optional box in processed-frame coordinates."""
     clicks = []
@@ -1319,12 +1503,10 @@ def collect_correction_clicks(frame_bgr, obj_id: int, frame_idx: int, preview_ma
         nonlocal box, box_start, box_current
         view["last_mouse"] = (x, y)
         if event == cv2.EVENT_MOUSEWHEEL:
-            ox, oy = _zoom_disp_to_orig(view, x, y)
             if flags > 0:
-                view["zoom"] = min(view["max_zoom"], view["zoom"] * 1.2)
+                _zoom_at_disp_point(view, x, y, view["zoom"] * 1.2)
             else:
-                view["zoom"] = max(view["min_zoom"], view["zoom"] / 1.2)
-            view["center_x"], view["center_y"] = ox, oy
+                _zoom_at_disp_point(view, x, y, view["zoom"] / 1.2)
             return
         if mode == "box":
             if event == cv2.EVENT_LBUTTONDOWN:
@@ -1414,12 +1596,10 @@ def collect_correction_clicks(frame_bgr, obj_id: int, frame_idx: int, preview_ma
                 box_start = None
                 box_current = None
             elif key in (ord("+"), ord("="), ord("-"), ord("_")):
-                ox, oy = _zoom_disp_to_orig(view, *view["last_mouse"])
                 if key in (ord("+"), ord("=")):
-                    view["zoom"] = min(view["max_zoom"], view["zoom"] * 1.2)
+                    _zoom_at_disp_point(view, *view["last_mouse"], view["zoom"] * 1.2)
                 else:
-                    view["zoom"] = max(view["min_zoom"], view["zoom"] / 1.2)
-                view["center_x"], view["center_y"] = ox, oy
+                    _zoom_at_disp_point(view, *view["last_mouse"], view["zoom"] / 1.2)
             elif key in (ord("w"), ord("a"), ord("s"), ord("d")):
                 step = max(10.0, 60.0 / float(view["zoom"]))
                 if key == ord("a"):
@@ -1493,6 +1673,18 @@ def _make_correction_record(frame_idx: int, obj_id: int, correction_data, scale:
     return record
 
 
+def _correction_frame_bounds(corrections_payload, side_key: str, active_obj_ids):
+    active = set(int(v) for v in active_obj_ids)
+    frames = [
+        int(corr.get("frame", 0))
+        for corr in corrections_for_side(corrections_payload, side_key)
+        if int(corr.get("obj_id", -1)) in active
+    ]
+    if not frames:
+        return None, None
+    return min(frames), max(frames)
+
+
 def _release_sam2_state(state, device: str):
     """Best-effort release of SAM2 inference state between clean restarts."""
     try:
@@ -1504,6 +1696,17 @@ def _release_sam2_state(state, device: str):
     if str(device).startswith("cuda"):
         torch.cuda.empty_cache()
         torch.cuda.ipc_collect()
+
+
+def make_rich_progress():
+    return Progress(
+        TextColumn("[bold]{task.description}"),
+        BarColumn(),
+        MofNCompleteColumn(),
+        TimeElapsedColumn(),
+        TimeRemainingColumn(),
+        transient=False,
+    )
 
 # ---- MAIN ----
 def parse_args():
@@ -1628,10 +1831,61 @@ def parse_args():
     parser.add_argument(
         "--single-gpu-index",
         type=int,
-        default=0,
-        help="GPU index used when --gpu-mode=single (default: 0)",
+        default=None,
+        help="GPU index used when --gpu-mode=single. If omitted with multiple GPUs, prompt interactively.",
+    )
+    parser.add_argument(
+        "--correction-restart-mode",
+        choices=["full", "reseed-from-correction-frame"],
+        default="full",
+        help="Correction restart behavior. full restarts from frame 0; reseed-from-correction-frame is experimental and restarts from the earliest corrected frame using current tracked marker positions as prompts.",
+    )
+    parser.add_argument(
+        "--auto-pause-missing",
+        type=lambda x: x.lower() in ("true", "1", "yes"),
+        default=False,
+        help="Automatically pause preview when fewer valid markers are visible than expected.",
     )
     return parser.parse_args()
+
+
+def format_cuda_device_line(idx: int, name: str) -> str:
+    try:
+        props = torch.cuda.get_device_properties(idx)
+        total_gb = props.total_memory / (1024 ** 3)
+        return f"{idx}: {name} ({total_gb:.1f} GiB)"
+    except Exception:
+        return f"{idx}: {name}"
+
+
+def choose_single_gpu_index(gpu_names):
+    gpu_count = len(gpu_names)
+    if gpu_count <= 0:
+        return None
+    if gpu_count == 1:
+        print(f"[INFO] Single CUDA GPU detected: {format_cuda_device_line(0, gpu_names[0])}")
+        return 0
+
+    print("\nAvailable CUDA GPUs:")
+    for idx, name in enumerate(gpu_names):
+        print(f"  {format_cuda_device_line(idx, name)}")
+
+    if not sys.stdin.isatty():
+        print("[INFO] Non-interactive terminal detected; defaulting --gpu-mode single to cuda:0.")
+        return 0
+
+    while True:
+        raw = input(f"Select GPU for --gpu-mode single [0-{gpu_count - 1}] (Enter=0): ").strip()
+        if raw == "":
+            return 0
+        try:
+            idx = int(raw)
+        except ValueError:
+            print(f"Invalid GPU index: {raw!r}")
+            continue
+        if 0 <= idx < gpu_count:
+            return idx
+        print(f"GPU index out of range. Choose 0-{gpu_count - 1}.")
 
 def _video_fps(video_path: str) -> float:
     cap = cv2.VideoCapture(video_path)
@@ -1783,6 +2037,26 @@ def _mask_to_track_row(frame_idx: int, obj_id: int, mask_2d, crop, scale: float 
         "quality": quality,
         "valid": 1 if quality > 0 and area_original > 0 else 0,
     }
+
+
+def _valid_marker_count(rows_by_obj, active_obj_ids):
+    count = 0
+    missing = []
+    for obj_id in active_obj_ids:
+        row = rows_by_obj.get(int(obj_id))
+        if row is not None and int(row.get("valid", 0)) == 1:
+            count += 1
+        else:
+            missing.append(int(obj_id))
+    return count, len(active_obj_ids), missing
+
+
+def _pause_reason_text(auto_pause, valid_count=None, expected_count=None, missing_ids=None):
+    if not auto_pause:
+        return ""
+    shown_missing = list(missing_ids or [])[:20]
+    suffix = "..." if missing_ids is not None and len(missing_ids) > 20 else ""
+    return f"  AUTO missing {shown_missing}{suffix} ({valid_count}/{expected_count})"
 
 
 def draw_id_labels_on_processed_frame(frame_bgr,
@@ -2168,7 +2442,10 @@ def run_single_video_tracking(side_name: str,
                               frames_dir_override=None,
                               shared_state=None,
                               release_state=True,
-                              preview_controller=None):
+                              preview_controller=None,
+                              correction_restart_mode: str = "full",
+                              auto_pause_missing: bool = False,
+                              progress_event_q=None):
     object_ids = list(range(len(points))) if object_ids is None else [int(obj_id) for obj_id in object_ids]
     if len(object_ids) != len(points):
         raise ValueError("object_ids must have the same length as points")
@@ -2180,10 +2457,17 @@ def run_single_video_tracking(side_name: str,
         shutil.rmtree(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    if frames_dir_override is None or not frames_dir.exists() or not any(frames_dir.glob("*.jpg")):
-        extract_frames(video_path, frames_dir, crop=crop, scale=scale, frame_extractor=frame_extractor)
+    if frames_dir_override is None:
+        prepare_frame_cache(
+            video_path,
+            frames_dir,
+            crop=crop,
+            scale=scale,
+            frame_extractor=frame_extractor,
+            label=side_name,
+        )
     else:
-        print(f"[INFO][{side_name}] Reusing extracted frames from {frames_dir}")
+        print(f"[INFO][{side_name}] Using prepared frame cache: {frames_dir}")
     first_frame = load_first_frame(frames_dir)
     scaled_points = []
     for point in points:
@@ -2242,7 +2526,35 @@ def run_single_video_tracking(side_name: str,
     )
 
     with torch.inference_mode(), autocast_ctx:
-        def build_state_from_prompts():
+        restart_start_frame_idx = 0
+        restart_seed_points = None
+
+        def build_reseed_points_from_tracks(frame_idx: int):
+            rows = {
+                int(r["obj_id"]): r
+                for r in track_rows_data
+                if int(r["frame"]) == int(frame_idx) and int(r.get("valid", 0)) == 1
+            }
+            seed_points = {}
+            missing = []
+            for obj_id in active_obj_ids:
+                row = rows.get(int(obj_id))
+                if row is None:
+                    missing.append(int(obj_id))
+                    continue
+                seed_points[int(obj_id)] = (
+                    float(row["u_local"]) * float(scale),
+                    float(row["v_local"]) * float(scale),
+                )
+            if missing:
+                raise RuntimeError(
+                    f"[CORRECT][{side_name}] Cannot reseed from frame {frame_idx}: "
+                    f"missing valid tracked positions for object IDs {missing[:20]}"
+                    f"{'...' if len(missing) > 20 else ''}."
+                )
+            return seed_points
+
+        def build_state_from_prompts(start_frame_idx: int = 0, seed_points_by_obj=None):
             if shared_state is None:
                 state = predictor.init_state(
                     video_path=str(frames_dir),
@@ -2254,10 +2566,21 @@ def run_single_video_tracking(side_name: str,
                 predictor.reset_state(shared_state)
                 state = shared_state
 
-            frame_idx = 0
+            frame_idx = int(start_frame_idx)
             prompt_debug = []
             for point_idx, (obj_id, point) in enumerate(zip(active_obj_ids, scaled_points)):
-                pts, lbl, box = build_setup_prompt(point, scale=1.0)
+                if seed_points_by_obj is not None:
+                    seed_xy = seed_points_by_obj.get(int(obj_id))
+                    if seed_xy is None:
+                        raise RuntimeError(
+                            f"[CORRECT][{side_name}] Cannot reseed from frame {frame_idx}: "
+                            f"missing valid tracked position for obj_id={obj_id}."
+                        )
+                    pts = np.asarray([[float(seed_xy[0]), float(seed_xy[1])]], dtype=np.float32)
+                    lbl = np.asarray([1], dtype=np.int32)
+                    box = None
+                else:
+                    pts, lbl, box = build_setup_prompt(point, scale=1.0)
                 predictor.add_new_points_or_box(
                     inference_state=state,
                     frame_idx=frame_idx,
@@ -2271,9 +2594,11 @@ def run_single_video_tracking(side_name: str,
                 scaled_x, scaled_y, scaled_label = _coerce_prompt_point(point, prefer_local=False)
                 prompt_debug.append({
                     "obj_id": int(obj_id),
+                    "frame_idx": int(frame_idx),
+                    "source": "reseed_track_position" if seed_points_by_obj is not None else "setup_prompt",
                     "click_xy": [float(orig_x), float(orig_y)],
                     "label": int(orig_label),
-                    "scaled_click_xy": [float(scaled_x), float(scaled_y)],
+                    "scaled_click_xy": pts.reshape(-1, 2).tolist()[0],
                     "scaled_label": int(scaled_label),
                     "points": pts.tolist(),
                     "labels": lbl.tolist(),
@@ -2286,6 +2611,7 @@ def run_single_video_tracking(side_name: str,
             current_side_corrections = [
                 corr for corr in corrections_for_side(corrections_payload, side_key)
                 if int(corr.get("obj_id", -1)) in set(active_obj_ids)
+                and int(corr.get("frame", 0)) >= int(start_frame_idx)
             ]
             if current_side_corrections:
                 print(f"[INFO][{side_name}] Applying {len(current_side_corrections)} saved correction(s)")
@@ -2302,6 +2628,19 @@ def run_single_video_tracking(side_name: str,
             masks_root.mkdir(parents=True, exist_ok=True)
             for obj_id in active_obj_ids:
                 (masks_root / f"{obj_id:02d}").mkdir(parents=True, exist_ok=True)
+
+        def delete_outputs_from_frame(start_frame_idx: int):
+            if save_masks and masks_root.exists():
+                for obj_id in active_obj_ids:
+                    obj_mask_dir = masks_root / f"{int(obj_id):02d}"
+                    if not obj_mask_dir.exists():
+                        continue
+                    for mask_path in obj_mask_dir.glob("*.jpg"):
+                        try:
+                            if int(mask_path.stem) >= int(start_frame_idx):
+                                mask_path.unlink()
+                        except ValueError:
+                            continue
 
         h0, w0 = first_frame.shape[:2]
         out_mp4 = out_dir / "overlay.mp4"
@@ -2326,10 +2665,48 @@ def run_single_video_tracking(side_name: str,
         stop_requested = False
         frames_seen = 0
         track_rows = 0
+        local_progress = None
+        local_progress_task = None
+        use_local_progress = progress_event_q is None
         try:
+            if use_local_progress:
+                local_progress = make_rich_progress()
+                local_progress.start()
             while True:
                 clean_restart_requested = False
-                for f_idx, obj_ids, masks in predictor.propagate_in_video(state):
+                propagate_kwargs = {}
+                if int(restart_start_frame_idx) > 0:
+                    propagate_kwargs["start_frame_idx"] = int(restart_start_frame_idx)
+                if progress_event_q is not None:
+                    progress_event_q.put({
+                        "type": "reset",
+                        "side": str(side_name),
+                        "total": int(total_extracted_frames),
+                        "completed": int(restart_start_frame_idx),
+                        "description": f"{side_name} propagate",
+                    })
+                elif local_progress is not None:
+                    if local_progress_task is None:
+                        local_progress_task = local_progress.add_task(
+                            f"{side_name} propagate",
+                            total=int(total_extracted_frames),
+                        )
+                    local_progress.update(
+                        local_progress_task,
+                        completed=int(restart_start_frame_idx),
+                        total=int(total_extracted_frames),
+                    )
+                for f_idx, obj_ids, masks in predictor.propagate_in_video(state, **propagate_kwargs):
+                    if progress_event_q is not None:
+                        progress_event_q.put({
+                            "type": "update",
+                            "side": str(side_name),
+                            "total": int(total_extracted_frames),
+                            "completed": int(f_idx) + 1,
+                            "description": f"{side_name} propagate",
+                        })
+                    elif local_progress is not None and local_progress_task is not None:
+                        local_progress.update(local_progress_task, completed=int(f_idx) + 1)
                     current_save_overlay = video_writer is not None
                     frames_seen = max(frames_seen, int(f_idx) + 1)
                     masks_by_obj = {}
@@ -2425,9 +2802,12 @@ def run_single_video_tracking(side_name: str,
                                 continue
                             if cmd_type == "restart":
                                 corrections_payload = cmd.get("corrections_payload", corrections_payload)
-                                print(f"[CORRECT][{side_name}] Saved correction(s). Restarting cleanly from frame 0...")
-                                track_rows_data = []
-                                frames_seen = 0
+                                restart_start_frame_idx = int(cmd.get("start_frame_idx", 0) or 0)
+                                restart_seed_points = cmd.get("seed_points_by_obj")
+                                print(
+                                    f"[CORRECT][{side_name}] Saved correction(s). "
+                                    f"Restarting cleanly from frame {restart_start_frame_idx}..."
+                                )
                                 if video_writer is not None:
                                     video_writer.release()
                                     video_writer = None
@@ -2439,7 +2819,27 @@ def run_single_video_tracking(side_name: str,
                                     _release_sam2_state(state, device)
                                 else:
                                     predictor.reset_state(state)
-                                state = build_state_from_prompts()
+                                if restart_start_frame_idx > 0 and restart_seed_points:
+                                    restart_seed_points = {
+                                        int(k): tuple(v) for k, v in restart_seed_points.items()
+                                    }
+                                    track_rows_data = [
+                                        r for r in track_rows_data
+                                        if int(r["frame"]) < int(restart_start_frame_idx)
+                                    ]
+                                    delete_outputs_from_frame(restart_start_frame_idx)
+                                    frames_seen = int(restart_start_frame_idx)
+                                    state = build_state_from_prompts(
+                                        start_frame_idx=restart_start_frame_idx,
+                                        seed_points_by_obj=restart_seed_points,
+                                    )
+                                else:
+                                    restart_start_frame_idx = 0
+                                    restart_seed_points = None
+                                    track_rows_data = []
+                                    delete_outputs_from_frame(0)
+                                    frames_seen = 0
+                                    state = build_state_from_prompts()
                                 clean_restart_requested = True
                                 break
                             print(f"[WARN][{side_name}] Unknown preview command: {cmd_type}")
@@ -2476,9 +2876,29 @@ def run_single_video_tracking(side_name: str,
                                 hidden_preview_obj_ids,
                             )
                             continue
-                        if key == ord("p"):
+                        valid_markers, expected_markers, missing_markers = _valid_marker_count(
+                            frame_rows_by_obj,
+                            active_obj_ids,
+                        )
+                        auto_pause = bool(auto_pause_missing) and expected_markers > 0 and valid_markers < expected_markers
+                        if auto_pause and key != ord("p"):
+                            print(
+                                f"[INFO][{side_name}] Auto-pausing at frame {f_idx}: "
+                                f"valid markers {valid_markers}/{expected_markers}; "
+                                f"missing IDs {missing_markers[:20]}"
+                                f"{'...' if len(missing_markers) > 20 else ''}."
+                            )
+                        if key == ord("p") or auto_pause:
                             pause_zoom = 1.0
                             pause_frame_idx = int(f_idx)
+                            pause_corrections_added = 0
+                            pause_correction_frames = []
+                            pause_reason = _pause_reason_text(
+                                auto_pause,
+                                valid_markers,
+                                expected_markers,
+                                missing_markers,
+                            )
 
                             def load_pause_frame(frame_idx):
                                 if int(frame_idx) == int(f_idx):
@@ -2508,7 +2928,7 @@ def run_single_video_tracking(side_name: str,
                                     paused_rows,
                                     scale,
                                     preview_max_width,
-                                    f"PAUSED {side_name} frame={pause_frame_idx}  Left/Right frame  p resume  v IDs  c correct  +/- zoom  WASD pan",
+                                    f"PAUSED {side_name} frame={pause_frame_idx}{pause_reason}  Left/Right frame  p resume  v IDs  c correct  +/- zoom  WASD pan",
                                     zoom=pause_zoom,
                                     center_xy=pause_center,
                                     visible_obj_ids=[
@@ -2529,7 +2949,55 @@ def run_single_video_tracking(side_name: str,
                                     stop_requested = True
                                     break
                                 if pause_key == ord("p"):
-                                    print(f"[INFO][{side_name}] Resumed at frame {f_idx}.")
+                                    if pause_corrections_added:
+                                        save_corrections(corrections_payload, corrections_path)
+                                        with open(out_dir / "prompts" / "corrections_applied.json", "w") as f:
+                                            json.dump(corrections_for_side(corrections_payload, side_key), f, indent=2)
+                                        print(
+                                            f"[CORRECT][{side_name}] Saved {pause_corrections_added} correction(s). "
+                                            "Restarting cleanly..."
+                                        )
+                                        if video_writer is not None:
+                                            video_writer.release()
+                                            video_writer = None
+                                        if save_overlay:
+                                            print("[WARN] Correction restart invalidated partial overlay.mp4; disabling overlay for this run.")
+                                            if video_writer is not None:
+                                                video_writer.release()
+                                                video_writer = None
+                                            if out_mp4.exists():
+                                                out_mp4.unlink()
+                                        if shared_state is None:
+                                            _release_sam2_state(state, device)
+                                        else:
+                                            predictor.reset_state(state)
+                                        if correction_restart_mode == "reseed-from-correction-frame":
+                                            restart_start_frame_idx = min(int(v) for v in pause_correction_frames)
+                                            restart_seed_points = build_reseed_points_from_tracks(restart_start_frame_idx)
+                                            track_rows_data = [
+                                                r for r in track_rows_data
+                                                if int(r["frame"]) < int(restart_start_frame_idx)
+                                            ]
+                                            delete_outputs_from_frame(restart_start_frame_idx)
+                                            frames_seen = int(restart_start_frame_idx)
+                                            print(
+                                                f"[CORRECT][{side_name}] Experimental reseed restart from "
+                                                f"frame {restart_start_frame_idx}."
+                                            )
+                                            state = build_state_from_prompts(
+                                                start_frame_idx=restart_start_frame_idx,
+                                                seed_points_by_obj=restart_seed_points,
+                                            )
+                                        else:
+                                            restart_start_frame_idx = 0
+                                            restart_seed_points = None
+                                            track_rows_data = []
+                                            delete_outputs_from_frame(0)
+                                            frames_seen = 0
+                                            state = build_state_from_prompts()
+                                        clean_restart_requested = True
+                                    else:
+                                        print(f"[INFO][{side_name}] Resumed at frame {f_idx}.")
                                     break
                                 if pause_key == ord("v"):
                                     hidden_preview_obj_ids = prompt_id_visibility_in_preview(
@@ -2540,11 +3008,51 @@ def run_single_video_tracking(side_name: str,
                                     )
                                     continue
                                 if pause_key == ord("c"):
-                                    correction_frame_idx = int(pause_frame_idx)
-                                    correction_frame_bgr = paused_frame
-                                    correction_rows_by_obj = paused_rows
-                                    key = ord("c")
-                                    break
+                                    correction_frame_path = frames_dir / f"{int(pause_frame_idx):06d}.jpg"
+                                    correction_frame = cv2.imread(str(correction_frame_path), cv2.IMREAD_COLOR)
+                                    if correction_frame is None or correction_frame.size == 0:
+                                        print(f"[CORRECT] Could not read correction frame: {correction_frame_path}")
+                                        continue
+                                    correction_vis, _, _ = render_preview_frame(
+                                        correction_frame,
+                                        paused_rows,
+                                        scale,
+                                        preview_max_width,
+                                        f"{side_name} frame={pause_frame_idx} correction",
+                                        reserved_top_px=112,
+                                        visible_obj_ids=[
+                                            obj_id for obj_id in active_obj_ids
+                                            if obj_id not in hidden_preview_obj_ids
+                                        ],
+                                    )
+                                    obj_id = prompt_obj_id_in_preview(
+                                        preview_win,
+                                        correction_vis,
+                                        active_obj_ids,
+                                        side_name,
+                                        int(pause_frame_idx),
+                                    )
+                                    if obj_id is None:
+                                        print("[CORRECT] Object ID selection canceled.")
+                                        continue
+                                    clicks = collect_correction_clicks(
+                                        correction_frame,
+                                        obj_id,
+                                        int(pause_frame_idx),
+                                        preview_max_width,
+                                    )
+                                    if not clicks:
+                                        print("[CORRECT] No correction applied for this object.")
+                                        continue
+                                    correction = _make_correction_record(int(pause_frame_idx), obj_id, clicks, scale)
+                                    corrections_payload.setdefault("corrections", {}).setdefault(side_key, []).append(correction)
+                                    pause_corrections_added += 1
+                                    pause_correction_frames.append(int(pause_frame_idx))
+                                    print(
+                                        f"[CORRECT][{side_name}] Queued correction for obj_id={obj_id} "
+                                        f"at frame {pause_frame_idx}. Press p to apply/restart, or keep browsing."
+                                    )
+                                    continue
                                 is_left_arrow = pause_key == 81 or raw_pause_key in (2424832, 65361)
                                 is_right_arrow = pause_key == 83 or raw_pause_key in (2555904, 65363)
                                 if is_left_arrow or is_right_arrow:
@@ -2575,6 +3083,8 @@ def run_single_video_tracking(side_name: str,
                                 elif pause_key == ord("s"):
                                     pause_center = (cx, cy + step)
                             if stop_requested:
+                                break
+                            if clean_restart_requested:
                                 break
                         if key == ord("c"):
                             prompt_vis, _, _ = render_preview_frame(
@@ -2691,6 +3201,16 @@ def run_single_video_tracking(side_name: str,
                 if stop_requested or not clean_restart_requested:
                     break
         finally:
+            if progress_event_q is not None:
+                progress_event_q.put({
+                    "type": "done",
+                    "side": str(side_name),
+                    "total": int(total_extracted_frames),
+                    "completed": int(frames_seen),
+                    "description": f"{side_name} propagate",
+                })
+            if local_progress is not None:
+                local_progress.stop()
             if local_preview:
                 cv2.destroyWindow(preview_win)
             if video_writer is not None:
@@ -2750,7 +3270,12 @@ def _run_single_video_worker(side_name: str,
                              corrections_payload=None,
                              corrections_path: Path = DEFAULT_CORRECTIONS_PATH,
                              preview_event_q=None,
-                             preview_cmd_q=None):
+                             preview_cmd_q=None,
+                             correction_restart_mode: str = "full",
+                             object_ids=None,
+                             frames_dir_override=None,
+                             auto_pause_missing: bool = False,
+                             progress_event_q=None):
     """Worker entrypoint for running one side on one explicit device."""
     try:
         device = str(device)
@@ -2792,7 +3317,12 @@ def _run_single_video_worker(side_name: str,
             preview_max_width=preview_max_width,
             corrections_payload=corrections_payload,
             corrections_path=corrections_path,
+            object_ids=object_ids,
+            frames_dir_override=frames_dir_override,
             preview_controller=preview_controller,
+            correction_restart_mode=correction_restart_mode,
+            auto_pause_missing=auto_pause_missing,
+            progress_event_q=progress_event_q,
         )
         return {
             "side": side_name,
@@ -2938,10 +3468,17 @@ def run_dual_gpu_with_parent_preview(left_video,
                                      save_overlay,
                                      preview_max_width,
                                      corrections_payload,
-                                     corrections_path):
+                                     corrections_path,
+                                     correction_restart_mode: str = "full",
+                                     left_object_ids=None,
+                                     right_object_ids=None,
+                                     left_frames_dir=None,
+                                     right_frames_dir=None,
+                                     auto_pause_missing: bool = False):
     """Run left/right workers on separate GPUs while the parent owns OpenCV UI."""
     mp_ctx = multiprocessing.get_context("spawn")
     event_q = mp_ctx.Queue(maxsize=2)
+    progress_q = mp_ctx.Queue()
     result_q = mp_ctx.Queue()
     command_queues = {
         "LEFT": mp_ctx.Queue(maxsize=1),
@@ -2951,14 +3488,14 @@ def run_dual_gpu_with_parent_preview(left_video,
     specs = [
         (
             "LEFT", left_video, str(left_out), left_points, crop_left, "cuda:0",
-            command_queues["LEFT"],
+            command_queues["LEFT"], left_object_ids, left_frames_dir,
         ),
         (
             "RIGHT", right_video, str(right_out), right_points, crop_right, "cuda:1",
-            command_queues["RIGHT"],
+            command_queues["RIGHT"], right_object_ids, right_frames_dir,
         ),
     ]
-    for side_name, video_path, out_dir, points, crop, device, cmd_q in specs:
+    for side_name, video_path, out_dir, points, crop, device, cmd_q, object_ids, frames_dir in specs:
         proc = mp_ctx.Process(
             target=_run_single_video_process,
             args=(
@@ -2983,6 +3520,11 @@ def run_dual_gpu_with_parent_preview(left_video,
                 corrections_path,
                 event_q,
                 cmd_q,
+                correction_restart_mode,
+                object_ids,
+                str(frames_dir) if frames_dir is not None else None,
+                auto_pause_missing,
+                progress_q,
             ),
         )
         proc.start()
@@ -2997,11 +3539,67 @@ def run_dual_gpu_with_parent_preview(left_video,
 
     hidden_by_side = {"LEFT": set(), "RIGHT": set()}
     history_by_side = {"LEFT": {}, "RIGHT": {}}
+    latest_event_by_side = {}
     results = {}
     stop_all = False
+    pending_key = None
+    pending_manual_pause_side = None
+    progress = make_rich_progress()
+    progress_tasks = {}
+
+    def drain_progress_events():
+        while True:
+            try:
+                progress_event = progress_q.get_nowait()
+            except queue.Empty:
+                break
+            side = str(progress_event.get("side", "")).upper()
+            if side not in ("LEFT", "RIGHT"):
+                continue
+            description = str(progress_event.get("description") or f"{side} propagate")
+            total = int(progress_event.get("total", 0) or 0)
+            completed = int(progress_event.get("completed", 0) or 0)
+            if side not in progress_tasks:
+                progress_tasks[side] = progress.add_task(description, total=total)
+            progress.update(
+                progress_tasks[side],
+                description=description,
+                total=total,
+                completed=completed,
+            )
+
+    def prompt_manual_pause_side():
+        print("[INFO][DUAL] Pause requested. Press l for LEFT, r for RIGHT, or Esc to cancel.")
+        while True:
+            for side, event in latest_event_by_side.items():
+                img = event["image"].copy()
+                cv2.rectangle(img, (0, 0), (min(img.shape[1] - 1, 760), 42), (0, 0, 0), -1)
+                cv2.putText(
+                    img,
+                    "Pause which side?  l LEFT   r RIGHT   Esc cancel",
+                    (10, 28),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.75,
+                    (0, 255, 255),
+                    2,
+                )
+                cv2.imshow(preview_windows[side], img)
+            choice_key = cv2.waitKeyEx(30)
+            if choice_key == -1:
+                continue
+            choice = choice_key & 0xFF
+            if choice == 27:
+                print("[INFO][DUAL] Pause canceled.")
+                return None
+            if choice == ord("l"):
+                return "LEFT"
+            if choice == ord("r"):
+                return "RIGHT"
 
     try:
+        progress.start()
         while len(results) < 2:
+            drain_progress_events()
             while True:
                 try:
                     result = result_q.get_nowait()
@@ -3018,12 +3616,16 @@ def run_dual_gpu_with_parent_preview(left_video,
             try:
                 event = event_q.get(timeout=0.1)
             except queue.Empty:
+                drain_progress_events()
                 if not any(proc.is_alive() for proc in procs) and result_q.empty():
                     break
-                cv2.waitKey(1)
+                idle_key = cv2.waitKeyEx(30)
+                if idle_key != -1:
+                    pending_key = idle_key
                 continue
 
             side_name = str(event.get("side", "")).upper()
+            drain_progress_events()
             if event.get("type") != "frame" or side_name not in command_queues:
                 continue
 
@@ -3031,11 +3633,17 @@ def run_dual_gpu_with_parent_preview(left_video,
             rows_by_obj = {
                 int(k): v for k, v in event.get("rows_by_obj", {}).items()
             }
+            active_obj_ids = [int(v) for v in event.get("active_obj_ids", [])]
             history_by_side[side_name][frame_idx] = rows_by_obj
+            latest_event_by_side[side_name] = event
 
             preview_win = preview_windows[side_name]
             cv2.imshow(preview_win, event["image"])
-            key = cv2.waitKey(1) & 0xFF
+            raw_key = pending_key
+            pending_key = None
+            if raw_key is None:
+                raw_key = cv2.waitKeyEx(30)
+            key = -1 if raw_key == -1 else raw_key & 0xFF
 
             if key in (27, ord("q")):
                 print(f"[INFO][{side_name}] Stop requested from dual preview.")
@@ -3056,44 +3664,107 @@ def run_dual_gpu_with_parent_preview(left_video,
                 })
                 continue
 
-            if key == ord("p"):
+            valid_markers, expected_markers, missing_markers = _valid_marker_count(
+                rows_by_obj,
+                active_obj_ids,
+            )
+            auto_pause = bool(auto_pause_missing) and expected_markers > 0 and valid_markers < expected_markers
+            if auto_pause and key != ord("p"):
+                print(
+                    f"[INFO][{side_name}] Auto-pausing at frame {frame_idx}: "
+                    f"valid markers {valid_markers}/{expected_markers}; "
+                    f"missing IDs {missing_markers[:20]}"
+                    f"{'...' if len(missing_markers) > 20 else ''}."
+                )
+
+            manual_pause = False
+            if pending_manual_pause_side == side_name:
+                manual_pause = True
+                pending_manual_pause_side = None
+                print(f"[INFO][DUAL] Pausing selected side {side_name} at frame {frame_idx}.")
+            elif key == ord("p") and not auto_pause:
+                selected_side = prompt_manual_pause_side()
+                if selected_side is None:
+                    command_queues[side_name].put({"type": "continue"})
+                    continue
+                if selected_side != side_name:
+                    pending_manual_pause_side = selected_side
+                    command_queues[side_name].put({"type": "continue"})
+                    print(f"[INFO][DUAL] Waiting for next {selected_side} frame to pause.")
+                    continue
+                manual_pause = True
+
+            if manual_pause or auto_pause:
                 pause_zoom = 1.0
                 pause_frame_idx = frame_idx
                 pause_center = None
-                active_obj_ids = [int(v) for v in event.get("active_obj_ids", [])]
+                pause_corrections_added = 0
+                pause_correction_frames = []
+                pause_reason = _pause_reason_text(
+                    auto_pause,
+                    valid_markers,
+                    expected_markers,
+                    missing_markers,
+                )
                 print(
                     f"[INFO][{side_name}] Paused at frame {frame_idx}. "
                     "Left/Right frame, p resume, c correct, +/- zoom, WASD pan."
                 )
 
-                def load_pause_frame(idx):
-                    if int(idx) == frame_idx:
-                        return event["image"], rows_by_obj
-                    pause_path = Path(event["frames_dir"]) / f"{int(idx):06d}.jpg"
+                def load_pause_frame(side, idx):
+                    side_event = latest_event_by_side.get(side)
+                    if side_event is None:
+                        return None, {}
+                    pause_path = Path(side_event["frames_dir"]) / f"{int(idx):06d}.jpg"
                     pause_frame = cv2.imread(str(pause_path), cv2.IMREAD_COLOR)
                     if pause_frame is None or pause_frame.size == 0:
                         return None, {}
-                    return pause_frame, dict(history_by_side[side_name].get(int(idx), {}))
+                    return pause_frame, dict(history_by_side[side].get(int(idx), {}))
 
-                paused_frame, paused_rows = load_pause_frame(pause_frame_idx)
-                while True:
-                    if paused_frame is None:
-                        paused_frame, paused_rows = event["image"], rows_by_obj
-                        pause_frame_idx = frame_idx
-                    paused_vis, pause_center, _ = render_preview_frame(
-                        paused_frame,
-                        paused_rows,
-                        float(event["scale"]),
+                def render_paused_side(side, idx, zoom, center_xy, title):
+                    side_event = latest_event_by_side.get(side)
+                    if side_event is None:
+                        return center_xy, None, {}
+                    side_frame, side_rows = load_pause_frame(side, idx)
+                    if side_frame is None:
+                        return center_xy, None, {}
+                    side_active_obj_ids = [int(v) for v in side_event.get("active_obj_ids", [])]
+                    side_vis, next_center, _ = render_preview_frame(
+                        side_frame,
+                        side_rows,
+                        float(side_event["scale"]),
                         preview_max_width,
-                        f"PAUSED {side_name} frame={pause_frame_idx}  Left/Right frame  p resume  v IDs  c correct  +/- zoom  WASD pan",
-                        zoom=pause_zoom,
-                        center_xy=pause_center,
+                        title,
+                        zoom=zoom,
+                        center_xy=center_xy,
                         visible_obj_ids=[
-                            obj_id for obj_id in active_obj_ids
-                            if obj_id not in hidden_by_side[side_name]
+                            obj_id for obj_id in side_active_obj_ids
+                            if obj_id not in hidden_by_side[side]
                         ],
                     )
-                    cv2.imshow(preview_win, paused_vis)
+                    cv2.imshow(preview_windows[side], side_vis)
+                    return next_center, side_vis, side_rows
+
+                paused_frame, paused_rows = load_pause_frame(side_name, pause_frame_idx)
+                while True:
+                    if paused_frame is None:
+                        pause_frame_idx = frame_idx
+                        paused_frame, paused_rows = load_pause_frame(side_name, pause_frame_idx)
+                    pause_center, paused_vis, paused_rows = render_paused_side(
+                        side_name,
+                        pause_frame_idx,
+                        pause_zoom,
+                        pause_center,
+                        f"PAUSED {side_name} frame={pause_frame_idx}{pause_reason}  Left/Right frame  p resume  v IDs  c correct  +/- zoom  WASD pan",
+                    )
+                    peer_side = "RIGHT" if side_name == "LEFT" else "LEFT"
+                    render_paused_side(
+                        peer_side,
+                        pause_frame_idx,
+                        pause_zoom,
+                        pause_center,
+                        f"PAUSED WITH {side_name} frame={pause_frame_idx}  correction side={side_name}",
+                    )
                     raw_pause_key = cv2.waitKeyEx(30)
                     if raw_pause_key == -1:
                         if cv2.getWindowProperty(preview_win, cv2.WND_PROP_VISIBLE) < 1:
@@ -3107,7 +3778,46 @@ def run_dual_gpu_with_parent_preview(left_video,
                         _dual_send_all(command_queues, {"type": "stop"})
                         break
                     if pause_key == ord("p"):
-                        command_queues[side_name].put({"type": "continue"})
+                        if pause_corrections_added:
+                            save_corrections(corrections_payload, corrections_path)
+                            print(
+                                f"[CORRECT][{side_name}] Saved {pause_corrections_added} correction(s). "
+                                "Restarting cleanly..."
+                            )
+                            restart_cmd = {
+                                "type": "restart",
+                                "corrections_payload": corrections_payload,
+                            }
+                            if correction_restart_mode == "reseed-from-correction-frame":
+                                restart_frame_idx = min(int(v) for v in pause_correction_frames)
+                                seed_rows = dict(history_by_side[side_name].get(int(restart_frame_idx), {}))
+                                missing = []
+                                seed_points = {}
+                                for obj_id in active_obj_ids:
+                                    row = seed_rows.get(int(obj_id))
+                                    if row is None or int(row.get("valid", 0)) != 1:
+                                        missing.append(int(obj_id))
+                                        continue
+                                    seed_points[int(obj_id)] = [
+                                        float(row["u_local"]) * float(event["scale"]),
+                                        float(row["v_local"]) * float(event["scale"]),
+                                    ]
+                                if missing:
+                                    print(
+                                        f"[CORRECT][{side_name}] Cannot reseed from frame {restart_frame_idx}; "
+                                        f"missing valid object IDs {missing[:20]}"
+                                        f"{'...' if len(missing) > 20 else ''}. Falling back to full restart."
+                                    )
+                                else:
+                                    print(
+                                        f"[CORRECT][{side_name}] Experimental reseed restart from "
+                                        f"frame {restart_frame_idx}."
+                                    )
+                                    restart_cmd["start_frame_idx"] = int(restart_frame_idx)
+                                    restart_cmd["seed_points_by_obj"] = seed_points
+                            command_queues[side_name].put(restart_cmd)
+                        else:
+                            command_queues[side_name].put({"type": "continue"})
                         break
                     if pause_key == ord("v"):
                         hidden_by_side[side_name] = prompt_id_visibility_in_preview(
@@ -3118,25 +3828,59 @@ def run_dual_gpu_with_parent_preview(left_video,
                         )
                         continue
                     if pause_key == ord("c"):
-                        corrections_payload = _handle_dual_correction(
-                            event,
-                            preview_win,
-                            active_obj_ids,
-                            history_by_side[side_name],
-                            hidden_by_side[side_name],
-                            corrections_payload,
-                            corrections_path,
+                        side_key = side_name.lower()
+                        correction_frame_path = Path(event["frames_dir"]) / f"{int(pause_frame_idx):06d}.jpg"
+                        correction_frame = cv2.imread(str(correction_frame_path), cv2.IMREAD_COLOR)
+                        if correction_frame is None or correction_frame.size == 0:
+                            print(f"[CORRECT] Could not read correction frame: {correction_frame_path}")
+                            continue
+                        correction_vis, _, _ = render_preview_frame(
+                            correction_frame,
+                            paused_rows,
+                            float(event["scale"]),
                             preview_max_width,
-                            command_queues[side_name],
+                            f"{side_name} frame={pause_frame_idx} correction",
+                            reserved_top_px=112,
+                            visible_obj_ids=[
+                                obj_id for obj_id in active_obj_ids
+                                if obj_id not in hidden_by_side[side_name]
+                            ],
                         )
-                        break
+                        obj_id = prompt_obj_id_in_preview(
+                            preview_win,
+                            correction_vis,
+                            active_obj_ids,
+                            side_name,
+                            int(pause_frame_idx),
+                        )
+                        if obj_id is None:
+                            print("[CORRECT] Object ID selection canceled.")
+                            continue
+                        clicks = collect_correction_clicks(
+                            correction_frame,
+                            obj_id,
+                            int(pause_frame_idx),
+                            preview_max_width,
+                        )
+                        if not clicks:
+                            print("[CORRECT] No correction applied for this object.")
+                            continue
+                        correction = _make_correction_record(int(pause_frame_idx), obj_id, clicks, float(event["scale"]))
+                        corrections_payload.setdefault("corrections", {}).setdefault(side_key, []).append(correction)
+                        pause_corrections_added += 1
+                        pause_correction_frames.append(int(pause_frame_idx))
+                        print(
+                            f"[CORRECT][{side_name}] Queued correction for obj_id={obj_id} "
+                            f"at frame {pause_frame_idx}. Press p to apply/restart, or keep browsing."
+                        )
+                        continue
                     is_left_arrow = pause_key == 81 or raw_pause_key in (2424832, 65361)
                     is_right_arrow = pause_key == 83 or raw_pause_key in (2555904, 65363)
                     if is_left_arrow or is_right_arrow:
                         delta = -1 if is_left_arrow else 1
                         next_frame_idx = max(0, min(frame_idx, int(pause_frame_idx) + delta))
                         if next_frame_idx != pause_frame_idx:
-                            loaded_frame, loaded_rows = load_pause_frame(next_frame_idx)
+                            loaded_frame, loaded_rows = load_pause_frame(side_name, next_frame_idx)
                             if loaded_frame is not None:
                                 pause_frame_idx = next_frame_idx
                                 paused_frame = loaded_frame
@@ -3182,7 +3926,9 @@ def run_dual_gpu_with_parent_preview(left_video,
 
         for proc in procs:
             proc.join()
+        drain_progress_events()
     finally:
+        progress.stop()
         for win in preview_windows.values():
             try:
                 cv2.destroyWindow(win)
@@ -3448,7 +4194,10 @@ def main():
         if gpu_count <= 0:
             device = "cpu"
         else:
-            idx = int(args.single_gpu_index)
+            if args.single_gpu_index is None:
+                idx = choose_single_gpu_index(gpu_names)
+            else:
+                idx = int(args.single_gpu_index)
             if idx < 0 or idx >= gpu_count:
                 raise RuntimeError(f"--single-gpu-index={idx} is out of range [0, {gpu_count - 1}].")
             device = f"cuda:{idx}"
@@ -3474,6 +4223,7 @@ def main():
     )
     print(f"[INFO] processing scale: {scale:g}")
     print(f"[INFO] frame extractor: {frame_extractor}")
+    print(f"[INFO] correction restart mode: {args.correction_restart_mode}")
     print(
         f"[INFO] outputs: save_tracks={save_tracks}, save_masks={save_masks}, "
         f"save_overlay={save_overlay}, preview={preview}"
@@ -3506,6 +4256,8 @@ def main():
                 preview_max_width=preview_max_width,
                 corrections_payload=corrections_payload,
                 corrections_path=corrections_path,
+                correction_restart_mode=args.correction_restart_mode,
+                auto_pause_missing=args.auto_pause_missing,
             )
         else:
             mp_ctx = multiprocessing.get_context("spawn")
@@ -3530,6 +4282,12 @@ def main():
                     preview_max_width,
                     corrections_payload,
                     corrections_path,
+                    None,
+                    None,
+                    args.correction_restart_mode,
+                    None,
+                    None,
+                    args.auto_pause_missing,
                 )
                 right_future = ex.submit(
                     _run_single_video_worker,
@@ -3551,6 +4309,12 @@ def main():
                     preview_max_width,
                     corrections_payload,
                     corrections_path,
+                    None,
+                    None,
+                    args.correction_restart_mode,
+                    None,
+                    None,
+                    args.auto_pause_missing,
                 )
                 left_result = left_future.result()
                 right_result = right_future.result()
@@ -3595,6 +4359,8 @@ def main():
             preview_max_width=preview_max_width,
             corrections_payload=corrections_payload,
             corrections_path=corrections_path,
+            correction_restart_mode=args.correction_restart_mode,
+            auto_pause_missing=args.auto_pause_missing,
         )
 
         right_overlay, right_stopped = run_single_video_tracking(
@@ -3617,6 +4383,8 @@ def main():
             preview_max_width=preview_max_width,
             corrections_payload=corrections_payload,
             corrections_path=corrections_path,
+            correction_restart_mode=args.correction_restart_mode,
+            auto_pause_missing=args.auto_pause_missing,
         )
 
     if left_stopped:

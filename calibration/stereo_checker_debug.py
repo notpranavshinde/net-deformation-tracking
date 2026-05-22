@@ -1,12 +1,16 @@
 import argparse
 import json
 import os
+import queue
 import shutil
 import subprocess
 import tempfile
+import time
 import wave
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 from dataclasses import dataclass
+from multiprocessing import Manager
 from typing import List, Tuple, Optional
 
 import cv2
@@ -19,6 +23,13 @@ _CUDA_FALLBACK_WARNED = False
 
 AUDIO_TOPK_DEFAULT = 5
 AUDIO_MIN_SEPARATION_FRAMES_DEFAULT = 20
+DEFAULT_LEFT_VIDEO = "in/left.mp4"
+DEFAULT_RIGHT_VIDEO = "in/right.mp4"
+DEFAULT_SYNC_JSON = "work/sync.json"
+DEFAULT_STATS_DIR = "work/stats"
+DEFAULT_MONO_NPZ = "work/mono.npz"
+DEFAULT_STEREO_NPZ = "work/stereo.npz"
+DEFAULT_RECTIFY_DIR = "work/rectify"
 
 
 # -----------------------------
@@ -58,11 +69,13 @@ def validate_args(args):
     if hasattr(args, "rows") and args.rows < 2:
         raise ValueError("--rows must be >= 2")
     if hasattr(args, "max_scan") and args.max_scan < 1:
-        raise ValueError("--max_scan must be >= 1")
+        raise ValueError("--max-scan must be >= 1")
     if hasattr(args, "max_frames") and args.max_frames == 0:
-        raise ValueError("--max_frames cannot be 0 (use -1 for all frames)")
+        raise ValueError("--max-frames cannot be 0 (use -1 for all frames)")
     if hasattr(args, "max_pairs") and args.max_pairs < 1:
-        raise ValueError("--max_pairs must be >= 1")
+        raise ValueError("--max-pairs must be >= 1")
+    if hasattr(args, "workers") and args.workers < 1:
+        raise ValueError("--workers must be >= 1")
 
 def downscale(frame, scale: float):
     if scale == 1.0:
@@ -627,7 +640,11 @@ def collect_samples_checker(video_path: str,
                             out_dir: str,
                             use_cuda: bool = False,
                             frame_indices: Optional[List[int]] = None,
-                            no_adaptive: bool = False):
+                            no_adaptive: bool = False,
+                            tqdm_position: int = 0,
+                            show_tqdm: bool = True,
+                            progress_queue=None,
+                            quiet: bool = False):
     ensure_dir(out_dir)
     cap = open_video(video_path)
     total, fps, (W, H) = get_video_info(cap)
@@ -652,11 +669,21 @@ def collect_samples_checker(video_path: str,
         if max_scan > 0:
             idx_list = idx_list[:max_scan]
 
-        pbar = tqdm(total=len(idx_list), desc=f"[{label} detection]", unit="frame")
+        if progress_queue is not None:
+            progress_queue.put(("total", len(idx_list)))
+        pbar = tqdm(
+            total=len(idx_list),
+            desc=f"[{label} detection]",
+            unit="frame",
+            position=tqdm_position,
+            disable=not show_tqdm,
+        )
         next_idx = None
         for idx in idx_list:
             ok, frame, next_idx = read_frame_progressive(cap, idx, next_idx)
             pbar.update(1)
+            if progress_queue is not None:
+                progress_queue.put(("update", 1))
             if not ok:
                 continue
 
@@ -701,16 +728,27 @@ def collect_samples_checker(video_path: str,
             if len(idx_list) > remaining:
                 idx_list = idx_list[:remaining]
 
-            print(
-                f"[{label}] {'simple' if no_adaptive else 'adaptive'} pass {pass_i}/{len(steps)}: "
-                f"step={pass_step}, intervals={len(intervals)}, frames={len(idx_list)}"
+            if not quiet:
+                print(
+                    f"[{label}] {'simple' if no_adaptive else 'adaptive'} pass {pass_i}/{len(steps)}: "
+                    f"step={pass_step}, intervals={len(intervals)}, frames={len(idx_list)}"
+                )
+            if progress_queue is not None:
+                progress_queue.put(("total", len(idx_list)))
+            pbar = tqdm(
+                total=len(idx_list),
+                desc=f"[{label} detection s={pass_step}]",
+                unit="frame",
+                position=tqdm_position,
+                disable=not show_tqdm,
             )
-            pbar = tqdm(total=len(idx_list), desc=f"[{label} detection s={pass_step}]", unit="frame")
 
             for idx in idx_list:
                 ok, frame, next_idx = read_frame_progressive(cap, idx, next_idx)
                 visited.add(int(idx))
                 pbar.update(1)
+                if progress_queue is not None:
+                    progress_queue.put(("update", 1))
                 if not ok:
                     continue
 
@@ -875,7 +913,7 @@ def cmd_sync(args):
         )
 
         if len(candL) == 0 or len(candR) == 0:
-            raise RuntimeError("[SYNC] No audio peak candidates found. Try increasing --max_frames.")
+            raise RuntimeError("[SYNC] No audio peak candidates found. Try increasing --max-frames.")
 
         audio_preview_png = str(Path(args.out).with_suffix("")) + "_audio_peaks.png"
         try:
@@ -980,6 +1018,453 @@ def build_paired_indices_from_stats(trimL: int,
     common_g = sorted(set(left_g.keys()) & set(right_g.keys()))
     return [(left_g[g], right_g[g]) for g in common_g]
 
+
+def collect_stats_worker(params: dict):
+    samples, stats, image_size = collect_samples_checker(
+        params["video_path"],
+        params["trim"],
+        params["pattern"],
+        params["square_m"],
+        scale=params["scale"],
+        step=params["step"],
+        max_scan=params["max_scan"],
+        debug_every=params["debug_every"],
+        label=params["label"],
+        out_dir=params["out_dir"],
+        use_cuda=params["use_cuda"],
+        no_adaptive=params["no_adaptive"],
+        show_tqdm=params["show_tqdm"],
+        progress_queue=params["progress_queue"],
+        quiet=params["quiet"],
+    )
+    stats["detected_frame_indices"] = [int(s.frame_idx) for s in samples]
+    return stats, image_size
+
+
+def chunk_indices(indices: List[int], n_chunks: int) -> List[List[int]]:
+    if not indices:
+        return []
+    n_chunks = max(1, min(int(n_chunks), len(indices)))
+    chunk_size = (len(indices) + n_chunks - 1) // n_chunks
+    return [indices[i:i + chunk_size] for i in range(0, len(indices), chunk_size)]
+
+
+def detect_stats_chunk_worker(params: dict):
+    video_path = params["video_path"]
+    idx_list = [int(i) for i in params["idx_list"]]
+    pattern = tuple(params["pattern"])
+    scale = float(params["scale"])
+    label = params["label"]
+    debug_every = int(params["debug_every"])
+    out_dir = params["out_dir"]
+    progress_queue = params.get("progress_queue")
+
+    cap = open_video(video_path)
+    found_indices = []
+    scanned = 0
+    next_idx = None
+    try:
+        for local_i, idx in enumerate(idx_list, start=1):
+            ok, frame, next_idx = read_frame_progressive(cap, idx, next_idx)
+            if progress_queue is not None:
+                progress_queue.put(("update", 1))
+            if not ok:
+                continue
+
+            frame, gray = prepare_frame_and_gray(frame, scale)
+            scanned += 1
+            found, corners = detect_checkerboard(gray, pattern)
+            if found:
+                found_indices.append(int(idx))
+
+            if debug_every > 0 and (local_i % debug_every == 0):
+                vis = frame.copy()
+                if found and corners is not None:
+                    cv2.drawChessboardCorners(vis, pattern, corners, found)
+                    cv2.putText(vis, f"{label} FOUND", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,255,0), 2)
+                else:
+                    cv2.putText(vis, f"{label} NOT FOUND", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,0,255), 2)
+                cv2.putText(vis, f"idx={idx}", (20, 80),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255,255,0), 2)
+                cv2.imwrite(os.path.join(out_dir, f"{label}_debug_idx_{idx:08d}.png"), vis)
+    finally:
+        cap.release()
+
+    return {
+        "scanned": scanned,
+        "found_indices": found_indices,
+    }
+
+
+def collect_sample_chunk_worker(params: dict):
+    video_path = params["video_path"]
+    idx_list = [int(i) for i in params["idx_list"]]
+    pattern = tuple(params["pattern"])
+    square_m = float(params["square_m"])
+    scale = float(params["scale"])
+    label = params["label"]
+    debug_every = int(params["debug_every"])
+    out_dir = params["out_dir"]
+    progress_queue = params.get("progress_queue")
+
+    cap = open_video(video_path)
+    obj_template = make_object_points(pattern, square_m)
+    samples = []
+    scanned = 0
+    next_idx = None
+    try:
+        for local_i, idx in enumerate(idx_list, start=1):
+            ok, frame, next_idx = read_frame_progressive(cap, idx, next_idx)
+            if progress_queue is not None:
+                progress_queue.put(("update", 1))
+            if not ok:
+                continue
+
+            frame, gray = prepare_frame_and_gray(frame, scale)
+            scanned += 1
+            found, corners = detect_checkerboard(gray, pattern)
+
+            if found:
+                pts = corners.reshape(-1, 2)
+                samples.append(Sample(frame_idx=idx, img=pts, obj=obj_template.copy()))
+
+            if debug_every > 0 and (local_i % debug_every == 0):
+                vis = frame.copy()
+                if found and corners is not None:
+                    cv2.drawChessboardCorners(vis, pattern, corners, found)
+                    cv2.putText(vis, f"{label} FOUND", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,255,0), 2)
+                else:
+                    cv2.putText(vis, f"{label} NOT FOUND", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,0,255), 2)
+                cv2.putText(vis, f"idx={idx}", (20, 80),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255,255,0), 2)
+                cv2.imwrite(os.path.join(out_dir, f"{label}_debug_idx_{idx:08d}.png"), vis)
+    finally:
+        cap.release()
+
+    return {
+        "scanned": scanned,
+        "samples": samples,
+    }
+
+
+def collect_stereo_pair_chunk_worker(params: dict):
+    left_video = params["left_video"]
+    right_video = params["right_video"]
+    pair_list = [(int(a), int(b)) for a, b in params["pair_list"]]
+    pattern = tuple(params["pattern"])
+    square_m = float(params["square_m"])
+    scale = float(params["scale"])
+    debug_every = int(params["debug_every"])
+    out_dir = params["out_dir"]
+    progress_queue = params.get("progress_queue")
+
+    capL = open_video(left_video)
+    capR = open_video(right_video)
+    obj_template = make_object_points(pattern, square_m)
+    usedL = []
+    usedR = []
+    scanned = 0
+    nextL = None
+    nextR = None
+    try:
+        for local_i, (idxL, idxR) in enumerate(pair_list, start=1):
+            okL, fL, nextL = read_frame_progressive(capL, idxL, nextL)
+            okR, fR, nextR = read_frame_progressive(capR, idxR, nextR)
+            if progress_queue is not None:
+                progress_queue.put(("update", 1))
+            if not okL or not okR:
+                continue
+
+            fL, gL = prepare_frame_and_gray(fL, scale)
+            fR, gR = prepare_frame_and_gray(fR, scale)
+            scanned += 1
+            foundL, cL = detect_checkerboard(gL, pattern)
+            foundR, cR = detect_checkerboard(gR, pattern)
+
+            if foundL and foundR:
+                usedL.append(Sample(idxL, cL.reshape(-1, 2), obj_template.copy()))
+                usedR.append(Sample(idxR, cR.reshape(-1, 2), obj_template.copy()))
+
+            if debug_every > 0 and (local_i % debug_every == 0):
+                visL = fL.copy()
+                visR = fR.copy()
+                if foundL:
+                    cv2.drawChessboardCorners(visL, pattern, cL, True)
+                if foundR:
+                    cv2.drawChessboardCorners(visR, pattern, cR, True)
+                both = np.hstack([visL, visR])
+                cv2.putText(both, f"idxL={idxL} idxR={idxR} paired={len(usedL)}", (20, 40),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1, (0,255,255), 2)
+                cv2.imwrite(os.path.join(out_dir, f"pair_idx_{idxL:08d}_{idxR:08d}.png"), both)
+    finally:
+        capL.release()
+        capR.release()
+
+    return {
+        "scanned": scanned,
+        "usedL": usedL,
+        "usedR": usedR,
+    }
+
+
+def drain_progress_queue(progress_queue, pbar):
+    while True:
+        try:
+            event, value = progress_queue.get_nowait()
+        except queue.Empty:
+            break
+        if event == "total":
+            pbar.total = int(pbar.total or 0) + int(value)
+            pbar.refresh()
+        elif event == "update":
+            pbar.update(int(value))
+
+
+def collect_stats_parallel_side(params: dict, workers: int, progress_queue=None, pbar=None):
+    ensure_dir(params["out_dir"])
+    cap = open_video(params["video_path"])
+    try:
+        total, _fps, (W, H) = get_video_info(cap)
+    finally:
+        cap.release()
+
+    scale = float(params["scale"])
+    image_size = (int(W * scale), int(H * scale))
+    scan_lo = max(0, int(params["trim"]))
+    scan_hi = total - 1
+    intervals = [(scan_lo, scan_hi)]
+    steps = [int(params["step"])] if params["no_adaptive"] else adaptive_halving_steps(params["step"], levels=4)
+    visited = set()
+    scanned = 0
+    found_indices: List[int] = []
+    max_scan = int(params["max_scan"])
+    scan_source = "parallel_adaptive_halving_scan"
+
+    with ProcessPoolExecutor(max_workers=max(1, int(workers))) as executor:
+        for pass_i, pass_step in enumerate(steps, start=1):
+            remaining = max_scan - scanned
+            if remaining <= 0 or scan_hi < scan_lo or len(intervals) == 0:
+                break
+
+            idx_list = build_scan_indices(intervals, pass_step, scan_lo, scan_hi)
+            idx_list = [i for i in idx_list if i not in visited]
+            if len(idx_list) == 0:
+                continue
+            if len(idx_list) > remaining:
+                idx_list = idx_list[:remaining]
+
+            msg = (
+                f"[{params['label']}] {'simple' if params['no_adaptive'] else 'adaptive'} pass {pass_i}/{len(steps)}: "
+                f"step={pass_step}, intervals={len(intervals)}, frames={len(idx_list)}, workers={workers}"
+            )
+            if pbar is not None:
+                pbar.write(msg)
+            else:
+                print(msg)
+            if progress_queue is not None:
+                progress_queue.put(("total", len(idx_list)))
+
+            futures = []
+            for chunk in chunk_indices(idx_list, workers):
+                futures.append(executor.submit(detect_stats_chunk_worker, {
+                    "video_path": params["video_path"],
+                    "idx_list": chunk,
+                    "pattern": params["pattern"],
+                    "scale": params["scale"],
+                    "label": params["label"],
+                    "debug_every": params["debug_every"],
+                    "out_dir": params["out_dir"],
+                    "progress_queue": progress_queue,
+                }))
+
+            pass_found = []
+            pending = set(futures)
+            while pending:
+                done = [future for future in pending if future.done()]
+                if not done:
+                    if progress_queue is not None and pbar is not None:
+                        drain_progress_queue(progress_queue, pbar)
+                    time.sleep(0.1)
+                    continue
+                for future in done:
+                    pending.remove(future)
+                    result = future.result()
+                    scanned += int(result["scanned"])
+                    pass_found.extend(int(i) for i in result["found_indices"])
+                if progress_queue is not None and pbar is not None:
+                    drain_progress_queue(progress_queue, pbar)
+
+            visited.update(int(i) for i in idx_list)
+            found_indices.extend(pass_found)
+
+            if pass_i < len(steps) and found_indices:
+                intervals = build_roi_intervals(found_indices, margin=pass_step * 2, min_idx=scan_lo, max_idx=scan_hi)
+
+            if scanned >= max_scan:
+                break
+
+    found_indices = sorted(set(found_indices))
+    stats = {
+        "video": params["video_path"],
+        "sync_start": int(params["trim"]),
+        "scan_source": scan_source,
+        "scale": scale,
+        "step": int(params["step"]),
+        "max_scan": max_scan,
+        "scanned": int(scanned),
+        "found": len(found_indices),
+        "found_pct": 0.0 if scanned == 0 else 100.0 * len(found_indices) / scanned,
+        "used_frames": len(found_indices),
+        "pattern_inner_corners": list(params["pattern"]),
+        "square_m": float(params["square_m"]),
+        "image_size_scaled": list(image_size),
+        "detected_frame_indices": found_indices,
+    }
+    return stats, image_size
+
+
+def collect_samples_parallel_indices(params: dict, frame_indices: List[int], workers: int, progress_queue=None, pbar=None):
+    ensure_dir(params["out_dir"])
+    cap = open_video(params["video_path"])
+    try:
+        total, _fps, (W, H) = get_video_info(cap)
+    finally:
+        cap.release()
+
+    seen = set()
+    idx_list = []
+    for i in frame_indices:
+        ii = int(i)
+        if ii < 0 or ii >= total or ii in seen:
+            continue
+        seen.add(ii)
+        idx_list.append(ii)
+    if params["max_scan"] > 0:
+        idx_list = idx_list[:int(params["max_scan"])]
+
+    if progress_queue is not None:
+        progress_queue.put(("total", len(idx_list)))
+    if pbar is not None:
+        pbar.write(f"[{params['label']}] detecting {len(idx_list)} reused stats frames with {workers} workers")
+
+    samples = []
+    scanned = 0
+    with ProcessPoolExecutor(max_workers=max(1, int(workers))) as executor:
+        futures = []
+        for chunk in chunk_indices(idx_list, workers):
+            futures.append(executor.submit(collect_sample_chunk_worker, {
+                "video_path": params["video_path"],
+                "idx_list": chunk,
+                "pattern": params["pattern"],
+                "square_m": params["square_m"],
+                "scale": params["scale"],
+                "label": params["label"],
+                "debug_every": params["debug_every"],
+                "out_dir": params["out_dir"],
+                "progress_queue": progress_queue,
+            }))
+
+        pending = set(futures)
+        while pending:
+            done = [future for future in pending if future.done()]
+            if not done:
+                if progress_queue is not None and pbar is not None:
+                    drain_progress_queue(progress_queue, pbar)
+                time.sleep(0.1)
+                continue
+            for future in done:
+                pending.remove(future)
+                result = future.result()
+                scanned += int(result["scanned"])
+                samples.extend(result["samples"])
+            if progress_queue is not None and pbar is not None:
+                drain_progress_queue(progress_queue, pbar)
+
+    samples.sort(key=lambda s: int(s.frame_idx))
+    image_size = (int(W * float(params["scale"])), int(H * float(params["scale"])))
+    stats = {
+        "video": params["video_path"],
+        "sync_start": int(params["trim"]),
+        "scan_source": "parallel_reused_stats_indices",
+        "scale": float(params["scale"]),
+        "step": int(params["step"]),
+        "max_scan": int(params["max_scan"]),
+        "scanned": int(scanned),
+        "found": len(samples),
+        "found_pct": 0.0 if scanned == 0 else 100.0 * len(samples) / scanned,
+        "used_frames": len(samples),
+        "pattern_inner_corners": list(params["pattern"]),
+        "square_m": float(params["square_m"]),
+        "image_size_scaled": list(image_size),
+    }
+    return samples, stats, image_size
+
+
+def collect_stereo_pairs_parallel(args, paired_indices: List[Tuple[int, int]], pattern, square_m: float,
+                                  workers: int, progress_queue=None, pbar=None):
+    out_dir = os.path.join(os.path.dirname(args.out) or ".", "stereo_debug")
+    ensure_dir(out_dir)
+    pair_list = [(int(a), int(b)) for a, b in paired_indices]
+    if args.max_scan > 0:
+        pair_list = pair_list[:int(args.max_scan)]
+    if progress_queue is not None:
+        progress_queue.put(("total", len(pair_list)))
+    if pbar is not None:
+        pbar.write(f"[STEREO] detecting {len(pair_list)} reused stats pairs with {workers} workers")
+
+    usedL = []
+    usedR = []
+    scanned = 0
+    with ProcessPoolExecutor(max_workers=max(1, int(workers))) as executor:
+        futures = []
+        for chunk in chunk_indices(pair_list, workers):
+            futures.append(executor.submit(collect_stereo_pair_chunk_worker, {
+                "left_video": args.left,
+                "right_video": args.right,
+                "pair_list": chunk,
+                "pattern": pattern,
+                "square_m": square_m,
+                "scale": args.scale,
+                "debug_every": args.debug_every,
+                "out_dir": out_dir,
+                "progress_queue": progress_queue,
+            }))
+
+        pending = set(futures)
+        while pending:
+            done = [future for future in pending if future.done()]
+            if not done:
+                if progress_queue is not None and pbar is not None:
+                    drain_progress_queue(progress_queue, pbar)
+                time.sleep(0.1)
+                continue
+            for future in done:
+                pending.remove(future)
+                result = future.result()
+                scanned += int(result["scanned"])
+                usedL.extend(result["usedL"])
+                usedR.extend(result["usedR"])
+            if progress_queue is not None and pbar is not None:
+                drain_progress_queue(progress_queue, pbar)
+
+    pairs = sorted(zip(usedL, usedR), key=lambda pair: int(pair[0].frame_idx))
+    usedL = [pair[0] for pair in pairs]
+    usedR = [pair[1] for pair in pairs]
+    return usedL, usedR, scanned
+
+
+def compact_stats_for_print(stats: dict) -> dict:
+    compact = dict(stats)
+    indices = compact.get("detected_frame_indices")
+    if isinstance(indices, list):
+        compact["detected_frame_indices"] = {
+            "count": len(indices),
+            "first": indices[:10],
+            "last": indices[-10:] if len(indices) > 10 else [],
+        }
+    return compact
+
+
 def cmd_stats(args):
     ensure_dir(args.out)
     trimL, trimR = load_sync(args.sync)
@@ -988,29 +1473,91 @@ def cmd_stats(args):
     square_m = args.square_mm / 1000.0
 
     print("\n[STATS] Checkerboard detection stats (no calibration).")
-    sL, stL, sizeL = collect_samples_checker(
-        args.left, trimL, pattern, square_m,
-        scale=args.scale, step=args.step, max_scan=args.max_scan,
-        debug_every=args.debug_every, label="LEFT",
-        out_dir=os.path.join(args.out, "debug_left"),
-        use_cuda=args.use_cuda,
-        no_adaptive=args.no_adaptive,
-    )
-    sR, stR, sizeR = collect_samples_checker(
-        args.right, trimR, pattern, square_m,
-        scale=args.scale, step=args.step, max_scan=args.max_scan,
-        debug_every=args.debug_every, label="RIGHT",
-        out_dir=os.path.join(args.out, "debug_right"),
-        use_cuda=args.use_cuda,
-        no_adaptive=args.no_adaptive,
-    )
+    jobs = [
+        {
+            "video_path": args.left,
+            "trim": trimL,
+            "pattern": pattern,
+            "square_m": square_m,
+            "scale": args.scale,
+            "step": args.step,
+            "max_scan": args.max_scan,
+            "debug_every": args.debug_every,
+            "label": "LEFT",
+            "out_dir": os.path.join(args.out, "debug_left"),
+            "use_cuda": args.use_cuda,
+            "no_adaptive": args.no_adaptive,
+            "show_tqdm": False,
+            "progress_queue": None,
+            "quiet": True,
+        },
+        {
+            "video_path": args.right,
+            "trim": trimR,
+            "pattern": pattern,
+            "square_m": square_m,
+            "scale": args.scale,
+            "step": args.step,
+            "max_scan": args.max_scan,
+            "debug_every": args.debug_every,
+            "label": "RIGHT",
+            "out_dir": os.path.join(args.out, "debug_right"),
+            "use_cuda": args.use_cuda,
+            "no_adaptive": args.no_adaptive,
+            "show_tqdm": False,
+            "progress_queue": None,
+            "quiet": True,
+        },
+    ]
+    print(f"[STATS] Scanning with {args.workers} worker process(es).")
+    if args.workers == 1:
+        sL, stL, sizeL = collect_samples_checker(
+            args.left, trimL, pattern, square_m,
+            scale=args.scale, step=args.step, max_scan=args.max_scan,
+            debug_every=args.debug_every, label="LEFT",
+            out_dir=os.path.join(args.out, "debug_left"),
+            use_cuda=args.use_cuda,
+            no_adaptive=args.no_adaptive,
+        )
+        sR, stR, sizeR = collect_samples_checker(
+            args.right, trimR, pattern, square_m,
+            scale=args.scale, step=args.step, max_scan=args.max_scan,
+            debug_every=args.debug_every, label="RIGHT",
+            out_dir=os.path.join(args.out, "debug_right"),
+            use_cuda=args.use_cuda,
+            no_adaptive=args.no_adaptive,
+        )
+        stL["detected_frame_indices"] = [int(s.frame_idx) for s in sL]
+        stR["detected_frame_indices"] = [int(s.frame_idx) for s in sR]
+    elif args.workers > 2:
+        with Manager() as manager:
+            progress_queue = manager.Queue()
+            jobs[0]["progress_queue"] = progress_queue
+            jobs[1]["progress_queue"] = progress_queue
+            with tqdm(desc="[Stats detection]", unit="frame") as pbar:
+                stL, sizeL = collect_stats_parallel_side(jobs[0], args.workers, progress_queue, pbar)
+                drain_progress_queue(progress_queue, pbar)
+                stR, sizeR = collect_stats_parallel_side(jobs[1], args.workers, progress_queue, pbar)
+                drain_progress_queue(progress_queue, pbar)
+    else:
+        with Manager() as manager:
+            progress_queue = manager.Queue()
+            jobs[0]["progress_queue"] = progress_queue
+            jobs[1]["progress_queue"] = progress_queue
+            with ProcessPoolExecutor(max_workers=2) as executor:
+                left_future = executor.submit(collect_stats_worker, jobs[0])
+                right_future = executor.submit(collect_stats_worker, jobs[1])
+                with tqdm(desc="[Stats detection]", unit="frame") as pbar:
+                    while not (left_future.done() and right_future.done()):
+                        drain_progress_queue(progress_queue, pbar)
+                        time.sleep(0.1)
+                    drain_progress_queue(progress_queue, pbar)
+                stL, sizeL = left_future.result()
+                stR, sizeR = right_future.result()
 
-    print("\n[STATS] LEFT:", json.dumps(stL, indent=2))
-    print("\n[STATS] RIGHT:", json.dumps(stR, indent=2))
+    print("\n[STATS] LEFT:", json.dumps(compact_stats_for_print(stL), indent=2))
+    print("\n[STATS] RIGHT:", json.dumps(compact_stats_for_print(stR), indent=2))
     print(f"\n[STATS] image_size_scaled: L={sizeL}, R={sizeR}")
-
-    stL["detected_frame_indices"] = [int(s.frame_idx) for s in sL]
-    stR["detected_frame_indices"] = [int(s.frame_idx) for s in sR]
 
     write_json(os.path.join(args.out, "stats_left.json"), stL)
     write_json(os.path.join(args.out, "stats_right.json"), stR)
@@ -1035,27 +1582,75 @@ def cmd_mono(args):
         )
 
     print("\n[MONO] Collecting samples for LEFT...")
-    samplesL, statsL, image_size = collect_samples_checker(
-        args.left, trimL, pattern, square_m,
-        scale=args.scale, step=args.step, max_scan=args.max_scan,
-        debug_every=args.debug_every, label="LEFT",
-        out_dir=os.path.join(os.path.dirname(args.out) or ".", "mono_debug_left"),
-        use_cuda=args.use_cuda,
-        frame_indices=frame_indices_left,
-        no_adaptive=args.no_adaptive,
-    )
+    if args.workers > 1 and frame_indices_left is not None:
+        with Manager() as manager:
+            progress_queue = manager.Queue()
+            with tqdm(desc="[MONO LEFT detection]", unit="frame") as pbar:
+                samplesL, statsL, image_size = collect_samples_parallel_indices(
+                    {
+                        "video_path": args.left,
+                        "trim": trimL,
+                        "pattern": pattern,
+                        "square_m": square_m,
+                        "scale": args.scale,
+                        "step": args.step,
+                        "max_scan": args.max_scan,
+                        "debug_every": args.debug_every,
+                        "label": "LEFT",
+                        "out_dir": os.path.join(os.path.dirname(args.out) or ".", "mono_debug_left"),
+                    },
+                    frame_indices_left,
+                    args.workers,
+                    progress_queue,
+                    pbar,
+                )
+                drain_progress_queue(progress_queue, pbar)
+    else:
+        samplesL, statsL, image_size = collect_samples_checker(
+            args.left, trimL, pattern, square_m,
+            scale=args.scale, step=args.step, max_scan=args.max_scan,
+            debug_every=args.debug_every, label="LEFT",
+            out_dir=os.path.join(os.path.dirname(args.out) or ".", "mono_debug_left"),
+            use_cuda=args.use_cuda,
+            frame_indices=frame_indices_left,
+            no_adaptive=args.no_adaptive,
+        )
     print(f"[MONO] LEFT used={len(samplesL)} found_pct={statsL['found_pct']:.1f}%")
 
     print("\n[MONO] Collecting samples for RIGHT...")
-    samplesR, statsR, image_size_r = collect_samples_checker(
-        args.right, trimR, pattern, square_m,
-        scale=args.scale, step=args.step, max_scan=args.max_scan,
-        debug_every=args.debug_every, label="RIGHT",
-        out_dir=os.path.join(os.path.dirname(args.out) or ".", "mono_debug_right"),
-        use_cuda=args.use_cuda,
-        frame_indices=frame_indices_right,
-        no_adaptive=args.no_adaptive,
-    )
+    if args.workers > 1 and frame_indices_right is not None:
+        with Manager() as manager:
+            progress_queue = manager.Queue()
+            with tqdm(desc="[MONO RIGHT detection]", unit="frame") as pbar:
+                samplesR, statsR, image_size_r = collect_samples_parallel_indices(
+                    {
+                        "video_path": args.right,
+                        "trim": trimR,
+                        "pattern": pattern,
+                        "square_m": square_m,
+                        "scale": args.scale,
+                        "step": args.step,
+                        "max_scan": args.max_scan,
+                        "debug_every": args.debug_every,
+                        "label": "RIGHT",
+                        "out_dir": os.path.join(os.path.dirname(args.out) or ".", "mono_debug_right"),
+                    },
+                    frame_indices_right,
+                    args.workers,
+                    progress_queue,
+                    pbar,
+                )
+                drain_progress_queue(progress_queue, pbar)
+    else:
+        samplesR, statsR, image_size_r = collect_samples_checker(
+            args.right, trimR, pattern, square_m,
+            scale=args.scale, step=args.step, max_scan=args.max_scan,
+            debug_every=args.debug_every, label="RIGHT",
+            out_dir=os.path.join(os.path.dirname(args.out) or ".", "mono_debug_right"),
+            use_cuda=args.use_cuda,
+            frame_indices=frame_indices_right,
+            no_adaptive=args.no_adaptive,
+        )
     print(f"[MONO] RIGHT used={len(samplesR)} found_pct={statsR['found_pct']:.1f}%")
 
     if image_size != image_size_r:
@@ -1114,6 +1709,7 @@ def cmd_stereo(args):
     capR = open_video(args.right)
     totalL, _, _ = get_video_info(capL)
     totalR, _, _ = get_video_info(capR)
+    capL.release(); capR.release()
 
     obj_template = make_object_points(pattern, square_m)
 
@@ -1136,126 +1732,146 @@ def cmd_stereo(args):
             f"left_pos={len(left_pos)}, right_pos={len(right_pos)}, paired={len(paired_indices)}"
         )
         if args.step != 5:
-            print("[STEREO] NOTE: --step is ignored when --reuse_stats_indices is enabled.")
+            print("[STEREO] NOTE: --step is ignored when --reuse-stats-indices is enabled.")
 
     print("\n[STEREO] Collecting paired samples...")
     if paired_indices is not None:
-        pbar = tqdm(total=len(paired_indices), desc="[Stereo pairing]", unit="frame")
-        nextL = None
-        nextR = None
-        for idxL, idxR in paired_indices:
-            if idxL >= totalL or idxR >= totalR:
-                pbar.update(1)
-                continue
+        if args.workers > 1:
+            with Manager() as manager:
+                progress_queue = manager.Queue()
+                with tqdm(desc="[STEREO detection]", unit="pair") as pbar:
+                    usedL, usedR, scanned = collect_stereo_pairs_parallel(
+                        args, paired_indices, pattern, square_m, args.workers, progress_queue, pbar
+                    )
+                    drain_progress_queue(progress_queue, pbar)
+            if len(usedL) > args.max_pairs:
+                usedL = usedL[:args.max_pairs]
+                usedR = usedR[:args.max_pairs]
+        else:
+            capL = open_video(args.left)
+            capR = open_video(args.right)
+            pbar = tqdm(total=len(paired_indices), desc="[Stereo pairing]", unit="frame")
+            nextL = None
+            nextR = None
+            try:
+                for idxL, idxR in paired_indices:
+                    if idxL >= totalL or idxR >= totalR:
+                        pbar.update(1)
+                        continue
 
-            okL, fL, nextL = read_frame_progressive(capL, idxL, nextL)
-            okR, fR, nextR = read_frame_progressive(capR, idxR, nextR)
-            scanned += 1
-            pbar.update(1)
-            if not okL or not okR:
-                continue
+                    okL, fL, nextL = read_frame_progressive(capL, idxL, nextL)
+                    okR, fR, nextR = read_frame_progressive(capR, idxR, nextR)
+                    scanned += 1
+                    pbar.update(1)
+                    if not okL or not okR:
+                        continue
 
-            fL, gL = prepare_frame_and_gray(fL, args.scale)
-            fR, gR = prepare_frame_and_gray(fR, args.scale)
+                    fL, gL = prepare_frame_and_gray(fL, args.scale)
+                    fR, gR = prepare_frame_and_gray(fR, args.scale)
 
-            foundL, cL = detect_checkerboard(gL, pattern)
-            foundR, cR = detect_checkerboard(gR, pattern)
+                    foundL, cL = detect_checkerboard(gL, pattern)
+                    foundR, cR = detect_checkerboard(gR, pattern)
 
-            if foundL and foundR:
-                usedL.append(Sample(idxL, cL.reshape(-1,2), obj_template.copy()))
-                usedR.append(Sample(idxR, cR.reshape(-1,2), obj_template.copy()))
+                    if foundL and foundR:
+                        usedL.append(Sample(idxL, cL.reshape(-1,2), obj_template.copy()))
+                        usedR.append(Sample(idxR, cR.reshape(-1,2), obj_template.copy()))
 
-            if args.debug_every > 0 and (scanned % args.debug_every == 0):
-                visL = fL.copy()
-                visR = fR.copy()
-                if foundL: cv2.drawChessboardCorners(visL, pattern, cL, True)
-                if foundR: cv2.drawChessboardCorners(visR, pattern, cR, True)
-                both = np.hstack([visL, visR])
-                cv2.putText(both, f"scan={scanned} paired={len(usedL)}", (20, 40),
-                            cv2.FONT_HERSHEY_SIMPLEX, 1, (0,255,255), 2)
-                cv2.imwrite(os.path.join(os.path.dirname(args.out) or ".", "stereo_debug",
-                                         f"pair_{scanned:05d}.png"), both)
+                    if args.debug_every > 0 and (scanned % args.debug_every == 0):
+                        visL = fL.copy()
+                        visR = fR.copy()
+                        if foundL: cv2.drawChessboardCorners(visL, pattern, cL, True)
+                        if foundR: cv2.drawChessboardCorners(visR, pattern, cR, True)
+                        both = np.hstack([visL, visR])
+                        cv2.putText(both, f"scan={scanned} paired={len(usedL)}", (20, 40),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 1, (0,255,255), 2)
+                        cv2.imwrite(os.path.join(os.path.dirname(args.out) or ".", "stereo_debug",
+                                                 f"pair_{scanned:05d}.png"), both)
 
-            if len(usedL) >= args.max_pairs:
-                break
-        pbar.close()
+                    if len(usedL) >= args.max_pairs:
+                        break
+            finally:
+                pbar.close()
+                capL.release(); capR.release()
     else:
+        capL = open_video(args.left)
+        capR = open_video(args.right)
         max_g = min(totalL - trimL, totalR - trimR) - 1
-        if max_g < 0:
-            raise RuntimeError("[STEREO] No overlapping synchronized frame range after trim.")
+        try:
+            if max_g < 0:
+                raise RuntimeError("[STEREO] No overlapping synchronized frame range after trim.")
 
-        steps = [int(args.step)] if args.no_adaptive else adaptive_halving_steps(args.step, levels=4)
-        intervals_g = [(0, max_g)]
-        visited_g = set()
-        nextL = None
-        nextR = None
-        for pass_i, pass_step in enumerate(steps, start=1):
-            remaining = args.max_scan - scanned
-            if remaining <= 0 or len(intervals_g) == 0:
-                break
+            steps = [int(args.step)] if args.no_adaptive else adaptive_halving_steps(args.step, levels=4)
+            intervals_g = [(0, max_g)]
+            visited_g = set()
+            nextL = None
+            nextR = None
+            for pass_i, pass_step in enumerate(steps, start=1):
+                remaining = args.max_scan - scanned
+                if remaining <= 0 or len(intervals_g) == 0:
+                    break
 
-            g_list = build_scan_indices(intervals_g, pass_step, 0, max_g)
-            g_list = [g for g in g_list if g not in visited_g]
-            if len(g_list) == 0:
-                continue
-            if len(g_list) > remaining:
-                g_list = g_list[:remaining]
-
-            print(
-                f"[STEREO] {'simple' if args.no_adaptive else 'adaptive'} pass {pass_i}/{len(steps)}: "
-                f"step={pass_step}, intervals={len(intervals_g)}, pairs={len(g_list)}"
-            )
-            pbar = tqdm(total=len(g_list), desc=f"[Stereo pairing s={pass_step}]", unit="frame")
-
-            for g in g_list:
-                idxL = trimL + int(g)
-                idxR = trimR + int(g)
-
-                okL, fL, nextL = read_frame_progressive(capL, idxL, nextL)
-                okR, fR, nextR = read_frame_progressive(capR, idxR, nextR)
-                visited_g.add(int(g))
-                pbar.update(1)
-                if not okL or not okR:
+                g_list = build_scan_indices(intervals_g, pass_step, 0, max_g)
+                g_list = [g for g in g_list if g not in visited_g]
+                if len(g_list) == 0:
                     continue
+                if len(g_list) > remaining:
+                    g_list = g_list[:remaining]
 
-                fL, gL = prepare_frame_and_gray(fL, args.scale)
-                fR, gR = prepare_frame_and_gray(fR, args.scale)
+                print(
+                    f"[STEREO] {'simple' if args.no_adaptive else 'adaptive'} pass {pass_i}/{len(steps)}: "
+                    f"step={pass_step}, intervals={len(intervals_g)}, pairs={len(g_list)}"
+                )
+                pbar = tqdm(total=len(g_list), desc=f"[Stereo pairing s={pass_step}]", unit="frame")
 
-                scanned += 1
-                foundL, cL = detect_checkerboard(gL, pattern)
-                foundR, cR = detect_checkerboard(gR, pattern)
+                for g in g_list:
+                    idxL = trimL + int(g)
+                    idxR = trimR + int(g)
 
-                if foundL and foundR:
-                    usedL.append(Sample(idxL, cL.reshape(-1,2), obj_template.copy()))
-                    usedR.append(Sample(idxR, cR.reshape(-1,2), obj_template.copy()))
+                    okL, fL, nextL = read_frame_progressive(capL, idxL, nextL)
+                    okR, fR, nextR = read_frame_progressive(capR, idxR, nextR)
+                    visited_g.add(int(g))
+                    pbar.update(1)
+                    if not okL or not okR:
+                        continue
 
-                if args.debug_every > 0 and (scanned % args.debug_every == 0):
-                    visL = fL.copy()
-                    visR = fR.copy()
-                    if foundL: cv2.drawChessboardCorners(visL, pattern, cL, True)
-                    if foundR: cv2.drawChessboardCorners(visR, pattern, cR, True)
-                    both = np.hstack([visL, visR])
-                    cv2.putText(both, f"scan={scanned} paired={len(usedL)}", (20, 40),
-                                cv2.FONT_HERSHEY_SIMPLEX, 1, (0,255,255), 2)
-                    cv2.imwrite(os.path.join(os.path.dirname(args.out) or ".", "stereo_debug",
-                                             f"pair_{scanned:05d}.png"), both)
+                    fL, gL = prepare_frame_and_gray(fL, args.scale)
+                    fR, gR = prepare_frame_and_gray(fR, args.scale)
+
+                    scanned += 1
+                    foundL, cL = detect_checkerboard(gL, pattern)
+                    foundR, cR = detect_checkerboard(gR, pattern)
+
+                    if foundL and foundR:
+                        usedL.append(Sample(idxL, cL.reshape(-1,2), obj_template.copy()))
+                        usedR.append(Sample(idxR, cR.reshape(-1,2), obj_template.copy()))
+
+                    if args.debug_every > 0 and (scanned % args.debug_every == 0):
+                        visL = fL.copy()
+                        visR = fR.copy()
+                        if foundL: cv2.drawChessboardCorners(visL, pattern, cL, True)
+                        if foundR: cv2.drawChessboardCorners(visR, pattern, cR, True)
+                        both = np.hstack([visL, visR])
+                        cv2.putText(both, f"scan={scanned} paired={len(usedL)}", (20, 40),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 1, (0,255,255), 2)
+                        cv2.imwrite(os.path.join(os.path.dirname(args.out) or ".", "stereo_debug",
+                                                 f"pair_{scanned:05d}.png"), both)
+
+                    if len(usedL) >= args.max_pairs:
+                        break
+
+                pbar.close()
 
                 if len(usedL) >= args.max_pairs:
                     break
 
-            pbar.close()
+                if pass_i < len(steps) and len(usedL) > 0:
+                    found_g = [s.frame_idx - trimL for s in usedL]
+                    intervals_g = build_roi_intervals(found_g, margin=pass_step * 2, min_idx=0, max_idx=max_g)
 
-            if len(usedL) >= args.max_pairs:
-                break
-
-            if pass_i < len(steps) and len(usedL) > 0:
-                found_g = [s.frame_idx - trimL for s in usedL]
-                intervals_g = build_roi_intervals(found_g, margin=pass_step * 2, min_idx=0, max_idx=max_g)
-
-            if scanned >= args.max_scan:
-                break
-
-    capL.release(); capR.release()
+                if scanned >= args.max_scan:
+                    break
+        finally:
+            capL.release(); capR.release()
 
     print(f"[STEREO] scanned={scanned}, collected_pairs={len(usedL)}")
     if len(usedL) < 20:
@@ -1337,12 +1953,12 @@ def main():
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     sp = sub.add_parser("sync")
-    sp.add_argument("--left", required=True)
-    sp.add_argument("--right", required=True)
-    sp.add_argument("--out", required=True)
-    sp.add_argument("--scale", type=float, default=0.5)
+    sp.add_argument("--left", default=DEFAULT_LEFT_VIDEO)
+    sp.add_argument("--right", default=DEFAULT_RIGHT_VIDEO)
+    sp.add_argument("--out", default=DEFAULT_SYNC_JSON)
+    sp.add_argument("--scale", type=float, default=1.0)
     sp.add_argument("--step", type=int, default=5)
-    sp.add_argument("--max_frames", type=int, default=4000)
+    sp.add_argument("--max-frames", type=int, default=4000)
     sp.add_argument("--sync-mode", choices=["flash", "audio"], default="flash",
                     help="Sync mode: flash (brightness) or audio peak")
     sp.add_argument("--audio-sample-rate", type=int, default=16000,
@@ -1351,74 +1967,80 @@ def main():
     sp.set_defaults(func=cmd_sync)
 
     sp = sub.add_parser("stats")
-    sp.add_argument("--left", required=True)
-    sp.add_argument("--right", required=True)
-    sp.add_argument("--sync", required=True)
-    sp.add_argument("--out", required=True)
+    sp.add_argument("--left", default=DEFAULT_LEFT_VIDEO)
+    sp.add_argument("--right", default=DEFAULT_RIGHT_VIDEO)
+    sp.add_argument("--sync", default=DEFAULT_SYNC_JSON)
+    sp.add_argument("--out", default=DEFAULT_STATS_DIR)
     sp.add_argument("--cols", type=int, default=9)
     sp.add_argument("--rows", type=int, default=6)
-    sp.add_argument("--square_mm", type=float, default=25.0)
-    sp.add_argument("--scale", type=float, default=0.5)
+    sp.add_argument("--square-mm", type=float, default=25.0)
+    sp.add_argument("--scale", type=float, default=1.0)
     sp.add_argument("--step", type=int, default=5)
-    sp.add_argument("--max_scan", type=int, default=3000)
-    sp.add_argument("--debug_every", type=int, default=0)
+    sp.add_argument("--max-scan", type=int, default=3000)
+    sp.add_argument("--debug-every", type=int, default=0)
+    sp.add_argument("--workers", type=int, default=2,
+                    help="Stats worker processes. 1 scans serially; 2 scans left/right in parallel; >2 splits frames within each video.")
     sp.add_argument("--no-adaptive", action="store_true",
                     help="Disable adaptive halving; scan exactly once at --step.")
     sp.add_argument("--use-cuda", action="store_true", help="Use OpenCV CUDA ops when available; auto-fallback to CPU")
     sp.set_defaults(func=cmd_stats)
 
     sp = sub.add_parser("mono")
-    sp.add_argument("--left", required=True)
-    sp.add_argument("--right", required=True)
-    sp.add_argument("--sync", required=True)
-    sp.add_argument("--out", required=True)
+    sp.add_argument("--left", default=DEFAULT_LEFT_VIDEO)
+    sp.add_argument("--right", default=DEFAULT_RIGHT_VIDEO)
+    sp.add_argument("--sync", default=DEFAULT_SYNC_JSON)
+    sp.add_argument("--out", default=DEFAULT_MONO_NPZ)
     sp.add_argument("--cols", type=int, default=9)
     sp.add_argument("--rows", type=int, default=6)
-    sp.add_argument("--square_mm", type=float, default=25.0)
-    sp.add_argument("--scale", type=float, default=0.5)
+    sp.add_argument("--square-mm", type=float, default=25.0)
+    sp.add_argument("--scale", type=float, default=1.0)
     sp.add_argument("--step", type=int, default=5)
-    sp.add_argument("--max_scan", type=int, default=6000)
-    sp.add_argument("--debug_every", type=int, default=0)
+    sp.add_argument("--max-scan", type=int, default=6000)
+    sp.add_argument("--debug-every", type=int, default=0)
+    sp.add_argument("--workers", type=int, default=2,
+                    help="Mono detection worker processes when --reuse-stats-indices is enabled.")
     sp.add_argument("--no-adaptive", action="store_true",
                     help="Disable adaptive halving; scan exactly once at --step.")
-    sp.add_argument("--reuse_stats_indices", action="store_true",
+    sp.add_argument("--reuse-stats-indices", action="store_true",
                     help="Reuse positive detection frame indices from stats output instead of rescanning")
-    sp.add_argument("--stats_dir", default=None,
-                    help="Directory containing stats_left.json and stats_right.json (default: <mono_out_dir>/stats)")
+    sp.add_argument("--stats-dir", default=DEFAULT_STATS_DIR,
+                    help="Directory containing stats_left.json and stats_right.json")
     sp.add_argument("--use-cuda", action="store_true", help="Use OpenCV CUDA ops when available; auto-fallback to CPU")
     sp.set_defaults(func=cmd_mono)
 
     sp = sub.add_parser("stereo")
-    sp.add_argument("--left", required=True)
-    sp.add_argument("--right", required=True)
-    sp.add_argument("--sync", required=True)
-    sp.add_argument("--mono", required=True)
-    sp.add_argument("--out", required=True)
+    sp.add_argument("--left", default=DEFAULT_LEFT_VIDEO)
+    sp.add_argument("--right", default=DEFAULT_RIGHT_VIDEO)
+    sp.add_argument("--sync", default=DEFAULT_SYNC_JSON)
+    sp.add_argument("--mono", default=DEFAULT_MONO_NPZ)
+    sp.add_argument("--out", default=DEFAULT_STEREO_NPZ)
     sp.add_argument("--cols", type=int, default=9)
     sp.add_argument("--rows", type=int, default=6)
-    sp.add_argument("--square_mm", type=float, default=25.0)
-    sp.add_argument("--scale", type=float, default=0.5)
+    sp.add_argument("--square-mm", type=float, default=25.0)
+    sp.add_argument("--scale", type=float, default=1.0)
     sp.add_argument("--step", type=int, default=5)
-    sp.add_argument("--max_scan", type=int, default=12000)
-    sp.add_argument("--max_pairs", type=int, default=200)
-    sp.add_argument("--debug_every", type=int, default=0)
+    sp.add_argument("--max-scan", type=int, default=12000)
+    sp.add_argument("--max-pairs", type=int, default=200)
+    sp.add_argument("--debug-every", type=int, default=0)
+    sp.add_argument("--workers", type=int, default=2,
+                    help="Stereo pair detection worker processes when --reuse-stats-indices is enabled.")
     sp.add_argument("--no-adaptive", action="store_true",
                     help="Disable adaptive halving; scan exactly once at --step.")
-    sp.add_argument("--reuse_stats_indices", action="store_true",
+    sp.add_argument("--reuse-stats-indices", action="store_true",
                     help="Reuse synchronized positive detection frame indices from stats output instead of rescanning")
-    sp.add_argument("--stats_dir", default=None,
-                    help="Directory containing stats_left.json and stats_right.json (default: <stereo_out_dir>/stats)")
+    sp.add_argument("--stats-dir", default=DEFAULT_STATS_DIR,
+                    help="Directory containing stats_left.json and stats_right.json")
     sp.add_argument("--use-cuda", action="store_true", help="Use OpenCV CUDA ops when available; auto-fallback to CPU")
     sp.set_defaults(func=cmd_stereo)
 
     sp = sub.add_parser("rectify")
-    sp.add_argument("--left", required=True)
-    sp.add_argument("--right", required=True)
-    sp.add_argument("--sync", required=True)
-    sp.add_argument("--stereo", required=True)
-    sp.add_argument("--out", required=True)
-    sp.add_argument("--scale", type=float, default=0.5)
-    sp.add_argument("--frame_offset", type=int, default=100)
+    sp.add_argument("--left", default=DEFAULT_LEFT_VIDEO)
+    sp.add_argument("--right", default=DEFAULT_RIGHT_VIDEO)
+    sp.add_argument("--sync", default=DEFAULT_SYNC_JSON)
+    sp.add_argument("--stereo", default=DEFAULT_STEREO_NPZ)
+    sp.add_argument("--out", default=DEFAULT_RECTIFY_DIR)
+    sp.add_argument("--scale", type=float, default=1.0)
+    sp.add_argument("--frame-offset", type=int, default=100)
     sp.add_argument("--alpha", type=float, default=0.0, help="0=crop black borders, 1=keep all FOV")
     sp.add_argument("--use-cuda", action="store_true", help="Use OpenCV CUDA ops when available; auto-fallback to CPU")
     sp.set_defaults(func=cmd_rectify)
@@ -1432,12 +2054,12 @@ if __name__ == "__main__":
 
 
 """run commands
-python stereo_checker_debug.py sync   --left .\in\left.MP4 --right .\in\right.MP4 --out work/sync.json --scale 1.0
-python .\stereo_checker_debug.py stats --left .\left.MP4 --right .\right.MP4 --sync work/sync.json --out work/stats --scale 1.0 --step 5 --max_scan 1000 --debug_every 100 --cols 8 --rows 6
-python stereo_checker_debug.py mono   --left .\in\left.MP4 --right .\in\right.MP4 --sync work/sync.json --out work/mono.npz --scale 1.0 --step 10 --max_scan 1000 --debug_every 100 --cols 8 --rows 6
-python stereo_checker_debug.py stereo --left .\in\left.MP4 --right .\in\right.MP4 --sync work/sync.json --mono work/mono.npz --out work/stereo.npz --scale 1.0 --step 25 --max_pairs 50 --debug_every 50 --cols 8 --rows 6
-python stereo_checker_debug.py rectify --left .\in\left.MP4 --right .\in\right.MP4 --sync work/sync.json --stereo work/stereo.npz --out work/rectify --scale 1.0 --frame_offset 150 --alpha 0.2
+python stereo_checker_debug.py sync --sync-mode audio
+python stereo_checker_debug.py stats --step 50 --max-scan 1000 --cols 8 --rows 6 --workers 16
+python stereo_checker_debug.py mono --step 2 --max-scan 10000 --cols 8 --rows 6 --reuse-stats-indices --workers 16
+python stereo_checker_debug.py stereo --step 25 --max-pairs 50 --cols 8 --rows 6 --reuse-stats-indices --workers 16
+python stereo_checker_debug.py rectify --frame-offset 150 --alpha 0.2
 
 For GPU usage, add --use-cuda to the above commands, e.g.:
-python stereo_checker_debug.py mono   --left left_calib.mp4 --right right_calib.mp4 --sync work/sync.json --out work/mono.npz --scale 1.0 --step 5 --max_scan 10000 --debug_every 100 --cols 8 --rows 6 --use-cuda
+python stereo_checker_debug.py mono --step 5 --max-scan 10000 --debug-every 100 --cols 8 --rows 6 --use-cuda
 """

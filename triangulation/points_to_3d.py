@@ -144,7 +144,12 @@ OUTPUTS
 
 import argparse
 import json
+import os
+import shutil
+import subprocess
 import sys
+import tempfile
+from multiprocessing import Pool
 from pathlib import Path
 
 import numpy as np
@@ -446,6 +451,44 @@ def color_for_obj(obj_id: int):
     return tuple(int(v) for v in rng.randint(50, 255, size=3))
 
 
+def depth_to_bgr(z: float, z_min: float, z_max: float):
+    """Map a depth value to a BGR color using a viridis-like ramp."""
+    if z_max <= z_min:
+        t = 0.5
+    else:
+        t = (z - z_min) / (z_max - z_min)
+    t = float(np.clip(t, 0.0, 1.0))
+    stops = np.array([
+        [68, 1, 84],
+        [59, 82, 139],
+        [33, 144, 141],
+        [94, 201, 98],
+        [253, 231, 37],
+    ], dtype=np.float32)  # RGB
+    pos = t * (len(stops) - 1)
+    i0 = int(np.floor(pos))
+    i1 = min(i0 + 1, len(stops) - 1)
+    f = pos - i0
+    rgb = (1 - f) * stops[i0] + f * stops[i1]
+    return (int(rgb[2]), int(rgb[1]), int(rgb[0]))
+
+
+def draw_colorbar(img: np.ndarray, z_min: float, z_max: float,
+                  x: int, y: int, w: int = 18, h: int = 180):
+    for i in range(h):
+        t = 1.0 - (i / max(h - 1, 1))
+        z = z_min + t * (z_max - z_min)
+        col = depth_to_bgr(z, z_min, z_max)
+        cv2.rectangle(img, (x, y + i), (x + w, y + i + 1), col, -1)
+    cv2.rectangle(img, (x, y), (x + w, y + h), (255, 255, 255), 1)
+    cv2.putText(img, f"Z={z_max:.2f}", (x + w + 6, y + 12),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
+    cv2.putText(img, f"Z={z_min:.2f}", (x + w + 6, y + h),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
+    cv2.putText(img, "depth", (x - 4, y - 8),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
+
+
 def draw_cross(img: np.ndarray, x: int, y: int, color, size: int = 6, thickness: int = 2):
     cv2.line(img, (x - size, y), (x + size, y), color, thickness)
     cv2.line(img, (x, y - size), (x, y + size), color, thickness)
@@ -550,6 +593,374 @@ def create_3d_visualization_video(out_rows: list,
     print(f"[OK] Wrote visualization video: {out_path}")
 
 
+_WORKER = {}
+
+
+def _worker_init(kind, w, h, x_lim, y_lim, z_lim, z_min, z_max):
+    """Initialize a reusable matplotlib figure inside each worker process."""
+    import matplotlib
+    matplotlib.use("Agg", force=True)
+    import matplotlib.pyplot as plt
+    from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
+
+    dpi = 100
+    fig = plt.figure(figsize=(w / dpi, h / dpi), dpi=dpi, facecolor="black")
+    if kind == "iso":
+        ax = fig.add_subplot(111, projection="3d", facecolor="black")
+        x_lo, x_hi = x_lim
+        y_lo, y_hi = y_lim
+        z_lo, z_hi = z_lim
+        ax.set_xlim(x_lo, x_hi)
+        ax.set_ylim(y_lo, y_hi)
+        ax.set_zlim(z_lo, z_hi)
+        ax.set_box_aspect((x_hi - x_lo, y_hi - y_lo, z_hi - z_lo))
+        ax.set_xlabel("X", color="w", fontsize=22, labelpad=18)
+        ax.set_ylabel("Y", color="w", fontsize=22, labelpad=18)
+        ax.set_zlabel("Z (depth)", color="w", fontsize=22, labelpad=18)
+        ax.tick_params(colors="w", labelsize=18)
+        ax.view_init(elev=30, azim=-60)
+        for axis in (ax.xaxis, ax.yaxis, ax.zaxis):
+            axis.pane.set_facecolor((0, 0, 0, 0))
+            axis.pane.set_edgecolor((0.35, 0.35, 0.35, 1))
+        scatter = ax.scatter([], [], [], s=120, depthshade=True,
+                             edgecolors="white", linewidths=0.8)
+        fig.subplots_adjust(left=0.02, right=0.98, top=0.98, bottom=0.04)
+    else:
+        ax = fig.add_subplot(111, facecolor="black")
+        ax.set_xlim(x_lim)
+        ax.set_ylim(z_lim)
+        ax.set_aspect("equal", adjustable="box")
+        ax.set_xlabel("X", color="w", fontsize=26, labelpad=14)
+        ax.set_ylabel("Z (depth, toward camera = small)", color="w", fontsize=24, labelpad=14)
+        ax.tick_params(colors="w", labelsize=20, width=1.5, length=7)
+        ax.grid(True, color=(0.3, 0.3, 0.3), linestyle=":", linewidth=0.8)
+        for spine in ax.spines.values():
+            spine.set_color("w")
+            spine.set_linewidth(1.5)
+        scatter = ax.scatter([], [], s=110, edgecolors="white", linewidths=0.8)
+        fig.subplots_adjust(left=0.10, right=0.98, top=0.96, bottom=0.10)
+
+    _WORKER.update(dict(
+        kind=kind, fig=fig, ax=ax, scatter=scatter,
+        w=w, h=h, z_min=z_min, z_max=z_max,
+    ))
+
+
+def _rgb_from_z(zs, z_min, z_max):
+    out = np.empty((len(zs), 3), dtype=np.float32)
+    for i, z in enumerate(zs):
+        b, g, r = depth_to_bgr(float(z), z_min, z_max)
+        out[i] = (r / 255.0, g / 255.0, b / 255.0)
+    return out
+
+
+def _has_ffmpeg():
+    return shutil.which("ffmpeg") is not None
+
+
+def _open_writer(path, fps, w, h, encoder):
+    """Returns either a cv2.VideoWriter or a dict wrapping an ffmpeg pipe."""
+    path = str(path)
+    if encoder == "nvenc" and _has_ffmpeg():
+        cmd = [
+            "ffmpeg", "-y", "-loglevel", "error",
+            "-f", "rawvideo", "-pix_fmt", "bgr24",
+            "-s", f"{w}x{h}", "-r", f"{fps:.6f}",
+            "-i", "-",
+            "-c:v", "h264_nvenc", "-preset", "p4", "-pix_fmt", "yuv420p",
+            path,
+        ]
+        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
+        return {"proc": proc, "kind": "ffmpeg"}
+    vw = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
+    return {"writer": vw, "kind": "cv2"}
+
+
+def _writer_write(w, img):
+    if w["kind"] == "ffmpeg":
+        w["proc"].stdin.write(img.tobytes())
+    else:
+        w["writer"].write(img)
+
+
+def _writer_close(w):
+    if w["kind"] == "ffmpeg":
+        w["proc"].stdin.close()
+        w["proc"].wait()
+    else:
+        w["writer"].release()
+
+
+def _draw_chunk(args):
+    kind, frame_ids, chunk_xyz, fps, segment_path, encoder = args
+    fig = _WORKER["fig"]
+    scatter = _WORKER["scatter"]
+    w = _WORKER["w"]
+    h = _WORKER["h"]
+    z_min = _WORKER["z_min"]
+    z_max = _WORKER["z_max"]
+
+    writer = _open_writer(segment_path, fps, w, h, encoder)
+
+    for fid, (Xs, Ys, Zs) in zip(frame_ids, chunk_xyz):
+        rgb = _rgb_from_z(Zs, z_min, z_max) if len(Zs) > 0 else np.zeros((0, 3), dtype=np.float32)
+
+        if kind == "iso":
+            scatter._offsets3d = (Xs, Ys, Zs)
+            scatter.set_facecolor(rgb)
+            scatter.set_edgecolor("white")
+        else:
+            if len(Xs) > 0:
+                scatter.set_offsets(np.column_stack([Xs, Zs]))
+            else:
+                scatter.set_offsets(np.zeros((0, 2)))
+            scatter.set_facecolor(rgb)
+            scatter.set_edgecolor("white")
+
+        fig.canvas.draw()
+        buf = np.frombuffer(fig.canvas.buffer_rgba(), dtype=np.uint8)
+        cw, ch = fig.canvas.get_width_height()
+        img = buf.reshape(ch, cw, 4)[:, :, :3]
+        img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+        if img.shape[1] != w or img.shape[0] != h:
+            img = cv2.resize(img, (w, h))
+
+        title = "3D isometric" if kind == "iso" else "Top-down (X vs Z)"
+        cv2.putText(img, f"{title}  frame={fid}", (24, 40),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2)
+        _writer_write(writer, img)
+
+    _writer_close(writer)
+    return segment_path
+
+
+def _concat_segments(segments, out_path):
+    """Lossless concat of mp4 segments via ffmpeg."""
+    if len(segments) == 1:
+        shutil.move(segments[0], out_path)
+        return
+    list_file = Path(out_path).with_suffix(".list.txt")
+    list_file.write_text("\n".join(f"file '{Path(s).resolve()}'" for s in segments))
+    cmd = [
+        "ffmpeg", "-y", "-loglevel", "error",
+        "-f", "concat", "-safe", "0",
+        "-i", str(list_file),
+        "-c", "copy",
+        str(out_path),
+    ]
+    subprocess.run(cmd, check=True)
+    list_file.unlink(missing_ok=True)
+    for s in segments:
+        Path(s).unlink(missing_ok=True)
+
+
+def _render_panel_parallel(kind, frame_ids, per_frame_xyz, fps, out_path,
+                           w, h, x_lim, y_lim, z_lim, z_min, z_max,
+                           workers, encoder):
+    n = len(frame_ids)
+    if n == 0:
+        return
+    workers = max(1, min(workers, n))
+    chunk_size = (n + workers - 1) // workers
+    chunks = []
+    tmpdir = Path(tempfile.mkdtemp(prefix=f"viz_{kind}_"))
+    for i in range(workers):
+        s = i * chunk_size
+        e = min(s + chunk_size, n)
+        if s >= e:
+            break
+        seg = tmpdir / f"seg_{i:04d}.mp4"
+        chunks.append((kind, frame_ids[s:e], per_frame_xyz[s:e], fps, str(seg), encoder))
+
+    if workers == 1:
+        _worker_init(kind, w, h, x_lim, y_lim, z_lim, z_min, z_max)
+        segments = [_draw_chunk(c) for c in chunks]
+    else:
+        with Pool(
+            processes=workers,
+            initializer=_worker_init,
+            initargs=(kind, w, h, x_lim, y_lim, z_lim, z_min, z_max),
+        ) as pool:
+            segments = pool.map(_draw_chunk, chunks)
+
+    if not _has_ffmpeg() and len(segments) > 1:
+        print("[VIS] ffmpeg not found; concatenating via cv2 (slower).")
+        first = cv2.VideoCapture(segments[0])
+        fps_v = first.get(cv2.CAP_PROP_FPS) or fps
+        first.release()
+        vw = cv2.VideoWriter(str(out_path), cv2.VideoWriter_fourcc(*"mp4v"), fps_v, (w, h))
+        for seg in segments:
+            cap = cv2.VideoCapture(seg)
+            while True:
+                ok, frm = cap.read()
+                if not ok:
+                    break
+                vw.write(frm)
+            cap.release()
+            Path(seg).unlink(missing_ok=True)
+        vw.release()
+    else:
+        _concat_segments(segments, str(out_path))
+
+    shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def create_3d_scene_visualization(out_rows: list,
+                                  left_video: str,
+                                  out_path: str,
+                                  max_frames: int = -1,
+                                  trail_len: int = 60,
+                                  workers: int = 0,
+                                  encoder: str = "auto"):
+    """Render left overlay, isometric 3D, and top-down videos as separate files."""
+    _ = trail_len
+    if len(out_rows) == 0:
+        print("[VIS] No rows to visualize. Skipping.")
+        return
+
+    valid_rows = [r for r in out_rows if int(r["valid_3d"]) == 1]
+    if not valid_rows:
+        print("[VIS] No valid 3D rows. Falling back to side-by-side viz.")
+        create_3d_visualization_video(out_rows, left_video, out_path, max_frames)
+        return
+
+    Zs_all = np.array([r["Z"] for r in valid_rows], dtype=np.float64)
+    Xs_all = np.array([r["X"] for r in valid_rows], dtype=np.float64)
+    Ys_all = np.array([r["Y"] for r in valid_rows], dtype=np.float64)
+    z_min, z_max = float(np.percentile(Zs_all, 2)), float(np.percentile(Zs_all, 98))
+    if z_max - z_min < 1e-6:
+        z_max = z_min + 1.0
+
+    def pad_lim(arr):
+        lo, hi = float(np.percentile(arr, 1)), float(np.percentile(arr, 99))
+        pad = 0.1 * (hi - lo + 1e-6)
+        return (lo - pad, hi + pad)
+
+    x_lim = pad_lim(Xs_all)
+    y_lim = pad_lim(Ys_all)
+    z_lim = pad_lim(Zs_all)
+
+    capL = open_video(left_video)
+    fpsL = float(capL.get(cv2.CAP_PROP_FPS))
+    fps = fpsL if fpsL > 0 else 30.0
+
+    grouped = {}
+    for row in out_rows:
+        grouped.setdefault(int(row["frame_L"]), []).append(row)
+
+    target_frames = sorted(grouped.keys())
+    if max_frames > 0:
+        target_frames = target_frames[:max_frames]
+    if not target_frames:
+        capL.release()
+        print("[VIS] No frames selected. Skipping.")
+        return
+
+    ok, first_frame = capL.read()
+    if not ok:
+        capL.release()
+        raise RuntimeError("[VIS] Could not read first frame from left video.")
+
+    h, w_single = first_frame.shape[:2]
+
+    base = Path(out_path)
+    base.parent.mkdir(parents=True, exist_ok=True)
+    stem = base.with_suffix("")
+    left_path = Path(f"{stem}_left.mp4")
+    iso_path = Path(f"{stem}_iso.mp4")
+    top_path = Path(f"{stem}_topdown.mp4")
+
+    if encoder == "auto":
+        enc = "nvenc" if _has_ffmpeg() else "mp4v"
+    else:
+        enc = encoder
+    if enc == "nvenc" and not _has_ffmpeg():
+        print("[VIS] nvenc requested but ffmpeg not found; falling back to mp4v.")
+        enc = "mp4v"
+    print(f"[VIS] encoder={enc}")
+
+    if workers <= 0:
+        workers = min(os.cpu_count() or 8, len(target_frames))
+    print(f"[VIS] workers={workers}, frames={len(target_frames)}")
+
+    writer_left = _open_writer(left_path, fps, w_single, h, enc)
+    per_frame_xyz = []
+
+    current_idx = 0
+    frame = first_frame
+    target_ptr = 0
+    next_target = int(target_frames[target_ptr])
+
+    while True:
+        if current_idx == next_target:
+            rows = grouped[next_target]
+            valid_here = [r for r in rows if int(r["valid_3d"]) == 1]
+
+            vis_left = frame.copy()
+            for r in rows:
+                u = int(round(float(r["uL"])))
+                v = int(round(float(r["vL"])))
+                if u < 0 or v < 0 or u >= w_single or v >= h:
+                    continue
+                valid = int(r["valid_3d"]) == 1
+                if valid:
+                    col = depth_to_bgr(float(r["Z"]), z_min, z_max)
+                    cv2.circle(vis_left, (u, v), 10, col, -1)
+                    cv2.circle(vis_left, (u, v), 11, (255, 255, 255), 2)
+                    cv2.putText(vis_left, f"{float(r['Z']):.2f}", (u + 12, v - 10),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, col, 2, cv2.LINE_AA)
+                else:
+                    cv2.circle(vis_left, (u, v), 4, (120, 120, 120), -1)
+
+            cv2.putText(vis_left, "Left view (depth-colored)", (24, 40),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2)
+            cv2.putText(vis_left,
+                        f"frame={next_target}  nodes={len(rows)}  valid={len(valid_here)}",
+                        (24, 78), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+            draw_colorbar(vis_left, z_min, z_max, x=w_single - 130, y=110, w=28, h=260)
+            _writer_write(writer_left, vis_left)
+
+            if valid_here:
+                Xs = np.array([r["X"] for r in valid_here], dtype=np.float64)
+                Ys = np.array([r["Y"] for r in valid_here], dtype=np.float64)
+                Zs = np.array([r["Z"] for r in valid_here], dtype=np.float64)
+            else:
+                Xs = np.zeros(0)
+                Ys = np.zeros(0)
+                Zs = np.zeros(0)
+            per_frame_xyz.append((Xs, Ys, Zs))
+
+            target_ptr += 1
+            if target_ptr >= len(target_frames):
+                break
+            next_target = int(target_frames[target_ptr])
+            if target_ptr % max(1, len(target_frames) // 10) == 0:
+                print(f"[VIS] left pass: {target_ptr}/{len(target_frames)}")
+
+        ok, frame = capL.read()
+        if not ok:
+            break
+        current_idx += 1
+        if current_idx > int(target_frames[-1]):
+            break
+
+    _writer_close(writer_left)
+    capL.release()
+    print(f"[OK] Wrote {left_path}")
+
+    print("[VIS] rendering iso panel (parallel)...")
+    _render_panel_parallel("iso", target_frames, per_frame_xyz, fps, iso_path,
+                           w_single, h, x_lim, y_lim, z_lim, z_min, z_max,
+                           workers=workers, encoder=enc)
+    print(f"[OK] Wrote {iso_path}")
+
+    print("[VIS] rendering topdown panel (parallel)...")
+    _render_panel_parallel("topdown", target_frames, per_frame_xyz, fps, top_path,
+                           w_single, h, x_lim, y_lim, z_lim, z_min, z_max,
+                           workers=workers, encoder=enc)
+    print(f"[OK] Wrote {top_path}")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--stereo", default="calibration/work/stereo.npz", help="Path to stereo.npz")
@@ -571,6 +982,13 @@ def main():
     ap.add_argument("--visualize", action="store_true", help="Generate side-by-side original + CSV reconstruction video")
     ap.add_argument("--viz-out", default="triangulation/out/triangulated_3d_viz.mp4", help="Output path for visualization video")
     ap.add_argument("--viz-max-frames", type=int, default=-1, help="Max rendered frames with tracked nodes (-1=all)")
+    ap.add_argument("--viz-mode", choices=["scene", "sidebyside"], default="scene",
+                    help="scene: depth-colored overlay + isometric + top-down. sidebyside: original legacy view.")
+    ap.add_argument("--viz-trail", type=int, default=60, help="Recent-frames trail length in 3D panel (scene mode; currently unused)")
+    ap.add_argument("--viz-workers", type=int, default=0,
+                    help="Parallel workers for iso/topdown rendering. 0=auto (cpu_count).")
+    ap.add_argument("--viz-encoder", choices=["auto", "nvenc", "mp4v"], default="auto",
+                    help="Video encoder. auto=nvenc if ffmpeg present, else mp4v.")
     ap.add_argument("--quality-min", type=float, default=0.0, help="Filter 2D points by quality >= this")
     ap.add_argument("--max-reproj", type=float, default=20.0, help="Reject if mean reproj err > this (px)")
     args = ap.parse_args()
@@ -788,6 +1206,16 @@ def main():
     if args.visualize:
         if not args.left_video:
             print("[VIS] --visualize requested but --left-video not provided. Skipping visualization.")
+        elif args.viz_mode == "scene":
+            create_3d_scene_visualization(
+                out_rows=out_rows,
+                left_video=args.left_video,
+                out_path=args.viz_out,
+                max_frames=args.viz_max_frames,
+                trail_len=args.viz_trail,
+                workers=args.viz_workers,
+                encoder=args.viz_encoder,
+            )
         else:
             create_3d_visualization_video(
                 out_rows=out_rows,

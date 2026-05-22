@@ -65,13 +65,68 @@ to them later.
 
 ## Calibration
 
-From `calibration`:
+Put the left/right calibration videos here:
+
+```text
+calibration/in/left.mp4
+calibration/in/right.mp4
+```
+
+Then run from `calibration`:
 
 ```powershell
-python .\stereo_checker_debug.py sync --left .\in\left.mp4 --right .\in\right.mp4 --out work\sync.json --scale 1.0 --sync-mode audio
-python .\stereo_checker_debug.py stats --left .\in\left.mp4 --right .\in\right.mp4 --sync work\sync.json --out work\stats --scale 1.0 --step 50 --max_scan 1000 --cols 8 --rows 6
-python .\stereo_checker_debug.py mono --left .\in\left.mp4 --right .\in\right.mp4 --sync work\sync.json --out work\mono.npz --scale 1.0 --step 2 --max_scan 10000 --cols 8 --rows 6 --reuse_stats_indices --stats_dir .\work\stats
-python .\stereo_checker_debug.py stereo --left .\in\left.mp4 --right .\in\right.mp4 --sync work\sync.json --mono work\mono.npz --out work\stereo.npz --scale 1.0 --step 25 --max_pairs 50 --cols 8 --rows 6 --reuse_stats_indices --stats_dir .\work\stats
+python .\stereo_checker_debug.py sync --sync-mode audio
+python .\stereo_checker_debug.py stats --step 50 --max-scan 1000 --cols 8 --rows 6 --workers 16
+python .\stereo_checker_debug.py mono --step 2 --max-scan 10000 --cols 8 --rows 6 --reuse-stats-indices --workers 16
+python .\stereo_checker_debug.py stereo --step 25 --max-pairs 50 --cols 8 --rows 6 --reuse-stats-indices --workers 16
+python .\stereo_checker_debug.py rectify --frame-offset 150 --alpha 0.2
+```
+
+Linux uses the same arguments with `/` paths:
+
+```bash
+python stereo_checker_debug.py sync --sync-mode audio
+python stereo_checker_debug.py stats --step 50 --max-scan 1000 --cols 8 --rows 6 --workers 16
+python stereo_checker_debug.py mono --step 2 --max-scan 10000 --cols 8 --rows 6 --reuse-stats-indices --workers 16
+python stereo_checker_debug.py stereo --step 25 --max-pairs 50 --cols 8 --rows 6 --reuse-stats-indices --workers 16
+python stereo_checker_debug.py rectify --frame-offset 150 --alpha 0.2
+```
+
+By default, `stereo_checker_debug.py` uses:
+
+```text
+scale=1.0
+in/left.mp4
+in/right.mp4
+work/sync.json
+work/stats
+work/mono.npz
+work/stereo.npz
+work/rectify
+```
+
+That means the file input/output flags are optional for the standard layout.
+Override paths only when needed:
+
+```text
+--left
+--right
+--sync
+--out
+--mono
+--stereo
+--stats-dir
+```
+
+Useful calibration flags:
+
+```text
+--scale 1.0              processing scale; must match between mono, stereo, and rectify
+--cols 8 --rows 6        checkerboard inner-corner count for the current board
+--square-mm 25.0         checker square size
+--workers 16             multiprocessing workers for stats-index reuse paths
+--reuse-stats-indices    reuse positive detections from stats for faster mono/stereo
+--use-cuda               use OpenCV CUDA where supported, with CPU fallback
 ```
 
 ## SAM2 Tracking
