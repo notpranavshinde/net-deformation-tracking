@@ -1,0 +1,78 @@
+# Python / local environment
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.conda/
+.venv/
+venv/
+env/
+
+# Editor / OS
+.vscode/
+*.code-workspace
+.DS_Store
+Thumbs.db
+
+# Never commit raw recordings or split clips
+raw videos/
+**/raw videos/
+**/archive/
+**/dual_clips/
+*.mp4
+*.MP4
+*.mov
+*.MOV
+*.avi
+*.AVI
+
+# GoPro/OpenGoPro local connection artifacts
+cohn_db.json
+
+# SAM/checkpoint/model weights
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+sam2/sam2/checkpoints/
+sam2/sam2/.cache/
+sam2/sam2/external/
+sam2/sam2/demo/
+sam2/sam2/notebooks/
+sam2/sam2/training/
+sam2/sam2/sav_dataset/
+sam2/sam2/assets/
+sam2/sam2/.github/
+
+# Generated pipeline inputs/outputs/caches
+calibration/in/
+calibration/work/
+sam2/sam2/in/
+sam2/sam2/out/
+sam2/sam2/frames/
+sam2/sam2/work/
+triangulation/out/
+work/
+codex resume session id.txt
+
+# Generated frame/image debug dumps
+**/frames/
+**/objectwise_frames/
+**/debug/
+**/debug_left/
+**/debug_right/
+**/overlay/
+**/*_debug_*.png
+**/pair_*.png
+**/*preview*.png
+**/*heatmap*.png
+
+# Build/install products
+build/
+dist/
+*.egg-info/
+
+# Nested cloned repositories should not become embedded in this repo
+**/.git/
+.nested-git-backups/
