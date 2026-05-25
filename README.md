@@ -171,7 +171,7 @@ python .\run_sam2_objectwise.py --scale 0.5 --gpu-mode single --single-gpu-index
 Useful SAM2 flags:
 
 ```text
---gpu-mode single|dual|4090-only|cpu
+--gpu-mode auto|single|dual|4090-only
 --single-gpu-index N    CUDA device for single-GPU mode
 --batch-size N          objectwise only; objects per SAM2 run
 --preview true|false    live preview/correction UI

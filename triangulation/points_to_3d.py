@@ -88,7 +88,7 @@ python points_to_3d.py \
     --left-video sam2/sam2/in/left.mp4 \
     --viz-out triangulation/out/triangulated_3d_viz.mp4
 
-    python .\triangulation\points_to_3d.py --stereo .\calibration\work\stereo.npz --left .\sam2\sam2\out\left\trals_2d_left.csv --right .\sam2\sam2\out\right\tracks_2d_right.csv --left-video .\sam2\sam2\in\left.MP4 --right-video .\sam2\sam2\in\right.MP4 --sync-mode audio --visualize --viz-out .\triangulation\out\3d_out.mp4 --viz-max-frames 10000 --out-csv .\triangulation\out\triangulated_3d.csv --out-summary .\triangulation\out\summary.json
+    python .\triangulation\points_to_3d.py --stereo .\calibration\work\stereo.npz --left .\sam2\sam2\out\left\tracks_2d.csv --right .\sam2\sam2\out\right\tracks_2d.csv --left-video .\sam2\sam2\in\left.MP4 --right-video .\sam2\sam2\in\right.MP4 --sync-mode audio --visualize --viz-out .\triangulation\out\3d_out.mp4 --viz-max-frames 10000 --out-csv .\triangulation\out\triangulated_3d.csv --out-summary .\triangulation\out\summary.json
 
 6) Manual sync (if you already know drops)
 python points_to_3d.py \
