@@ -524,7 +524,7 @@ def create_3d_visualization_video(out_rows: list,
 
     capL = open_video(left_video)
     fpsL = float(capL.get(cv2.CAP_PROP_FPS))
-    fps = fpsL if fpsL > 0 else 30.0
+    fps = _visualization_fps(fpsL)
 
     grouped = {}
     for row in out_rows:
@@ -615,9 +615,15 @@ def create_3d_visualization_video(out_rows: list,
 
 _WORKER = {}
 VIZ_CMAP = "viridis"
+VIZ_PLAYBACK_SLOWDOWN = 4.0
 
 
-def _worker_init(kind, w, h, x_lim, y_lim, z_lim, z_min, z_max, disp_max, iso_azim):
+def _visualization_fps(source_fps: float):
+    fps = float(source_fps) if float(source_fps) > 0 else 30.0
+    return max(fps / VIZ_PLAYBACK_SLOWDOWN, 1.0)
+
+
+def _worker_init(kind, w, h, x_lim, y_lim, z_lim, z_min, z_max, disp_max, iso_azim, edges):
     """Initialize a reusable matplotlib figure inside each worker process."""
     import matplotlib
     matplotlib.use("Agg", force=True)
@@ -667,6 +673,10 @@ def _worker_init(kind, w, h, x_lim, y_lim, z_lim, z_min, z_max, disp_max, iso_az
             alpha=0.25,
             zorder=0,
         )
+        edge_lines = [
+            ax.plot([], [], [], color=(0.18, 0.18, 0.18, 0.90), linewidth=1.35)[0]
+            for _edge in edges
+        ]
         scatter = ax.scatter([], [], [], s=88, c=[], cmap=cmap, norm=norm,
                              depthshade=False, edgecolors="black", linewidths=0.25)
         cbar = fig.colorbar(sm, ax=ax, fraction=0.035, pad=0.05)
@@ -691,6 +701,10 @@ def _worker_init(kind, w, h, x_lim, y_lim, z_lim, z_min, z_max, disp_max, iso_az
         for spine in ax.spines.values():
             spine.set_color("black")
             spine.set_linewidth(1.5)
+        edge_lines = [
+            ax.plot([], [], color=(0.18, 0.18, 0.18, 0.90), linewidth=1.35)[0]
+            for _edge in edges
+        ]
         scatter = ax.scatter([], [], s=88, c=[], cmap=cmap, norm=norm,
                              edgecolors="black", linewidths=0.25)
         cbar = fig.colorbar(sm, ax=ax, fraction=0.035, pad=0.08)
@@ -700,7 +714,7 @@ def _worker_init(kind, w, h, x_lim, y_lim, z_lim, z_min, z_max, disp_max, iso_az
 
     _WORKER.update(dict(
         kind=kind, fig=fig, ax=ax, scatter=scatter,
-        w=w, h=h, cmap=cmap, norm=norm,
+        w=w, h=h, cmap=cmap, norm=norm, edges=edges, edge_lines=edge_lines,
     ))
 
 
@@ -749,17 +763,36 @@ def _draw_chunk(args):
     h = _WORKER["h"]
     cmap = _WORKER["cmap"]
     norm = _WORKER["norm"]
+    edges = _WORKER["edges"]
+    edge_lines = _WORKER["edge_lines"]
 
     writer = _open_writer(segment_path, fps, w, h, encoder)
 
-    for fid, (Xs, Ys, Zs, Ds) in zip(frame_ids, chunk_xyz):
+    for fid, (ObjIds, Xs, Ys, Zs, Ds) in zip(frame_ids, chunk_xyz):
         colors = cmap(norm(Ds)) if len(Ds) > 0 else np.zeros((0, 4), dtype=np.float32)
+        index_by_obj = {int(obj_id): i for i, obj_id in enumerate(ObjIds)}
         if kind == "iso":
+            for line, (obj_a, obj_b) in zip(edge_lines, edges):
+                ia = index_by_obj.get(int(obj_a))
+                ib = index_by_obj.get(int(obj_b))
+                if ia is None or ib is None:
+                    line.set_data([], [])
+                    line.set_3d_properties([])
+                else:
+                    line.set_data([Xs[ia], Xs[ib]], [Ys[ia], Ys[ib]])
+                    line.set_3d_properties([Zs[ia], Zs[ib]])
             scatter._offsets3d = (Xs, Ys, Zs)
             scatter.set_array(np.asarray(Ds, dtype=np.float64))
             scatter.set_facecolor(colors)
             scatter.set_edgecolor(colors)
         else:
+            for line, (obj_a, obj_b) in zip(edge_lines, edges):
+                ia = index_by_obj.get(int(obj_a))
+                ib = index_by_obj.get(int(obj_b))
+                if ia is None or ib is None:
+                    line.set_data([], [])
+                else:
+                    line.set_data([Xs[ia], Xs[ib]], [Zs[ia], Zs[ib]])
             if len(Xs) > 0:
                 scatter.set_offsets(np.column_stack([Xs, Zs]))
             else:
@@ -862,6 +895,149 @@ def _build_net_reference_frame(refs, fixed_ids):
     return origin, basis, ref_local, fixed_local
 
 
+def _infer_grid_shape(refs, ref_local, grid_cols=0, grid_rows=0):
+    obj_ids = sorted(int(obj_id) for obj_id in refs)
+    if not obj_ids:
+        return 0, 0
+    count = len(obj_ids)
+    if grid_cols and grid_rows:
+        return int(grid_cols), int(grid_rows)
+    if grid_cols:
+        return int(grid_cols), max(1, count // int(grid_cols))
+    if grid_rows:
+        return max(1, count // int(grid_rows)), int(grid_rows)
+
+    factor_pairs = [
+        (cols, count // cols)
+        for cols in range(1, count + 1)
+        if count % cols == 0
+    ]
+    if not factor_pairs:
+        return count, 1
+
+    yz_span = np.ptp(np.asarray(ref_local[:, 1:3], dtype=np.float64), axis=0)
+    ref_ratio = max(float(yz_span[0]), float(yz_span[1])) / max(min(float(yz_span[0]), float(yz_span[1])), 1e-9)
+    candidates = [
+        pair for pair in factor_pairs
+        if pair[0] > 1 and pair[1] > 1
+    ] or factor_pairs
+
+    def score(pair):
+        cols, rows = pair
+        grid_ratio = max(cols - 1, rows - 1) / max(min(cols - 1, rows - 1), 1)
+        orientation_penalty = 0
+        if yz_span[0] >= yz_span[1] and cols < rows:
+            orientation_penalty = 0.25
+        elif yz_span[1] > yz_span[0] and rows < cols:
+            orientation_penalty = 0.25
+        skinny_penalty = abs(cols - rows) / max(count, 1)
+        return abs(grid_ratio - ref_ratio) + orientation_penalty + skinny_penalty
+
+    return min(candidates, key=score)
+
+
+def _build_reference_edges(refs, ref_local, grid_cols=0, grid_rows=0):
+    """Infer net edges from the two dominant lattice directions."""
+    ref_items = sorted(refs.items())
+    obj_ids = [int(obj_id) for obj_id, _xyz in ref_items]
+    if len(obj_ids) < 2:
+        return [], (0, 0)
+
+    cols, rows = _infer_grid_shape(refs, ref_local, grid_cols=grid_cols, grid_rows=grid_rows)
+    if cols <= 0 or rows <= 0:
+        return [], (0, 0)
+
+    yz = np.asarray(ref_local[:, 1:3], dtype=np.float64)
+    pairs = []
+    nearest_by_point = []
+    for i in range(len(obj_ids)):
+        best = None
+        for j in range(len(obj_ids)):
+            if i == j:
+                continue
+            dist = float(np.linalg.norm(yz[j] - yz[i]))
+            if best is None or dist < best:
+                best = dist
+        if best is not None and best > 1e-9:
+            nearest_by_point.append(best)
+
+    if not nearest_by_point:
+        return [], (cols, rows)
+    nearest = float(np.median(nearest_by_point))
+
+    for i in range(len(obj_ids)):
+        for j in range(i + 1, len(obj_ids)):
+            vec = yz[j] - yz[i]
+            dist = float(np.linalg.norm(vec))
+            if dist <= 1e-9 or dist > nearest * 1.55:
+                continue
+            angle = float(np.mod(np.arctan2(vec[1], vec[0]), np.pi))
+            pairs.append((i, j, dist, angle))
+
+    if not pairs:
+        return [], (cols, rows)
+
+    def angle_delta(a, b):
+        return abs(float((a - b + np.pi / 2.0) % np.pi - np.pi / 2.0))
+
+    bins = np.linspace(0.0, np.pi, 37)
+    scores = np.zeros(len(bins) - 1, dtype=np.float64)
+    for _i, _j, dist, angle in pairs:
+        bin_idx = min(int(angle / np.pi * len(scores)), len(scores) - 1)
+        scores[bin_idx] += 1.0 / max(dist, 1e-9)
+
+    first_idx = int(np.argmax(scores))
+    first_angle = float(0.5 * (bins[first_idx] + bins[first_idx + 1]))
+    second_idx = None
+    second_score = -1.0
+    for idx, score_value in enumerate(scores):
+        angle = float(0.5 * (bins[idx] + bins[idx + 1]))
+        sep = angle_delta(angle, first_angle)
+        if sep < np.deg2rad(35.0) or sep > np.deg2rad(145.0):
+            continue
+        if score_value > second_score:
+            second_idx = idx
+            second_score = float(score_value)
+    if second_idx is None:
+        return [], (cols, rows)
+    second_angle = float(0.5 * (bins[second_idx] + bins[second_idx + 1]))
+
+    def refine_angle(seed_angle):
+        nearby = [
+            (angle, 1.0 / max(dist, 1e-9))
+            for _i, _j, dist, angle in pairs
+            if angle_delta(angle, seed_angle) <= np.deg2rad(18.0)
+        ]
+        if not nearby:
+            return seed_angle
+        doubled = np.array([2.0 * angle for angle, _weight in nearby], dtype=np.float64)
+        weights = np.array([weight for _angle, weight in nearby], dtype=np.float64)
+        mean_angle = 0.5 * np.arctan2(
+            float(np.sum(weights * np.sin(doubled))),
+            float(np.sum(weights * np.cos(doubled))),
+        )
+        return float(np.mod(mean_angle, np.pi))
+
+    lattice_angles = [refine_angle(first_angle), refine_angle(second_angle)]
+    edges = set()
+    cone = np.deg2rad(18.0)
+    for lattice_angle in lattice_angles:
+        dir_pairs = [
+            (i, j, dist)
+            for i, j, dist, angle in pairs
+            if angle_delta(angle, lattice_angle) <= cone
+        ]
+        if not dir_pairs:
+            continue
+        step = float(np.median([dist for _i, _j, dist in dir_pairs]))
+        max_step = step * 1.45
+        for i, j, dist in dir_pairs:
+            if dist <= max_step:
+                edges.add(tuple(sorted((obj_ids[i], obj_ids[j]))))
+
+    return sorted(edges), (cols, rows)
+
+
 def _to_local_xyz(xyz, origin, basis):
     return (np.asarray(xyz, dtype=np.float64) - origin) @ basis.T
 
@@ -873,7 +1049,9 @@ def _choose_iso_azim(ref_local, fixed_local):
     import matplotlib.pyplot as plt
     from mpl_toolkits.mplot3d import proj3d
 
-    candidates = [-150, -120, -90, -60, -30, 0, 30, 60, 90, 120, 150, 180]
+    # Avoid exactly edge-on camera angles. The net should still look like a
+    # mostly-flat plane, just rotated enough that x deformation comes forward.
+    candidates = [-60, -45, 45, 60]
     x_lim = (float(ref_local[:, 0].min()), float(ref_local[:, 0].max()))
     y_lim = (float(ref_local[:, 1].min()), float(ref_local[:, 1].max()))
     z_lim = (float(ref_local[:, 2].min()), float(ref_local[:, 2].max()))
@@ -888,10 +1066,8 @@ def _choose_iso_azim(ref_local, fixed_local):
         fig.canvas.draw()
         fx, fy, _ = proj3d.proj_transform(*fixed_center, ax.get_proj())
         axc, ayc, _ = proj3d.proj_transform(*all_center, ax.get_proj())
-        # Match the rendered image: fixed end should project left and high, while
-        # keeping an oblique view so out-of-plane deformation remains visible.
-        oblique_preference = -0.006 * abs(azim - 60) / 60.0
-        score = (fx - axc) + (fy - ayc) + oblique_preference
+        # Match the rendered image: fixed end should project left and high.
+        score = (fx - axc) + (fy - ayc)
         if score > best[0]:
             best = (float(score), int(azim))
     plt.close(fig)
@@ -920,7 +1096,7 @@ def _concat_segments(segments, out_path):
 
 def _render_panel_parallel(kind, frame_ids, per_frame_xyz, fps, out_path,
                            w, h, x_lim, y_lim, z_lim, z_min, z_max,
-                           workers, encoder, disp_max, iso_azim):
+                           workers, encoder, disp_max, iso_azim, edges):
     n = len(frame_ids)
     if n == 0:
         return
@@ -937,13 +1113,13 @@ def _render_panel_parallel(kind, frame_ids, per_frame_xyz, fps, out_path,
         chunks.append((kind, frame_ids[s:e], per_frame_xyz[s:e], fps, str(seg), encoder))
 
     if workers == 1:
-        _worker_init(kind, w, h, x_lim, y_lim, z_lim, z_min, z_max, disp_max, iso_azim)
+        _worker_init(kind, w, h, x_lim, y_lim, z_lim, z_min, z_max, disp_max, iso_azim, edges)
         segments = [_draw_chunk(c) for c in chunks]
     else:
         with Pool(
             processes=workers,
             initializer=_worker_init,
-            initargs=(kind, w, h, x_lim, y_lim, z_lim, z_min, z_max, disp_max, iso_azim),
+            initargs=(kind, w, h, x_lim, y_lim, z_lim, z_min, z_max, disp_max, iso_azim, edges),
         ) as pool:
             segments = pool.map(_draw_chunk, chunks)
 
@@ -975,7 +1151,9 @@ def create_3d_scene_visualization(out_rows: list,
                                   max_frames: int = -1,
                                   trail_len: int = 60,
                                   workers: int = 0,
-                                  encoder: str = "auto"):
+                                  encoder: str = "auto",
+                                  grid_cols: int = 0,
+                                  grid_rows: int = 0):
     """Render left overlay, isometric 3D, and top-down videos as separate files."""
     _ = trail_len
     if len(out_rows) == 0:
@@ -990,10 +1168,12 @@ def create_3d_scene_visualization(out_rows: list,
 
     refs, fixed_ids, disp_max = _attach_displacements(valid_rows)
     origin, basis, ref_local, fixed_local = _build_net_reference_frame(refs, fixed_ids)
+    edges, grid_shape = _build_reference_edges(refs, ref_local, grid_cols=grid_cols, grid_rows=grid_rows)
     iso_azim = _choose_iso_azim(ref_local, fixed_local)
     print(
         f"[VIS] displacement color scale: 0-{disp_max:.4f} m; "
-        f"fixed_ids={len(fixed_ids)}; iso_azim={iso_azim}"
+        f"fixed_ids={len(fixed_ids)}; grid={grid_shape[0]}x{grid_shape[1]}; "
+        f"edges={len(edges)}; iso_azim={iso_azim}"
     )
 
     local_all = np.array([
@@ -1022,7 +1202,7 @@ def create_3d_scene_visualization(out_rows: list,
 
     capL = open_video(left_video)
     fpsL = float(capL.get(cv2.CAP_PROP_FPS))
-    fps = fpsL if fpsL > 0 else 30.0
+    fps = _visualization_fps(fpsL)
 
     grouped = {}
     for row in out_rows:
@@ -1106,16 +1286,18 @@ def create_3d_scene_visualization(out_rows: list,
                     _to_local_xyz([float(r["X"]), float(r["Y"]), float(r["Z"])], origin, basis)
                     for r in valid_here
                 ], dtype=np.float64)
+                ObjIds = np.array([int(r["obj_id"]) for r in valid_here], dtype=np.int32)
                 Xs = local[:, 0]
                 Ys = local[:, 1]
                 Zs = local[:, 2]
                 Ds = np.array([float(r.get("_disp_m", 0.0)) for r in valid_here], dtype=np.float64)
             else:
+                ObjIds = np.zeros(0, dtype=np.int32)
                 Xs = np.zeros(0)
                 Ys = np.zeros(0)
                 Zs = np.zeros(0)
                 Ds = np.zeros(0)
-            per_frame_xyz.append((Xs, Ys, Zs, Ds))
+            per_frame_xyz.append((ObjIds, Xs, Ys, Zs, Ds))
 
             target_ptr += 1
             if target_ptr >= len(target_frames):
@@ -1138,13 +1320,13 @@ def create_3d_scene_visualization(out_rows: list,
     print("[VIS] rendering iso panel (parallel)...")
     _render_panel_parallel("iso", target_frames, per_frame_xyz, fps, iso_path,
                            w_single, h, x_lim, y_lim, z_lim, z_min, z_max,
-                           workers=workers, encoder=enc, disp_max=disp_max, iso_azim=iso_azim)
+                           workers=workers, encoder=enc, disp_max=disp_max, iso_azim=iso_azim, edges=edges)
     print(f"[OK] Wrote {iso_path}")
 
     print("[VIS] rendering topdown panel (parallel)...")
     _render_panel_parallel("topdown", target_frames, per_frame_xyz, fps, top_path,
                            w_single, h, x_lim, y_lim, z_lim, z_min, z_max,
-                           workers=workers, encoder=enc, disp_max=disp_max, iso_azim=iso_azim)
+                           workers=workers, encoder=enc, disp_max=disp_max, iso_azim=iso_azim, edges=edges)
     print(f"[OK] Wrote {top_path}")
 
 
@@ -1161,6 +1343,8 @@ def visualize_existing_rows(args, out_rows):
             trail_len=args.viz_trail,
             workers=args.workers,
             encoder=args.viz_encoder,
+            grid_cols=args.viz_grid_cols,
+            grid_rows=args.viz_grid_rows,
         )
     else:
         create_3d_visualization_video(
@@ -1215,6 +1399,10 @@ def main():
                     help="Parallel workers for iso/topdown rendering. 0=auto (cpu_count).")
     ap.add_argument("--viz-encoder", choices=["auto", "nvenc", "mp4v"], default="auto",
                     help="Video encoder. auto=nvenc if ffmpeg present, else mp4v.")
+    ap.add_argument("--viz-grid-cols", type=int, default=0,
+                    help="Marker grid columns for visualization net edges. 0=auto from object count/aspect.")
+    ap.add_argument("--viz-grid-rows", type=int, default=0,
+                    help="Marker grid rows for visualization net edges. 0=auto from object count/aspect.")
     ap.add_argument("--quality-min", type=float, default=0.0, help="Filter 2D points by quality >= this")
     ap.add_argument("--max-reproj", type=float, default=20.0, help="Reject if mean reproj err > this (px)")
     args = ap.parse_args()

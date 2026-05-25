@@ -3288,6 +3288,7 @@ def _run_single_video_worker(side_name: str,
                              auto_pause_missing: bool = False,
                              progress_event_q=None):
     """Worker entrypoint for running one side on one explicit device."""
+    os.environ["SAM2_DISABLE_FRAME_LOADING_PROGRESS"] = "1"
     try:
         device = str(device)
         if device.startswith("cuda"):

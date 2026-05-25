@@ -128,6 +128,18 @@ def write_json(path: str, payload: dict):
     with open(path, "w") as f:
         json.dump(payload, f, indent=2)
 
+
+def parse_bool(value):
+    if isinstance(value, bool):
+        return value
+    value = str(value).strip().lower()
+    if value in ("1", "true", "t", "yes", "y", "on"):
+        return True
+    if value in ("0", "false", "f", "no", "n", "off"):
+        return False
+    raise argparse.ArgumentTypeError("expected true or false")
+
+
 def validate_args(args):
     if hasattr(args, "scale") and args.scale <= 0:
         raise ValueError("--scale must be > 0")
@@ -2113,8 +2125,9 @@ def main():
                     help="Mono detection worker processes when --reuse-stats-indices is enabled.")
     sp.add_argument("--no-adaptive", action="store_true",
                     help="Disable adaptive halving; scan exactly once at --step.")
-    sp.add_argument("--reuse-stats-indices", action="store_true",
-                    help="Reuse positive detection frame indices from stats output instead of rescanning")
+    sp.add_argument("--reuse-stats-indices", type=parse_bool, nargs="?", const=True, default=True,
+                    metavar="true|false",
+                    help="Reuse positive detection frame indices from stats output instead of rescanning. Default: true.")
     sp.add_argument("--stats-dir", default=DEFAULT_STATS_DIR,
                     help="Directory containing stats_left.json and stats_right.json")
     sp.add_argument("--use-cuda", action="store_true", help="Use OpenCV CUDA ops when available; auto-fallback to CPU")
@@ -2138,8 +2151,9 @@ def main():
                     help="Stereo pair detection worker processes when --reuse-stats-indices is enabled.")
     sp.add_argument("--no-adaptive", action="store_true",
                     help="Disable adaptive halving; scan exactly once at --step.")
-    sp.add_argument("--reuse-stats-indices", action="store_true",
-                    help="Reuse synchronized positive detection frame indices from stats output instead of rescanning")
+    sp.add_argument("--reuse-stats-indices", type=parse_bool, nargs="?", const=True, default=True,
+                    metavar="true|false",
+                    help="Reuse synchronized positive detection frame indices from stats output instead of rescanning. Default: true.")
     sp.add_argument("--stats-dir", default=DEFAULT_STATS_DIR,
                     help="Directory containing stats_left.json and stats_right.json")
     sp.add_argument("--use-cuda", action="store_true", help="Use OpenCV CUDA ops when available; auto-fallback to CPU")
@@ -2167,11 +2181,11 @@ if __name__ == "__main__":
 
 """run commands
 python stereo_checker_debug.py sync --sync-mode audio
-python stereo_checker_debug.py stats --step 50 --max-scan 1000 --cols 8 --rows 6 --workers 16
-python stereo_checker_debug.py mono --step 2 --max-scan 10000 --cols 8 --rows 6 --reuse-stats-indices --workers 16
-python stereo_checker_debug.py stereo --step 25 --max-pairs 50 --cols 8 --rows 6 --reuse-stats-indices --workers 16
+python stereo_checker_debug.py stats --step 50 --max-scan 1000 --workers 16
+python stereo_checker_debug.py mono --max-scan 100 --workers 16
+python stereo_checker_debug.py stereo --max-pairs 50 --workers 16
 python stereo_checker_debug.py rectify --frame-offset 150 --alpha 0.2
 
 For GPU usage, add --use-cuda to the above commands, e.g.:
-python stereo_checker_debug.py mono --step 5 --max-scan 10000 --debug-every 100 --cols 8 --rows 6 --use-cuda
+python stereo_checker_debug.py mono --max-scan 100 --debug-every 100 --use-cuda
 """

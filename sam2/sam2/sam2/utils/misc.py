@@ -117,6 +117,11 @@ def _progress_side_label(video_path):
     return "frame loading (JPEG)"
 
 
+def _disable_frame_loading_progress():
+    value = os.environ.get("SAM2_DISABLE_FRAME_LOADING_PROGRESS", "")
+    return str(value).strip().lower() in ("1", "true", "yes", "y", "on")
+
+
 def _make_progress():
     return Progress(
         TextColumn("[progress.description]{task.description}"),
@@ -125,6 +130,7 @@ def _make_progress():
         TextColumn("{task.percentage:>3.0f}%"),
         TimeElapsedColumn(),
         TimeRemainingColumn(),
+        disable=_disable_frame_loading_progress(),
     )
 
 
