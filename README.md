@@ -159,9 +159,20 @@ From `sam2\sam2`:
 
 ```powershell
 python .\run_sam2_markers.py --setup
+python .\run_sam2_markers.py --semi-auto-setup
 python .\run_sam2_markers.py --modify-setup
 python .\run_sam2_markers.py --reuse-setup --scale 0.5 --gpu-mode single --single-gpu-index 0
 ```
+
+`--semi-auto-setup` asks for grid columns/rows, then asks you to click the
+outer marker-grid corners on LEFT and RIGHT in this order: top-left, top-right,
+bottom-left, bottom-right. It detects the painted marker centroids, fills any
+misses from the grid estimate, and opens an editable review window before
+saving the normal setup package.
+
+In `--modify-setup`, existing prompts use the same two-click move workflow:
+left-click a prompt to select it, left-click the corrected marker center to
+place it, and press `n` before a left-click when you want to add a new prompt.
 
 Memory-friendly batched run:
 

@@ -4,6 +4,7 @@ Manual SAM2 marker setup and tracking.
 Paste-ready commands from this directory:
 
     python run_sam2_markers.py --setup
+    python run_sam2_markers.py --semi-auto-setup
     python run_sam2_markers.py --modify-setup
     python run_sam2_markers.py --reuse-setup
 
@@ -12,6 +13,8 @@ Defaults expect:
     in/right.mp4
 
 Use --setup on the local Windows machine for manual clicking.
+Use --semi-auto-setup to generate grid prompts from detected painted markers
+after clicking the four outer grid corners.
 Default crop is full-frame. Add --select-crop only when you want to crop.
 Use --modify-setup to load the saved setup and add more points without
 re-clicking everything.
@@ -33,9 +36,15 @@ import time
 import subprocess
 import gc
 import hashlib
+import math
 from pathlib import Path
 import argparse
 import sys
+from types import SimpleNamespace
+
+THIS_DIR = Path(__file__).resolve().parent
+if str(THIS_DIR) not in sys.path:
+    sys.path.insert(0, str(THIS_DIR))
 
 import numpy as np
 import torch
@@ -47,6 +56,11 @@ from rich.progress import (
     TimeElapsedColumn,
     TimeRemainingColumn,
 )
+
+try:
+    from auto_detect_sam2_prompts import detect_candidates_on_processed_frame
+except Exception:
+    detect_candidates_on_processed_frame = None
 
 # ---- CONFIG ----
 DEFAULT_OUT_DIR = Path("out")
@@ -446,6 +460,212 @@ def build_setup_prompt(point, scale: float):
     return pts_arr, lbl_arr, None
 
 
+def _prompt_int(prompt: str, default: int = None, minimum: int = 1) -> int:
+    while True:
+        suffix = f" [{default}]" if default is not None else ""
+        raw = input(f"{prompt}{suffix}: ").strip()
+        if raw == "" and default is not None:
+            return int(default)
+        try:
+            value = int(raw)
+        except ValueError:
+            print(f"Enter an integer >= {minimum}.")
+            continue
+        if value >= minimum:
+            return value
+        print(f"Enter an integer >= {minimum}.")
+
+
+def _bilinear_grid_point(corners, col: int, row: int, cols: int, rows: int):
+    tl, tr, bl, br = [np.asarray(pt, dtype=np.float32) for pt in corners]
+    u = 0.0 if cols <= 1 else float(col) / float(cols - 1)
+    v = 0.0 if rows <= 1 else float(row) / float(rows - 1)
+    top = (1.0 - u) * tl + u * tr
+    bottom = (1.0 - u) * bl + u * br
+    xy = (1.0 - v) * top + v * bottom
+    return float(xy[0]), float(xy[1])
+
+
+def _make_detector_args(method: str, max_candidates: int = 0):
+    return SimpleNamespace(
+        method=method,
+        scale=1.0,
+        min_area=35.0,
+        max_area=1600.0,
+        min_distance=28.0,
+        min_score=0.38,
+        max_candidates=int(max_candidates),
+        debug=False,
+    )
+
+
+def _detect_marker_candidates(side: str, frame_bgr: np.ndarray, expected_count: int):
+    if detect_candidates_on_processed_frame is None:
+        print("[WARN] auto_detect_sam2_prompts.py could not be imported; using grid fallback only.")
+        return [], {"import_error": True}
+
+    runs = []
+    for method in ("color", "all"):
+        args = _make_detector_args(method)
+        _raw, counts, merged = detect_candidates_on_processed_frame(
+            side,
+            frame_bgr,
+            (0, 0),
+            args,
+            debug_dir=None,
+        )
+        runs.append((method, counts, merged))
+        if len(merged) >= max(4, int(round(expected_count * 0.75))):
+            break
+
+    method, counts, merged = runs[-1]
+    print(f"[INFO][{side.upper()}] semi-auto detector method={method} candidates={len(merged)} expected={expected_count}")
+    return list(merged), {"method": method, "counts": counts, "candidates": len(merged)}
+
+
+def _grid_homographies(corners, cols: int, rows: int):
+    image_pts = np.asarray(corners, dtype=np.float32)
+    grid_pts = np.asarray(
+        [[0.0, 0.0], [cols - 1.0, 0.0], [0.0, rows - 1.0], [cols - 1.0, rows - 1.0]],
+        dtype=np.float32,
+    )
+    to_grid = cv2.getPerspectiveTransform(image_pts, grid_pts)
+    to_image = cv2.getPerspectiveTransform(grid_pts, image_pts)
+    if not np.isfinite(to_grid).all() or not np.isfinite(to_image).all():
+        raise RuntimeError("Could not build a stable grid transform from the clicked corners.")
+    return to_grid, to_image
+
+
+def _apply_homography(points, homography):
+    pts = np.asarray(points, dtype=np.float32).reshape(-1, 1, 2)
+    out = cv2.perspectiveTransform(pts, homography).reshape(-1, 2)
+    return out
+
+
+def _generate_grid_prompts_from_detection(side: str, frame_bgr: np.ndarray, corners, cols: int, rows: int):
+    expected = int(cols * rows)
+    to_grid, _to_image = _grid_homographies(corners, cols, rows)
+    candidates, detector_meta = _detect_marker_candidates(side, frame_bgr, expected)
+
+    grid_candidates = []
+    if candidates:
+        image_xy = np.asarray([[float(c.x), float(c.y)] for c in candidates], dtype=np.float32)
+        grid_xy = _apply_homography(image_xy, to_grid)
+        for cand, (gx, gy) in zip(candidates, grid_xy):
+            if -0.55 <= gx <= cols - 0.45 and -0.55 <= gy <= rows - 0.45:
+                grid_candidates.append(
+                    {
+                        "candidate": cand,
+                        "grid_x": float(gx),
+                        "grid_y": float(gy),
+                        "score": float(getattr(cand, "score", 0.0)),
+                        "used": False,
+                    }
+                )
+
+    max_grid_dist = 0.48
+    prompts = []
+    meta_points = []
+    detected_count = 0
+
+    for row in range(rows):
+        for col in range(cols):
+            best_idx = None
+            best_key = None
+            for idx, item in enumerate(grid_candidates):
+                if item["used"]:
+                    continue
+                dx = item["grid_x"] - float(col)
+                dy = item["grid_y"] - float(row)
+                dist = math.hypot(dx, dy)
+                if dist > max_grid_dist:
+                    continue
+                key = (dist, -item["score"])
+                if best_key is None or key < best_key:
+                    best_key = key
+                    best_idx = idx
+
+            if best_idx is not None:
+                item = grid_candidates[best_idx]
+                item["used"] = True
+                cand = item["candidate"]
+                x, y = float(cand.x), float(cand.y)
+                source = "detected"
+                confidence = float(cand.score)
+                detected_count += 1
+            else:
+                x, y = _bilinear_grid_point(corners, col, row, cols, rows)
+                source = "inferred"
+                confidence = 0.0
+
+            x = max(0.0, min(float(frame_bgr.shape[1] - 1), x))
+            y = max(0.0, min(float(frame_bgr.shape[0] - 1), y))
+            prompts.append(_make_prompt_point(x, y, 1))
+            meta_points.append(
+                {
+                    "obj_id": len(prompts) - 1,
+                    "row": row,
+                    "col": col,
+                    "source": source,
+                    "confidence": confidence,
+                    "x": x,
+                    "y": y,
+                }
+            )
+
+    print(
+        f"[INFO][{side.upper()}] semi-auto assigned {detected_count}/{expected} from detected centroids; "
+        f"{expected - detected_count} inferred."
+    )
+    meta = {
+        "side": side,
+        "cols": int(cols),
+        "rows": int(rows),
+        "detector": detector_meta,
+        "assigned_detected": int(detected_count),
+        "assigned_inferred": int(expected - detected_count),
+        "points": meta_points,
+    }
+    return prompts, meta
+
+
+def _save_semi_auto_debug(out_root: Path, left_img, right_img, left_points, right_points, left_meta, right_meta):
+    debug_dir = out_root / "prompts" / "semi_auto_debug"
+    debug_dir.mkdir(parents=True, exist_ok=True)
+
+    def sync_meta_positions(points, meta):
+        synced = json.loads(json.dumps(meta))
+        meta_points = synced.get("points", [])
+        for idx, point in enumerate(points):
+            if idx >= len(meta_points):
+                continue
+            x, y, _label = _coerce_prompt_point(point, prefer_local=False)
+            if abs(float(meta_points[idx].get("x", x)) - x) > 1e-3 or abs(float(meta_points[idx].get("y", y)) - y) > 1e-3:
+                meta_points[idx]["source"] = "edited"
+            meta_points[idx]["x"] = float(x)
+            meta_points[idx]["y"] = float(y)
+        return synced
+
+    left_meta = sync_meta_positions(left_points, left_meta)
+    right_meta = sync_meta_positions(right_points, right_meta)
+
+    def draw_preview(img, points, meta, path):
+        disp = img.copy()
+        source_by_idx = {int(p["obj_id"]): p.get("source", "unknown") for p in meta.get("points", [])}
+        for idx, point in enumerate(points):
+            x, y, _label = _coerce_prompt_point(point, prefer_local=False)
+            source = source_by_idx.get(idx, "unknown")
+            color = (0, 220, 0) if source == "detected" else (0, 180, 255)
+            cv2.circle(disp, (int(round(x)), int(round(y))), 6, color, -1)
+            cv2.putText(disp, str(idx), (int(round(x)) + 8, int(round(y)) - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
+        cv2.imwrite(str(path), disp)
+
+    draw_preview(left_img, left_points, left_meta, debug_dir / "left_preview.png")
+    draw_preview(right_img, right_points, right_meta, debug_dir / "right_preview.png")
+    with open(debug_dir / "semi_auto_meta.json", "w") as f:
+        json.dump({"left": left_meta, "right": right_meta}, f, indent=2)
+
+
 def select_crop_roi(video_path: str):
     """
     Open the first video frame and let the user drag a crop ROI.
@@ -636,9 +856,20 @@ def load_first_frame_from_video(video_path: str, crop=None):
     return frame
 
 
-def click_points_dual(image_left_bgr, image_right_bgr, initial_left_points=None, initial_right_points=None):
+def click_points_dual(
+    image_left_bgr,
+    image_right_bgr,
+    initial_left_points=None,
+    initial_right_points=None,
+    fixed_count_review: bool = False,
+    move_existing_points: bool = False,
+    initial_left_meta=None,
+    initial_right_meta=None,
+):
     left_points = json.loads(json.dumps(initial_left_points or []))
     right_points = json.loads(json.dumps(initial_right_points or []))
+    left_meta = json.loads(json.dumps(initial_left_meta or []))
+    right_meta = json.loads(json.dumps(initial_right_meta or []))
     active_view_name = "left"
 
     def setup_view(img):
@@ -662,13 +893,25 @@ def click_points_dual(image_left_bgr, image_right_bgr, initial_left_points=None,
             "last_mouse": (disp_w // 2, disp_h // 2),
             "dragging": False,
             "last_drag": (disp_w // 2, disp_h // 2),
+            "moving_idx": None,
+            "selected_idx": None,
+            "add_next": False,
         }
 
     left_view = setup_view(image_left_bgr)
     right_view = setup_view(image_right_bgr)
 
-    left_win = "LEFT prompts (LMB positive, RMB negative-nearest)"
-    right_win = "RIGHT prompts (LMB positive, RMB negative-nearest)"
+    move_mode = fixed_count_review or move_existing_points
+
+    if fixed_count_review:
+        left_win = "LEFT semi-auto prompts (two-click move, RMB negative-nearest)"
+        right_win = "RIGHT semi-auto prompts (two-click move, RMB negative-nearest)"
+    elif move_existing_points:
+        left_win = "LEFT modify prompts (two-click move, n add next, RMB negative-nearest)"
+        right_win = "RIGHT modify prompts (two-click move, n add next, RMB negative-nearest)"
+    else:
+        left_win = "LEFT prompts (LMB positive, RMB negative-nearest)"
+        right_win = "RIGHT prompts (LMB positive, RMB negative-nearest)"
 
     def clamp_center(view, cx, cy):
         view_w = view["w"] / view["zoom"]
@@ -743,18 +986,32 @@ def click_points_dual(image_left_bgr, image_right_bgr, initial_left_points=None,
             view["center_y"] += step
         view["center_x"], view["center_y"] = clamp_center(view, view["center_x"], view["center_y"])
 
-    def render(view, points, title, other_count):
+    def render(view, points, title, other_count, meta=None):
         x0, y0, x1, y1 = get_view_rect(view)
         crop = view["img"][y0:y1, x0:x1]
         disp = cv2.resize(crop, (view["disp_w"], view["disp_h"]), interpolation=cv2.INTER_LINEAR)
+        source_by_idx = {}
+        for item in meta or []:
+            try:
+                source_by_idx[int(item.get("obj_id", len(source_by_idx)))] = item.get("source", "unknown")
+            except Exception:
+                pass
 
         for idx, point in enumerate(points):
             x, y, label = _coerce_prompt_point(point, prefer_local=False)
             if x0 <= x < x1 and y0 <= y < y1:
                 dx = int(round((x - x0) * (view["disp_w"] / max(x1 - x0, 1))))
                 dy = int(round((y - y0) * (view["disp_h"] / max(y1 - y0, 1))))
-                color = (0, 255, 255)
+                if move_mode:
+                    source = source_by_idx.get(idx, "detected")
+                    color = (0, 220, 0) if fixed_count_review and source == "detected" else (0, 180, 255)
+                    if idx == view.get("selected_idx"):
+                        color = (255, 0, 255)
+                else:
+                    color = (0, 255, 255)
                 cv2.circle(disp, (dx, dy), 6, color, -1)
+                if move_mode and idx == view.get("selected_idx"):
+                    cv2.circle(disp, (dx, dy), 12, color, 2)
                 cv2.putText(
                     disp,
                     f"{idx}+",
@@ -791,10 +1048,21 @@ def click_points_dual(image_left_bgr, image_right_bgr, initial_left_points=None,
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
         cv2.putText(disp, f"zoom={view['zoom']:.1f}x", (10, 86),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 255), 2)
-        cv2.putText(disp, "LMB add object  RMB add negative to nearest object  wheel/+/- zoom", (10, 114),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2)
-        cv2.putText(disp, "MMB drag/WASD pan  z undo neg  x undo object pair  q done  Esc cancel  1/2 focus", (10, 140),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        if fixed_count_review:
+            cv2.putText(disp, "LMB select point, LMB again places it  RMB negative  green=detected orange=inferred", (10, 114),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.52, (255, 255, 255), 2)
+            cv2.putText(disp, "MMB drag/WASD pan  c clear selection  z undo neg  q accept  Esc cancel  1/2 focus", (10, 140),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        elif move_existing_points:
+            cv2.putText(disp, "LMB select point, LMB again places it  n add next click  RMB negative", (10, 114),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.52, (255, 255, 255), 2)
+            cv2.putText(disp, "MMB drag/WASD pan  c clear selection  z undo neg  x undo object pair  q done  Esc cancel", (10, 140),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.56, (255, 255, 255), 2)
+        else:
+            cv2.putText(disp, "LMB add object  RMB add negative to nearest object  wheel/+/- zoom", (10, 114),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2)
+            cv2.putText(disp, "MMB drag/WASD pan  z undo neg  x undo object pair  q done  Esc cancel  1/2 focus", (10, 140),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
         return disp
 
     def add_negative_to_nearest(points, px, py):
@@ -823,7 +1091,28 @@ def click_points_dual(image_left_bgr, image_right_bgr, initial_left_points=None,
                 return
         print("No negative prompt to undo in active window.")
 
-    def _mouse_common(event, x, y, flags, view, points, which_name):
+    def nearest_point_index(points, px, py):
+        best_idx = None
+        best_d2 = None
+        for idx, point in enumerate(points):
+            x0, y0, _label = _coerce_prompt_point(point, prefer_local=False)
+            d2 = (float(px) - x0) ** 2 + (float(py) - y0) ** 2
+            if best_d2 is None or d2 < best_d2:
+                best_d2 = d2
+                best_idx = idx
+        return best_idx
+
+    def move_point(points, idx, px, py, meta):
+        if idx is None or idx < 0 or idx >= len(points):
+            return
+        negatives = _coerce_negative_points(points[idx])
+        points[idx] = _make_prompt_point(px, py, 1, negatives)
+        if idx < len(meta):
+            meta[idx]["source"] = "edited"
+            meta[idx]["x"] = float(px)
+            meta[idx]["y"] = float(py)
+
+    def _mouse_common(event, x, y, flags, view, points, which_name, meta):
         nonlocal active_view_name
         active_view_name = which_name
         if event == cv2.EVENT_MOUSEMOVE:
@@ -838,7 +1127,22 @@ def click_points_dual(image_left_bgr, image_right_bgr, initial_left_points=None,
         elif event in (cv2.EVENT_LBUTTONDOWN, cv2.EVENT_RBUTTONDOWN):
             px, py = map_disp_to_orig(view, x, y)
             if event == cv2.EVENT_LBUTTONDOWN:
-                points.append(_make_prompt_point(px, py, 1))
+                if move_mode:
+                    if view.get("add_next"):
+                        points.append(_make_prompt_point(px, py, 1))
+                        view["add_next"] = False
+                        view["selected_idx"] = None
+                        print(f"[{which_name.upper()}] Added object {len(points) - 1} at x={px}, y={py}.")
+                    elif view.get("selected_idx") is None:
+                        view["selected_idx"] = nearest_point_index(points, px, py)
+                        print(f"[{which_name.upper()}] Selected object {view['selected_idx']}; click the desired marker center to place it.")
+                    else:
+                        idx = view["selected_idx"]
+                        move_point(points, idx, px, py, meta)
+                        view["selected_idx"] = None
+                        print(f"[{which_name.upper()}] Moved object {idx} to x={px}, y={py}.")
+                else:
+                    points.append(_make_prompt_point(px, py, 1))
             else:
                 add_negative_to_nearest(points, px, py)
         elif event == cv2.EVENT_MBUTTONDOWN:
@@ -851,10 +1155,10 @@ def click_points_dual(image_left_bgr, image_right_bgr, initial_left_points=None,
             zoom_at_disp_point(view, x, y, view["zoom"] * delta)
 
     def on_left(event, x, y, flags, param):
-        _mouse_common(event, x, y, flags, left_view, left_points, "left")
+        _mouse_common(event, x, y, flags, left_view, left_points, "left", left_meta)
 
     def on_right(event, x, y, flags, param):
-        _mouse_common(event, x, y, flags, right_view, right_points, "right")
+        _mouse_common(event, x, y, flags, right_view, right_points, "right", right_meta)
 
     cv2.namedWindow(left_win, cv2.WINDOW_NORMAL)
     cv2.namedWindow(right_win, cv2.WINDOW_NORMAL)
@@ -862,8 +1166,8 @@ def click_points_dual(image_left_bgr, image_right_bgr, initial_left_points=None,
     cv2.setMouseCallback(right_win, on_right)
 
     while True:
-        cv2.imshow(left_win, render(left_view, left_points, "LEFT", len(right_points)))
-        cv2.imshow(right_win, render(right_view, right_points, "RIGHT", len(left_points)))
+        cv2.imshow(left_win, render(left_view, left_points, "LEFT", len(right_points), left_meta))
+        cv2.imshow(right_win, render(right_view, right_points, "RIGHT", len(left_points), right_meta))
         key = cv2.waitKey(20) & 0xFF
 
         if key == 27:
@@ -871,7 +1175,7 @@ def click_points_dual(image_left_bgr, image_right_bgr, initial_left_points=None,
             cv2.destroyWindow(right_win)
             raise RuntimeError("Point selection canceled by user.")
 
-        if key == ord("x"):
+        if key == ord("x") and not fixed_count_review:
             if left_points and right_points:
                 left_points.pop()
                 right_points.pop()
@@ -882,6 +1186,18 @@ def click_points_dual(image_left_bgr, image_right_bgr, initial_left_points=None,
 
         if key == ord("z"):
             undo_last_negative(left_points if active_view_name == "left" else right_points)
+
+        if move_mode and key == ord("c"):
+            target = left_view if active_view_name == "left" else right_view
+            target["selected_idx"] = None
+            target["add_next"] = False
+            print(f"[{active_view_name.upper()}] Cleared selected point.")
+
+        if move_existing_points and key == ord("n"):
+            target = left_view if active_view_name == "left" else right_view
+            target["selected_idx"] = None
+            target["add_next"] = True
+            print(f"[{active_view_name.upper()}] Next left click will add a new object.")
 
         if key == ord("1"):
             active_view_name = "left"
@@ -905,6 +1221,9 @@ def click_points_dual(image_left_bgr, image_right_bgr, initial_left_points=None,
                 continue
             if len(left_points) != len(right_points):
                 print(f"Point count mismatch: LEFT={len(left_points)}, RIGHT={len(right_points)}")
+                continue
+            if fixed_count_review and len(left_points) != len(initial_left_points or []):
+                print("Semi-auto review point count changed unexpectedly; cancel and regenerate.")
                 continue
             break
 
@@ -1739,6 +2058,11 @@ def parse_args():
         "--modify-setup",
         action="store_true",
         help="Load saved setup, let you add/edit prompt points, save it, then exit before SAM2 compute.",
+    )
+    parser.add_argument(
+        "--semi-auto-setup",
+        action="store_true",
+        help="Generate a row/column prompt grid from detected painted markers, review/edit it, save setup, then exit before SAM2 compute.",
     )
     parser.add_argument(
         "--left-crop",
@@ -3964,11 +4288,11 @@ def run_dual_gpu_with_parent_preview(left_video,
 def main():
     args = parse_args()
 
-    selected_setup_modes = sum(bool(v) for v in (args.setup, args.reuse_setup, args.modify_setup))
+    selected_setup_modes = sum(bool(v) for v in (args.setup, args.reuse_setup, args.modify_setup, args.semi_auto_setup))
     if selected_setup_modes > 1:
-        raise RuntimeError("Use only one of --setup, --reuse-setup, or --modify-setup.")
+        raise RuntimeError("Use only one of --setup, --semi-auto-setup, --reuse-setup, or --modify-setup.")
 
-    if (args.setup or args.modify_setup) and Path(args.out) == DEFAULT_OUT_DIR:
+    if (args.setup or args.semi_auto_setup or args.modify_setup) and Path(args.out) == DEFAULT_OUT_DIR:
         args.out = str(DEFAULT_LOCAL_SETUP_DIR)
 
     left_video = resolve_video_path(args.left_input)
@@ -3996,6 +4320,7 @@ def main():
     preview = args.preview
     preview_max_width = args.preview_max_width
     corrections_payload = _empty_corrections_payload()
+    semi_auto_debug_payload = None
     if args.reuse_setup:
         corrections_payload = load_corrections(DEFAULT_CORRECTIONS_PATH)
         total_saved_corrections = sum(
@@ -4069,12 +4394,13 @@ def main():
             print(
                 f"[INFO] Modify setup: loaded {len(left_points)} LEFT and {len(right_points)} RIGHT existing markers."
             )
-            print("[INFO] Add/edit points in both windows. Press q when done.")
+            print("[INFO] Modify setup: LMB select/place moves points; press n before LMB to add a new point. Press q when done.")
             left_points, right_points = click_points_dual(
                 left_first,
                 right_first,
                 initial_left_points=left_points,
                 initial_right_points=right_points,
+                move_existing_points=True,
             )
             if len(left_points) != len(right_points):
                 raise RuntimeError(f"Point count mismatch: LEFT={len(left_points)}, RIGHT={len(right_points)}")
@@ -4117,8 +4443,46 @@ def main():
         left_first = load_first_frame_from_video(left_video, crop=crop_left)
         right_first = load_first_frame_from_video(right_video, crop=crop_right)
 
-        print("[INFO] Click points in both windows. Press q when done.")
-        left_points, right_points = click_points_dual(left_first, right_first)
+        if args.semi_auto_setup:
+            cols = _prompt_int("Semi-auto grid columns", minimum=2)
+            rows = _prompt_int("Semi-auto grid rows", minimum=2)
+            expected_points = cols * rows
+            print(
+                "[INFO] Semi-auto setup: click exactly 4 anchors in each window, in this order: "
+                "top-left, top-right, bottom-left, bottom-right. Press q when done."
+            )
+            left_corners, right_corners = click_points_dual(left_first, right_first)
+            if len(left_corners) != 4 or len(right_corners) != 4:
+                raise RuntimeError(
+                    f"Semi-auto setup needs exactly 4 anchors per side; got LEFT={len(left_corners)}, RIGHT={len(right_corners)}."
+                )
+            left_corner_xy = [_coerce_point_pair(p, prefer_local=False) for p in left_corners]
+            right_corner_xy = [_coerce_point_pair(p, prefer_local=False) for p in right_corners]
+
+            left_points, left_meta = _generate_grid_prompts_from_detection("left", left_first, left_corner_xy, cols, rows)
+            right_points, right_meta = _generate_grid_prompts_from_detection("right", right_first, right_corner_xy, cols, rows)
+
+            print(
+                f"[INFO] Review generated {expected_points} prompts per side. "
+                "Drag points onto marker centers where needed, then press q to accept."
+            )
+            left_points, right_points = click_points_dual(
+                left_first,
+                right_first,
+                initial_left_points=left_points,
+                initial_right_points=right_points,
+                fixed_count_review=True,
+                initial_left_meta=left_meta.get("points", []),
+                initial_right_meta=right_meta.get("points", []),
+            )
+            if len(left_points) != expected_points or len(right_points) != expected_points:
+                raise RuntimeError(
+                    f"Semi-auto setup count changed unexpectedly: LEFT={len(left_points)}, RIGHT={len(right_points)}, expected={expected_points}."
+                )
+            semi_auto_debug_payload = (left_first, right_first, left_meta, right_meta)
+        else:
+            print("[INFO] Click points in both windows. Press q when done.")
+            left_points, right_points = click_points_dual(left_first, right_first)
 
         if len(left_points) != len(right_points):
             raise RuntimeError(f"Point count mismatch: LEFT={len(left_points)}, RIGHT={len(right_points)}")
@@ -4175,15 +4539,24 @@ def main():
         crop_left=crop_left,
         crop_right=crop_right,
     )
+    if semi_auto_debug_payload is not None:
+        left_first, right_first, left_meta, right_meta = semi_auto_debug_payload
+        _save_semi_auto_debug(out_root, left_first, right_first, left_points, right_points, left_meta, right_meta)
+        print(f"[OK] Saved semi-auto setup debug previews: {out_root / 'prompts' / 'semi_auto_debug'}")
 
-    if args.setup or args.modify_setup:
+    if args.setup or args.semi_auto_setup or args.modify_setup:
         if DEFAULT_CORRECTIONS_PATH.exists():
-            if args.setup:
+            if args.setup or args.semi_auto_setup:
                 DEFAULT_CORRECTIONS_PATH.unlink()
                 print(f"[OK] Cleared old corrections for fresh setup: {DEFAULT_CORRECTIONS_PATH}")
             else:
                 print(f"[INFO] Kept existing corrections for modified setup: {DEFAULT_CORRECTIONS_PATH}")
-        done_flag = "--modify-setup" if args.modify_setup else "--setup"
+        if args.modify_setup:
+            done_flag = "--modify-setup"
+        elif args.semi_auto_setup:
+            done_flag = "--semi-auto-setup"
+        else:
+            done_flag = "--setup"
         print(f"[OK] {done_flag} complete. Setup package is ready.")
         return
 
