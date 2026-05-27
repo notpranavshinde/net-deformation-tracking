@@ -230,12 +230,30 @@ Useful triangulation flags:
 --max-reproj 20.0       maximum mean reprojection error in pixels
 --visualize             write verification videos
 --viz-only              visualize existing --out-csv without triangulating again
---viz-mode scene        scene writes *_left.mp4, *_iso.mp4, and *_topdown.mp4
+--viz-mode scene        scene writes *_left.mp4, *_iso.mp4, *_topdown.mp4, and *_viewer.html
 --workers 0             scene visualization workers; 0=auto CPU count
 --viz-encoder auto      auto chooses NVENC when ffmpeg is present, else mp4v
 --viz-grid-cols 0       marker grid columns for net connections; 0=auto
 --viz-grid-rows 0       marker grid rows for net connections; 0=auto
 ```
+
+The `*_viewer.html` output is an interactive Three.js view of the same local
+net frame used by the iso video. Open it in a browser to orbit, pan, zoom, scrub
+frames, and inspect the deformation-colored net without rerendering videos.
+
+To compare multiple triangulation runs in one interactive 3D viewer:
+
+```powershell
+python .\triangulation\view_3d_runs.py `
+  .\triangulation\run_a\triangulated_3d.csv `
+  .\triangulation\run_b\triangulated_3d.csv `
+  --labels run-a,run-b `
+  --out .\triangulation\out\multi_run_3d_viewer.html
+```
+
+Each run is converted into the same kind of local net frame as the iso
+visualization, then overlaid with per-run visibility toggles and a shared frame
+slider.
 
 ## Video Splitting
 
