@@ -542,61 +542,396 @@ def _apply_homography(points, homography):
     return out
 
 
+def _grid_step_from_corners(corners, cols: int, rows: int) -> float:
+    distances = []
+    for row in range(rows):
+        prev = None
+        for col in range(cols):
+            pt = np.asarray(_bilinear_grid_point(corners, col, row, cols, rows), dtype=np.float64)
+            if prev is not None:
+                distances.append(float(np.linalg.norm(pt - prev)))
+            prev = pt
+    for col in range(cols):
+        prev = None
+        for row in range(rows):
+            pt = np.asarray(_bilinear_grid_point(corners, col, row, cols, rows), dtype=np.float64)
+            if prev is not None:
+                distances.append(float(np.linalg.norm(pt - prev)))
+            prev = pt
+    if not distances:
+        return 40.0
+    return max(float(np.median(distances)), 1.0)
+
+
+def _candidate_grid_records(candidates, to_grid, cols: int, rows: int):
+    if not candidates:
+        return []
+    image_xy = np.asarray([[float(c.x), float(c.y)] for c in candidates], dtype=np.float32)
+    grid_xy = _apply_homography(image_xy, to_grid)
+    records = []
+    for idx, (cand, (gx, gy)) in enumerate(zip(candidates, grid_xy)):
+        if -0.70 <= gx <= cols - 0.30 and -0.70 <= gy <= rows - 0.30:
+            records.append({
+                "idx": int(idx),
+                "candidate": cand,
+                "x": float(cand.x),
+                "y": float(cand.y),
+                "grid_x": float(gx),
+                "grid_y": float(gy),
+                "score": float(getattr(cand, "score", 0.0)),
+                "area": float(getattr(cand, "area", 0.0)),
+            })
+    return records
+
+
+def _assign_candidates_by_grid(records, cols: int, rows: int, max_grid_dist: float):
+    pairs = []
+    for rec in records:
+        col = int(round(rec["grid_x"]))
+        row = int(round(rec["grid_y"]))
+        if row < 0 or row >= rows or col < 0 or col >= cols:
+            continue
+        dist = math.hypot(rec["grid_x"] - float(col), rec["grid_y"] - float(row))
+        if dist <= max_grid_dist:
+            pairs.append((dist, -rec["score"], row, col, rec))
+
+    assigned = {}
+    used = set()
+    for _dist, _neg_score, row, col, rec in sorted(pairs):
+        cell = (row, col)
+        if cell in assigned or rec["idx"] in used:
+            continue
+        assigned[cell] = rec
+        used.add(rec["idx"])
+    return assigned
+
+
+def _fit_poly_predictor(samples, max_degree: int = 2):
+    """Fit independent x/y polynomials. samples are (t, x, y)."""
+    if len(samples) < 2:
+        return None
+    degree = min(max_degree, len(samples) - 1)
+    ts = np.asarray([s[0] for s in samples], dtype=np.float64)
+    xs = np.asarray([s[1] for s in samples], dtype=np.float64)
+    ys = np.asarray([s[2] for s in samples], dtype=np.float64)
+    try:
+        px = np.polyfit(ts, xs, degree)
+        py = np.polyfit(ts, ys, degree)
+    except Exception:
+        return None
+
+    def predict(t):
+        return np.array([float(np.polyval(px, t)), float(np.polyval(py, t))], dtype=np.float64)
+
+    return predict
+
+
+def _smooth_lattice_predictions(corners, assigned, cols: int, rows: int):
+    row_models = {}
+    col_models = {}
+
+    for row in range(rows):
+        samples = [
+            (float(col), float(rec["x"]), float(rec["y"]))
+            for (r, col), rec in assigned.items()
+            if r == row
+        ]
+        model = _fit_poly_predictor(samples)
+        if model is not None:
+            row_models[row] = model
+
+    for col in range(cols):
+        samples = [
+            (float(row), float(rec["x"]), float(rec["y"]))
+            for (row, c), rec in assigned.items()
+            if c == col
+        ]
+        model = _fit_poly_predictor(samples)
+        if model is not None:
+            col_models[col] = model
+
+    predictions = {}
+    for row in range(rows):
+        for col in range(cols):
+            pts = []
+            sources = []
+            if row in row_models:
+                pts.append(row_models[row](float(col)))
+                sources.append("row")
+            if col in col_models:
+                pts.append(col_models[col](float(row)))
+                sources.append("col")
+            if pts:
+                pred = np.mean(np.vstack(pts), axis=0)
+                source = "+".join(sources)
+            else:
+                pred = np.asarray(_bilinear_grid_point(corners, col, row, cols, rows), dtype=np.float64)
+                source = "corner_grid"
+            predictions[(row, col)] = {"xy": pred, "source": source}
+    return predictions
+
+
+def _assign_candidates_by_lattice(records, predictions, cols: int, rows: int, max_px_dist: float):
+    pairs = []
+    for cell, pred in predictions.items():
+        row, col = cell
+        px, py = pred["xy"]
+        for rec in records:
+            grid_dist = math.hypot(rec["grid_x"] - float(col), rec["grid_y"] - float(row))
+            if grid_dist > 0.78:
+                continue
+            dist = math.hypot(rec["x"] - px, rec["y"] - py)
+            if dist <= max_px_dist:
+                pairs.append((dist, grid_dist, -rec["score"], row, col, rec))
+
+    assigned = {}
+    used = set()
+    for _dist, _grid_dist, _neg_score, row, col, rec in sorted(pairs):
+        cell = (row, col)
+        if cell in assigned or rec["idx"] in used:
+            continue
+        assigned[cell] = rec
+        used.add(rec["idx"])
+    return assigned
+
+
+def _prefer_larger_same_cell_candidates(assigned, records, predictions, cols: int, rows: int, max_px_dist: float):
+    """Replace tiny same-cell detections with much larger nearby detections."""
+    if not assigned:
+        return assigned, 0
+    updated = dict(assigned)
+    used = {int(rec["idx"]) for rec in updated.values()}
+    replacements = 0
+    for row in range(rows):
+        for col in range(cols):
+            cell = (row, col)
+            current = updated.get(cell)
+            pred = predictions.get(cell)
+            if current is None or pred is None:
+                continue
+            px, py = pred["xy"]
+            current_area = max(float(current.get("area", 0.0)), 1.0)
+            current_dist = math.hypot(current["x"] - float(px), current["y"] - float(py))
+            current_quality = current_area / max(1.0 + current_dist, 1.0)
+            best = None
+            best_quality = current_quality
+            for rec in records:
+                if int(rec["idx"]) in used:
+                    continue
+                grid_dist = math.hypot(rec["grid_x"] - float(col), rec["grid_y"] - float(row))
+                if grid_dist > 0.92:
+                    continue
+                dist = math.hypot(rec["x"] - float(px), rec["y"] - float(py))
+                if dist > max_px_dist * 1.12:
+                    continue
+                area = max(float(rec.get("area", 0.0)), 1.0)
+                if area < max(current_area * 2.2, current_area + 18.0):
+                    continue
+                if float(rec.get("score", 0.0)) < float(current.get("score", 0.0)) * 0.45:
+                    continue
+                if dist > current_dist + max_px_dist * 0.42:
+                    continue
+                quality = area / max(1.0 + dist, 1.0)
+                if quality > best_quality * 1.25:
+                    best = rec
+                    best_quality = quality
+            if best is not None:
+                used.discard(int(current["idx"]))
+                used.add(int(best["idx"]))
+                updated[cell] = best
+                replacements += 1
+    return updated, replacements
+
+
+def _dominant_orange_component_near_lattice(frame_bgr: np.ndarray,
+                                            pred_xy,
+                                            current_xy,
+                                            current_area: float,
+                                            search_radius: int):
+    """Find the dominant orange paint body near a lattice prediction."""
+    h_img, w_img = frame_bgr.shape[:2]
+    px, py = float(pred_xy[0]), float(pred_xy[1])
+    cx, cy = float(current_xy[0]), float(current_xy[1])
+    radius = int(max(18, search_radius))
+    x0 = max(0, int(round(px)) - radius)
+    y0 = max(0, int(round(py)) - radius)
+    x1 = min(w_img, int(round(px)) + radius + 1)
+    y1 = min(h_img, int(round(py)) + radius + 1)
+    if x1 <= x0 + 3 or y1 <= y0 + 3:
+        return None
+
+    crop = frame_bgr[y0:y1, x0:x1]
+    hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+    h, s, v = cv2.split(hsv)
+    lab = cv2.cvtColor(crop, cv2.COLOR_BGR2LAB)
+    _l, a, b = cv2.split(lab)
+
+    yy, xx = np.indices(crop.shape[:2], dtype=np.float32)
+    local_px = px - float(x0)
+    local_py = py - float(y0)
+    pred_dist = np.sqrt((xx - local_px) ** 2 + (yy - local_py) ** 2)
+    near = pred_dist <= float(radius) * 0.95
+
+    orange_hue = (h >= 4) & (h <= 42)
+    red_orange_wrap = h >= 172
+    # The painted nodes are orange/yellow and strongly saturated; this avoids
+    # the gray net and the greenish fringe that caused the previous snap issue.
+    orange_mask = ((orange_hue | red_orange_wrap) & (s >= 65) & (v >= 45) & (b >= 135) & (a >= 118) & near)
+    mask = orange_mask.astype(np.uint8) * 255
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    mask = cv2.medianBlur(mask, 3)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=1)
+
+    n_labels, labels, stats, centroids = cv2.connectedComponentsWithStats((mask > 0).astype(np.uint8), connectivity=8)
+    best = None
+    current_area = max(float(current_area or 0.0), 1.0)
+    min_area = max(10.0, min(current_area * 0.55, 120.0))
+    for label in range(1, n_labels):
+        area = float(stats[label, cv2.CC_STAT_AREA])
+        if area < min_area:
+            continue
+        lx, ly, lw, lh = [float(vv) for vv in stats[label, :4]]
+        aspect = max(lw / max(lh, 1.0), lh / max(lw, 1.0))
+        extent = area / max(lw * lh, 1.0)
+        if aspect > 4.8 or extent < 0.13:
+            continue
+        comp_cx, comp_cy = centroids[label]
+        gx = float(x0) + float(comp_cx)
+        gy = float(y0) + float(comp_cy)
+        dist_to_pred = math.hypot(gx - px, gy - py)
+        dist_to_current = math.hypot(gx - cx, gy - cy)
+        if dist_to_pred > radius * 0.92 or dist_to_current > radius * 1.15:
+            continue
+        score = area / max(1.0 + dist_to_pred * 0.35 + dist_to_current * 0.12, 1.0)
+        if best is None or score > best["score"]:
+            best = {
+                "x": gx,
+                "y": gy,
+                "area": area,
+                "score": float(score),
+                "dist_to_pred": float(dist_to_pred),
+                "dist_to_current": float(dist_to_current),
+            }
+
+    if best is None:
+        return None
+    comparable_area = best["area"] >= max(40.0, current_area * 0.65)
+    clearly_bigger = best["area"] >= max(current_area * 1.20, current_area + 25.0)
+    meaningful_recentering = best["dist_to_current"] >= 6.0 and best["dist_to_pred"] <= radius * 0.86
+    if not comparable_area or not (clearly_bigger or meaningful_recentering):
+        return None
+    return best
+
+
+def _anchor_cells_from_corners(corners, cols: int, rows: int):
+    if cols < 2 or rows < 2:
+        return {}
+    return {
+        (0, 0): np.asarray(corners[0], dtype=np.float64),
+        (0, cols - 1): np.asarray(corners[1], dtype=np.float64),
+        (rows - 1, 0): np.asarray(corners[2], dtype=np.float64),
+        (rows - 1, cols - 1): np.asarray(corners[3], dtype=np.float64),
+    }
+
+
 def _generate_grid_prompts_from_detection(side: str, frame_bgr: np.ndarray, corners, cols: int, rows: int):
     expected = int(cols * rows)
     to_grid, _to_image = _grid_homographies(corners, cols, rows)
     candidates, detector_meta = _detect_marker_candidates(side, frame_bgr, expected)
+    records = _candidate_grid_records(candidates, to_grid, cols, rows)
+    grid_step = _grid_step_from_corners(corners, cols, rows)
+    anchor_cells = _anchor_cells_from_corners(corners, cols, rows)
 
-    grid_candidates = []
-    if candidates:
-        image_xy = np.asarray([[float(c.x), float(c.y)] for c in candidates], dtype=np.float32)
-        grid_xy = _apply_homography(image_xy, to_grid)
-        for cand, (gx, gy) in zip(candidates, grid_xy):
-            if -0.55 <= gx <= cols - 0.45 and -0.55 <= gy <= rows - 0.45:
-                grid_candidates.append(
-                    {
-                        "candidate": cand,
-                        "grid_x": float(gx),
-                        "grid_y": float(gy),
-                        "score": float(getattr(cand, "score", 0.0)),
-                        "used": False,
-                    }
-                )
+    assigned = _assign_candidates_by_grid(records, cols, rows, max_grid_dist=0.40)
+    predictions = _smooth_lattice_predictions(corners, assigned, cols, rows)
+    max_px_dist = max(10.0, min(55.0, grid_step * 0.42))
+    for _iteration in range(2):
+        refined = _assign_candidates_by_lattice(records, predictions, cols, rows, max_px_dist=max_px_dist)
+        if len(refined) < max(4, len(assigned) // 2):
+            break
+        assigned = refined
+        predictions = _smooth_lattice_predictions(corners, assigned, cols, rows)
+    assigned, large_blob_replacements = _prefer_larger_same_cell_candidates(
+        assigned,
+        records,
+        predictions,
+        cols,
+        rows,
+        max_px_dist=max_px_dist,
+    )
+    if large_blob_replacements:
+        predictions = _smooth_lattice_predictions(corners, assigned, cols, rows)
 
-    max_grid_dist = 0.48
     prompts = []
     meta_points = []
     detected_count = 0
+    lattice_count = 0
+    anchor_count = 0
+    orange_body_replacements = 0
+    orange_search_radius = int(round(max(28.0, min(95.0, grid_step * 0.36))))
 
     for row in range(rows):
         for col in range(cols):
-            best_idx = None
-            best_key = None
-            for idx, item in enumerate(grid_candidates):
-                if item["used"]:
-                    continue
-                dx = item["grid_x"] - float(col)
-                dy = item["grid_y"] - float(row)
-                dist = math.hypot(dx, dy)
-                if dist > max_grid_dist:
-                    continue
-                key = (dist, -item["score"])
-                if best_key is None or key < best_key:
-                    best_key = key
-                    best_idx = idx
-
-            if best_idx is not None:
-                item = grid_candidates[best_idx]
-                item["used"] = True
-                cand = item["candidate"]
-                x, y = float(cand.x), float(cand.y)
-                source = "detected"
-                confidence = float(cand.score)
-                detected_count += 1
+            cell = (row, col)
+            pred = predictions.get(cell)
+            pred_xy = pred["xy"] if pred is not None else np.asarray(_bilinear_grid_point(corners, col, row, cols, rows), dtype=np.float64)
+            rec = assigned.get(cell)
+            is_anchor = cell in anchor_cells
+            if is_anchor:
+                x, y = float(anchor_cells[cell][0]), float(anchor_cells[cell][1])
+                source = "anchor"
+                confidence = 1.0
+                anchor_count += 1
+            elif rec is not None:
+                candidate_dist = math.hypot(rec["x"] - float(pred_xy[0]), rec["y"] - float(pred_xy[1]))
+                if candidate_dist <= max_px_dist * 0.72:
+                    x, y = float(rec["x"]), float(rec["y"])
+                    source = "detected_lattice"
+                    confidence = float(rec["score"])
+                    detected_count += 1
+                else:
+                    x, y = float(pred_xy[0]), float(pred_xy[1])
+                    source = "lattice"
+                    confidence = max(float(rec["score"]) * 0.5, 0.0)
+                    lattice_count += 1
+            elif pred is not None:
+                x, y = float(pred_xy[0]), float(pred_xy[1])
+                if pred["source"] == "corner_grid":
+                    source = "inferred"
+                else:
+                    source = "lattice"
+                    lattice_count += 1
+                confidence = 0.0
             else:
                 x, y = _bilinear_grid_point(corners, col, row, cols, rows)
                 source = "inferred"
                 confidence = 0.0
+
+            if rec is not None:
+                candidate_dx = float(rec["grid_x"] - float(col))
+                candidate_dy = float(rec["grid_y"] - float(row))
+                candidate_grid_dist = math.hypot(candidate_dx, candidate_dy)
+                candidate_px_dist = math.hypot(rec["x"] - float(pred_xy[0]), rec["y"] - float(pred_xy[1]))
+            else:
+                candidate_grid_dist = None
+                candidate_px_dist = None
+
+            if source == "detected_lattice":
+                source = "detected"
+
+            orange_refine = None
+            if not is_anchor:
+                orange_refine = _dominant_orange_component_near_lattice(
+                    frame_bgr,
+                    pred_xy,
+                    (x, y),
+                    float(rec.get("area", 1.0)) if rec is not None else 1.0,
+                    orange_search_radius,
+                )
+                if orange_refine is not None:
+                    x, y = orange_refine["x"], orange_refine["y"]
+                    orange_body_replacements += 1
 
             x = max(0.0, min(float(frame_bgr.shape[1] - 1), x))
             y = max(0.0, min(float(frame_bgr.shape[0] - 1), y))
@@ -610,20 +945,38 @@ def _generate_grid_prompts_from_detection(side: str, frame_bgr: np.ndarray, corn
                     "confidence": confidence,
                     "x": x,
                     "y": y,
+                    "lattice_source": pred["source"] if pred is not None else "corner_grid",
+                    "candidate_grid_dist": candidate_grid_dist,
+                    "candidate_lattice_dist_px": candidate_px_dist,
+                    "candidate_area": float(rec.get("area", 0.0)) if rec is not None else None,
+                    "orange_body_refined": orange_refine is not None,
+                    "orange_body_area": float(orange_refine["area"]) if orange_refine is not None else None,
+                    "anchor_locked": bool(is_anchor),
                 }
             )
 
     print(
-        f"[INFO][{side.upper()}] semi-auto assigned {detected_count}/{expected} from detected centroids; "
-        f"{expected - detected_count} inferred."
+        f"[INFO][{side.upper()}] semi-auto lattice assigned {detected_count}/{expected} from detected centroids; "
+        f"{lattice_count} lattice fallback; {anchor_count} locked anchors; "
+        f"{expected - detected_count - lattice_count - anchor_count} corner fallback; "
+        f"large-blob swaps={large_blob_replacements}; orange-body refinements={orange_body_replacements}."
     )
     meta = {
         "side": side,
         "cols": int(cols),
         "rows": int(rows),
         "detector": detector_meta,
+        "assignment": {
+            "candidate_records": int(len(records)),
+            "lattice_px_threshold": float(max_px_dist),
+            "large_blob_replacements": int(large_blob_replacements),
+            "orange_body_replacements": int(orange_body_replacements),
+            "orange_search_radius_px": int(orange_search_radius),
+        },
         "assigned_detected": int(detected_count),
-        "assigned_inferred": int(expected - detected_count),
+        "assigned_lattice": int(lattice_count),
+        "assigned_anchors": int(anchor_count),
+        "assigned_inferred": int(expected - detected_count - lattice_count - anchor_count),
         "points": meta_points,
     }
     return prompts, meta
@@ -1004,7 +1357,12 @@ def click_points_dual(
                 dy = int(round((y - y0) * (view["disp_h"] / max(y1 - y0, 1))))
                 if move_mode:
                     source = source_by_idx.get(idx, "detected")
-                    color = (0, 220, 0) if fixed_count_review and source == "detected" else (0, 180, 255)
+                    if fixed_count_review and source == "detected":
+                        color = (0, 220, 0)
+                    elif fixed_count_review and source == "anchor":
+                        color = (255, 0, 255)
+                    else:
+                        color = (0, 180, 255)
                     if idx == view.get("selected_idx"):
                         color = (255, 0, 255)
                 else:
@@ -1049,7 +1407,7 @@ def click_points_dual(
         cv2.putText(disp, f"zoom={view['zoom']:.1f}x", (10, 86),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 255), 2)
         if fixed_count_review:
-            cv2.putText(disp, "LMB select point, LMB again places it  RMB negative  green=detected orange=inferred", (10, 114),
+            cv2.putText(disp, "LMB select point, LMB again places it  RMB negative  green=detected orange=inferred magenta=anchor", (10, 114),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.52, (255, 255, 255), 2)
             cv2.putText(disp, "MMB drag/WASD pan  c clear selection  z undo neg  q accept  Esc cancel  1/2 focus", (10, 140),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
@@ -4464,7 +4822,7 @@ def main():
 
             print(
                 f"[INFO] Review generated {expected_points} prompts per side. "
-                "Drag points onto marker centers where needed, then press q to accept."
+                "Use two-click move for corrections, then press q to accept."
             )
             left_points, right_points = click_points_dual(
                 left_first,

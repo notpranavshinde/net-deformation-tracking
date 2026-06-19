@@ -722,10 +722,52 @@ def _has_ffmpeg():
     return shutil.which("ffmpeg") is not None
 
 
+_NVENC_AVAILABLE = None
+
+
+def _has_nvenc():
+    """Return True only if ffmpeg can actually initialize h264_nvenc."""
+    global _NVENC_AVAILABLE
+    if _NVENC_AVAILABLE is not None:
+        return _NVENC_AVAILABLE
+    if not _has_ffmpeg():
+        _NVENC_AVAILABLE = False
+        return _NVENC_AVAILABLE
+
+    cmd = [
+        "ffmpeg", "-hide_banner", "-loglevel", "error",
+        "-f", "lavfi", "-i", "color=size=16x16:rate=1",
+        "-frames:v", "1",
+        "-c:v", "h264_nvenc",
+        "-f", "null", "-",
+    ]
+    try:
+        result = subprocess.run(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        print(f"[VIS] NVENC probe failed ({exc}); falling back to mp4v.")
+        _NVENC_AVAILABLE = False
+        return _NVENC_AVAILABLE
+
+    _NVENC_AVAILABLE = result.returncode == 0
+    if not _NVENC_AVAILABLE:
+        err = " ".join((result.stderr or "").strip().split())
+        if err:
+            print(f"[VIS] NVENC unavailable; falling back to mp4v. ffmpeg said: {err}")
+        else:
+            print("[VIS] NVENC unavailable; falling back to mp4v.")
+    return _NVENC_AVAILABLE
+
+
 def _open_writer(path, fps, w, h, encoder):
     """Returns either a cv2.VideoWriter or a dict wrapping an ffmpeg pipe."""
     path = str(path)
-    if encoder == "nvenc" and _has_ffmpeg():
+    if encoder == "nvenc" and _has_nvenc():
         cmd = [
             "ffmpeg", "-y", "-loglevel", "error",
             "-f", "rawvideo", "-pix_fmt", "bgr24",
@@ -737,11 +779,15 @@ def _open_writer(path, fps, w, h, encoder):
         proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
         return {"proc": proc, "kind": "ffmpeg"}
     vw = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
+    if not vw.isOpened():
+        raise RuntimeError(f"[VIS] Could not open video writer: {path}")
     return {"writer": vw, "kind": "cv2"}
 
 
 def _writer_write(w, img):
     if w["kind"] == "ffmpeg":
+        if w["proc"].poll() is not None:
+            raise RuntimeError("[VIS] ffmpeg encoder exited before all frames were written.")
         w["proc"].stdin.write(img.tobytes())
     else:
         w["writer"].write(img)
@@ -750,7 +796,9 @@ def _writer_write(w, img):
 def _writer_close(w):
     if w["kind"] == "ffmpeg":
         w["proc"].stdin.close()
-        w["proc"].wait()
+        ret = w["proc"].wait()
+        if ret != 0:
+            raise RuntimeError(f"[VIS] ffmpeg encoder exited with status {ret}.")
     else:
         w["writer"].release()
 
@@ -1492,11 +1540,11 @@ def create_3d_scene_visualization(out_rows: list,
     viewer_path = Path(f"{stem}_viewer.html")
 
     if encoder == "auto":
-        enc = "nvenc" if _has_ffmpeg() else "mp4v"
+        enc = "nvenc" if _has_nvenc() else "mp4v"
     else:
         enc = encoder
-    if enc == "nvenc" and not _has_ffmpeg():
-        print("[VIS] nvenc requested but ffmpeg not found; falling back to mp4v.")
+    if enc == "nvenc" and not _has_nvenc():
+        print("[VIS] nvenc requested but not usable on this machine; falling back to mp4v.")
         enc = "mp4v"
     print(f"[VIS] encoder={enc}")
 
@@ -1672,7 +1720,7 @@ def main():
     ap.add_argument("--workers", type=int, default=0,
                     help="Parallel workers for iso/topdown rendering. 0=auto (cpu_count).")
     ap.add_argument("--viz-encoder", choices=["auto", "nvenc", "mp4v"], default="auto",
-                    help="Video encoder. auto=nvenc if ffmpeg present, else mp4v.")
+                    help="Video encoder. auto=nvenc only if ffmpeg can initialize it, else mp4v.")
     ap.add_argument("--viz-grid-cols", type=int, default=0,
                     help="Marker grid columns for visualization net edges. 0=auto from object count/aspect.")
     ap.add_argument("--viz-grid-rows", type=int, default=0,
