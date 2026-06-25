@@ -1,5 +1,6 @@
 import os
 import shutil
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import cv2
@@ -196,11 +197,16 @@ def export_dual(left_video, right_video, regions, fps, output_root):
     print(f"\nLEFT output folder:  {left_dir}")
     print(f"RIGHT output folder: {right_dir}")
 
-    print("\nExporting LEFT video...")
-    export_regions(left_video, regions, left_dir, fps)
-
-    print("\nExporting RIGHT video with the same frame ranges...")
-    export_regions(right_video, regions, right_dir, fps)
+    print("\nExporting LEFT and RIGHT videos concurrently...")
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        left_future = executor.submit(
+            export_regions, left_video, regions, left_dir, fps
+        )
+        right_future = executor.submit(
+            export_regions, right_video, regions, right_dir, fps
+        )
+        left_future.result()
+        right_future.result()
 
 
 def main():
