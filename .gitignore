@@ -53,6 +53,8 @@ sam2/sam2/out/
 sam2/sam2/frames/
 sam2/sam2/work/
 triangulation/out/
+triangulation/results/
+imu_analysis/
 work/
 codex resume session id.txt
 

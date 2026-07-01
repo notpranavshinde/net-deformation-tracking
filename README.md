@@ -92,6 +92,13 @@ python stereo_checker_debug.py stereo --max-pairs 50 --workers 16
 python stereo_checker_debug.py rectify --frame-offset 150 --alpha 0.2
 ```
 
+Run sync, exhaustive stats, mono calibration, and stereo calibration
+sequentially with 32 workers:
+
+```bash
+python stereo_checker_debug.py sync --sync-mode audio; python stereo_checker_debug.py stats --step 1 --max-scan 100000 --workers 32 --no-adaptive; python stereo_checker_debug.py mono --max-scan 100 --workers 32; python stereo_checker_debug.py stereo --max-pairs 50 --workers 32
+```
+
 If you want stats to scan every frame instead of adaptively narrowing around
 detections, use the same worker count explicitly:
 
@@ -202,6 +209,57 @@ sam2/sam2/out/left/tracks_2d.csv
 sam2/sam2/out/right/tracks_2d.csv
 ```
 
+## Queued Runs
+
+Use the queue runner when several stereo clips need the same setup, objectwise
+tracking, and triangulation workflow:
+
+```bash
+python run_pipeline_queue.py
+```
+
+It asks for the number of runs, then the LEFT video, RIGHT video, and velocity
+label for each run. Grid columns and rows are entered once. It opens the
+semi-auto setup for every run first so all manual marker adjustments can be
+finished in one pass. After that it processes each prepared run unattended
+with:
+
+```text
+--scale 0.25 --gpu-mode dual --batch-size 36 --preview false
+```
+
+LEFT runs on CUDA 0 and RIGHT runs on CUDA 1. After each objectwise run,
+triangulation writes the CSV, summary, left-overlay video, iso video, top-down
+video, and Three.js viewer to:
+
+```text
+triangulation/results/<velocity>/
+```
+
+Queue state, isolated setup files, SAM2 outputs, and logs are retained under:
+
+```text
+work/pipeline_queue/<queue-id>/
+```
+
+If processing is interrupted, resume from its manifest without repeating
+completed setups or batches:
+
+```bash
+python run_pipeline_queue.py --resume work/pipeline_queue/<queue-id>
+```
+
+Resume checks are data-aware. The queue runner verifies each setup belongs to
+the queued left/right videos, verifies objectwise batch fingerprints, frame
+cache scale, frame counts, and merged track row counts, and fingerprints the
+triangulation inputs before reusing `--viz-only`. If tracks, videos,
+calibration, sync JSON, setup points, corrections, grid size, or queue settings
+change, the affected stage is recomputed instead of reusing stale files.
+
+The setup and objectwise scripts also accept `--corrections-json` for isolated
+correction files. Semi-auto setup accepts `--grid-cols` and `--grid-rows` to
+skip its grid-size prompts.
+
 ## Triangulation
 
 From the repository root:
@@ -262,3 +320,13 @@ Use `dual_video_splitter.py` to split left/right videos at matching frame IDs.
 ```powershell
 python .\dual_video_splitter.py
 ```
+
+On Linux, use the GoPro IMU-aware splitter:
+
+```bash
+python dual_video_splitter_linux.py
+```
+
+The right video is the cutting reference. Its embedded GoPro accelerometer and
+gyroscope activity is displayed along the bottom of the picker; press `n` to
+jump to the next detected acceleration event with 0.5 seconds of pre-roll.

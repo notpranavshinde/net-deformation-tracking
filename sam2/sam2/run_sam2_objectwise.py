@@ -28,9 +28,11 @@ Final merged outputs stay compatible with triangulation:
 """
 
 import argparse
+import concurrent.futures
 import csv
 import hashlib
 import json
+import multiprocessing
 import shutil
 from pathlib import Path
 
@@ -128,6 +130,11 @@ def parse_args():
     parser.add_argument("--right-input", default=str(Path("in") / "right.mp4"))
     parser.add_argument("--out", default=str(sam2run.DEFAULT_OUT_DIR))
     parser.add_argument("--setup-json", default=str(sam2run.DEFAULT_LOCAL_SETUP_DIR / "prompts" / "points_left_right.json"))
+    parser.add_argument(
+        "--corrections-json",
+        default=str(sam2run.DEFAULT_CORRECTIONS_PATH),
+        help="Corrections JSON associated with --setup-json.",
+    )
     parser.add_argument("--side", choices=["left", "right", "both"], default="both")
     parser.add_argument("--ids", default=None, help="Object IDs to run, e.g. 0,4,8-12. Default: all.")
     parser.add_argument("--batch-size", type=int, default=1, help="Objects per SAM2 run. Try 24 on a 4090.")
@@ -219,10 +226,15 @@ def load_setup(args):
         right_points = sam2run.offset_points(right_points, loaded_crop_right)
         print(f"[INFO] RIGHT crop disabled; shifted saved points by x={loaded_crop_right[0]}, y={loaded_crop_right[1]}")
 
-    corrections_path = sam2run.DEFAULT_CORRECTIONS_PATH
+    corrections_path = Path(args.corrections_json)
     corrections = sam2run.load_corrections(corrections_path)
     if left_forced_none or right_forced_none:
-        corrections_path = sam2run.NO_CROP_CORRECTIONS_PATH
+        if Path(args.corrections_json) == sam2run.DEFAULT_CORRECTIONS_PATH:
+            corrections_path = sam2run.NO_CROP_CORRECTIONS_PATH
+        else:
+            corrections_path = corrections_path.with_name(
+                f"{corrections_path.stem}_no_crop{corrections_path.suffix or '.json'}"
+            )
         if corrections_path.exists():
             corrections = sam2run.load_corrections(corrections_path)
         else:
@@ -692,8 +704,35 @@ def main():
     ids = parse_ids(args.ids, max_count)
     sides = ["left", "right"] if args.side == "both" else [args.side]
 
-    if args.gpu_mode == "dual" and args.preview and sides == ["left", "right"]:
-        summaries = run_dual_preview_sides(setup, ids, args, out_root)
+    if args.gpu_mode == "dual" and sides == ["left", "right"]:
+        if not torch.cuda.is_available() or torch.cuda.device_count() < 2:
+            raise RuntimeError("--gpu-mode dual requires at least 2 CUDA GPUs")
+        if args.preview:
+            summaries = run_dual_preview_sides(setup, ids, args, out_root)
+        else:
+            print("[INFO][DUAL] Headless objectwise run: LEFT->cuda:0 RIGHT->cuda:1")
+            mp_ctx = multiprocessing.get_context("spawn")
+            with concurrent.futures.ProcessPoolExecutor(
+                max_workers=2,
+                mp_context=mp_ctx,
+            ) as executor:
+                futures = {
+                    side_name: executor.submit(
+                        run_side,
+                        side_name,
+                        setup[side_name],
+                        ids,
+                        args,
+                        out_root,
+                        setup["corrections"],
+                        setup["corrections_path"],
+                    )
+                    for side_name in sides
+                }
+                summaries = {
+                    side_name: future.result()
+                    for side_name, future in futures.items()
+                }
     else:
         summaries = {}
         for side_name in sides:

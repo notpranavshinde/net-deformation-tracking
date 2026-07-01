@@ -1018,8 +1018,9 @@ def cmd_sync(args):
                 left_audio["env"], right_audio["env"], candL, candR, audio_preview_png
             )
             print(f"[SYNC] Saved audio peaks preview: {audio_preview_png}")
-            print("[SYNC] Close audio peaks window to continue.")
-            show("SYNC AUDIO PEAKS", audio_preview, wait=0)
+            if args.show_preview:
+                print("[SYNC] Close audio peaks window to continue.")
+                show("SYNC AUDIO PEAKS", audio_preview, wait=0)
         except Exception as e:
             print(f"[SYNC] WARNING: audio peak preview failed ({e}). Continuing.")
 
@@ -1061,8 +1062,9 @@ def cmd_sync(args):
     try:
         both = save_sync_preview(args.left, args.right, fL, fR, preview_png, args.scale)
         print(f"[SYNC] Saved sync preview: {preview_png}")
-        print("[SYNC] Close preview window to continue.")
-        show("SYNC PREVIEW (flash frames)", both, wait=0)
+        if args.show_preview:
+            print("[SYNC] Close preview window to continue.")
+            show("SYNC PREVIEW (flash frames)", both, wait=0)
     except Exception as e:
         print(f"[SYNC] WARNING: preview generation failed ({e}). Continuing without preview.")
 
@@ -2088,6 +2090,8 @@ def main():
     sp.add_argument("--audio-sample-rate", type=int, default=16000,
                     help="Audio sample rate used for --sync-mode audio")
     sp.add_argument("--use-cuda", action="store_true", help="Use OpenCV CUDA ops when available; auto-fallback to CPU")
+    sp.add_argument("--show-preview", action="store_true",
+                    help="Open sync preview windows. By default previews are saved without being displayed.")
     sp.set_defaults(func=cmd_sync)
 
     sp = sub.add_parser("stats")
