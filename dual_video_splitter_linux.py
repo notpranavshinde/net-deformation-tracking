@@ -1,6 +1,10 @@
+import argparse
+import json
 import os
 import shutil
+import sys
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
 from pathlib import Path
 
 import cv2
@@ -13,6 +17,28 @@ from video_splitter import (
     format_time,
     overlaps,
 )
+
+
+def _utc_now():
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _file_signature(path):
+    resolved = Path(path).expanduser().resolve()
+    stat = resolved.stat()
+    return {
+        "path": str(resolved),
+        "size_bytes": int(stat.st_size),
+        "mtime_ns": int(stat.st_mtime_ns),
+    }
+
+
+def _atomic_write_json(path, payload):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(json.dumps(payload, indent=2) + "\n")
+    os.replace(temporary, path)
 
 
 def _otsu_threshold(values):
@@ -409,47 +435,264 @@ def export_dual(left_video, right_video, regions, fps, output_root):
         left_future.result()
         right_future.result()
 
+    clips = []
+    for index, (start_frame, end_frame) in enumerate(regions, start=1):
+        clips.append(
+            {
+                "index": index,
+                "start_frame": int(start_frame),
+                "end_frame": int(end_frame),
+                "left_video": str(
+                    Path(left_dir) / f"{Path(left_video).stem}_clip_{index}.mp4"
+                ),
+                "right_video": str(
+                    Path(right_dir) / f"{Path(right_video).stem}_clip_{index}.mp4"
+                ),
+            }
+        )
+    return clips
+
+
+def _split_manifest_payload(
+    left_video,
+    right_video,
+    output_root,
+    regions,
+    fps,
+    select_only=False,
+):
+    left_dir = Path(output_root) / f"{Path(left_video).stem}_clips"
+    right_dir = Path(output_root) / f"{Path(right_video).stem}_clips"
+    clips = []
+    for index, (start_frame, end_frame) in enumerate(regions, start=1):
+        clips.append(
+            {
+                "index": index,
+                "start_frame": int(start_frame),
+                "end_frame": int(end_frame),
+                "left_video": (
+                    str(Path(left_video).resolve())
+                    if select_only
+                    else str(
+                        (left_dir / f"{Path(left_video).stem}_clip_{index}.mp4").resolve()
+                    )
+                ),
+                "right_video": (
+                    str(Path(right_video).resolve())
+                    if select_only
+                    else str(
+                        (right_dir / f"{Path(right_video).stem}_clip_{index}.mp4").resolve()
+                    )
+                ),
+            }
+        )
+    return {
+        "version": 1,
+        "mode": "virtual" if select_only else "physical",
+        "status": "complete" if select_only else "selected",
+        "created_at": _utc_now(),
+        "updated_at": _utc_now(),
+        "left_source": _file_signature(left_video),
+        "right_source": _file_signature(right_video),
+        "reference_side": "right",
+        "output_root": str(Path(output_root).resolve()),
+        "fps": float(fps),
+        "regions": [
+            {"start_frame": int(start), "end_frame": int(end)}
+            for start, end in regions
+        ],
+        "clips": clips,
+    }
+
+
+def _manifest_matches_sources(payload, left_video, right_video, output_root):
+    try:
+        return (
+            payload.get("version") == 1
+            and payload.get("left_source") == _file_signature(left_video)
+            and payload.get("right_source") == _file_signature(right_video)
+            and Path(payload.get("output_root", "")).resolve()
+            == Path(output_root).resolve()
+        )
+    except (OSError, TypeError, ValueError):
+        return False
+
+
+def _manifest_clips_complete(payload):
+    clips = payload.get("clips", [])
+    if payload.get("mode") == "virtual":
+        return bool(clips) and all(
+            int(clip.get("end_frame", 0)) > int(clip.get("start_frame", -1))
+            and Path(clip[side]).is_file()
+            for clip in clips
+            for side in ("left_video", "right_video")
+        )
+    return bool(clips) and all(
+        Path(clip[side]).is_file() and Path(clip[side]).stat().st_size > 0
+        for clip in clips
+        for side in ("left_video", "right_video")
+    )
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Interactively select matching regions from one raw stereo pair."
+    )
+    parser.add_argument("--left", help="Raw LEFT video path")
+    parser.add_argument("--right", help="Raw RIGHT video path")
+    parser.add_argument(
+        "--output-root",
+        help="Output root. Default: dual_clips beside the RIGHT video.",
+    )
+    parser.add_argument(
+        "--manifest",
+        help="Write/resume a machine-readable split manifest at this path.",
+    )
+    parser.add_argument(
+        "--yes",
+        action="store_true",
+        help="Continue immediately after region selection without confirmation.",
+    )
+    parser.add_argument(
+        "--select-only",
+        action="store_true",
+        help="Save source paths and frame ranges without exporting video files.",
+    )
+    args = parser.parse_args()
+    if bool(args.left) != bool(args.right):
+        parser.error("--left and --right must be supplied together")
+    return args
+
 
 def main():
+    args = parse_args()
     if shutil.which("ffmpeg") is None:
         print("Error: ffmpeg not found in PATH.")
         print("Install FFmpeg and make sure 'ffmpeg' works in your terminal.")
-        return
+        return 2
 
-    left_video = _prompt_path("LEFT")
-    right_video = _prompt_path("RIGHT")
+    left_video = args.left or _prompt_path("LEFT")
+    right_video = args.right or _prompt_path("RIGHT")
+    left_video = str(Path(left_video).expanduser().resolve())
+    right_video = str(Path(right_video).expanduser().resolve())
 
     if not os.path.isfile(left_video):
         print(f"Error: LEFT file not found: {left_video}")
-        return
+        return 2
     if not os.path.isfile(right_video):
         print(f"Error: RIGHT file not found: {right_video}")
-        return
+        return 2
 
     reference_video = right_video
-    print("\nPicking clip regions on RIGHT video:")
-    print(reference_video)
-
-    regions, fps = pick_regions(reference_video)
-    if not regions:
-        return
-
-    print(f"\n{len(regions)} clip(s) to export from BOTH videos:")
-    for i, (s, e) in enumerate(regions):
-        dur = (e - s) / fps
-        print(f"  Clip {i + 1}: {format_time(s, fps)}  ->  {format_time(e, fps)}  ({dur:.1f}s)")
-
-    confirm = input("\nProceed with export for both videos? [Y/n]: ").strip().lower()
-    if confirm == "n":
-        print("Cancelled.")
-        return
-
-    output_root = os.path.join(os.path.dirname(os.path.abspath(reference_video)), "dual_clips")
+    output_root = args.output_root or os.path.join(
+        os.path.dirname(os.path.abspath(reference_video)), "dual_clips"
+    )
+    output_root = str(Path(output_root).expanduser().resolve())
     os.makedirs(output_root, exist_ok=True)
-    print(f"Output root: {output_root}")
+    manifest_path = Path(args.manifest).expanduser().resolve() if args.manifest else None
+    payload = None
 
-    export_dual(left_video, right_video, regions, fps, output_root)
+    if manifest_path is not None and manifest_path.is_file():
+        try:
+            payload = json.loads(manifest_path.read_text())
+        except (OSError, json.JSONDecodeError) as exc:
+            print(f"Error: could not read split manifest {manifest_path}: {exc}")
+            return 2
+        if not _manifest_matches_sources(payload, left_video, right_video, output_root):
+            print("Error: existing split manifest does not match the requested source videos.")
+            return 2
+        requested_mode = "virtual" if args.select_only else "physical"
+        if (
+            payload.get("status") == "complete"
+            and payload.get("mode") == requested_mode
+            and _manifest_clips_complete(payload)
+        ):
+            print(f"[SKIP] Split clips already complete: {manifest_path}")
+            return 0
+        regions = [
+            (int(region["start_frame"]), int(region["end_frame"]))
+            for region in payload.get("regions", [])
+        ]
+        fps = float(payload.get("fps", 0.0))
+        if not regions or fps <= 0:
+            print(f"Error: split manifest has no reusable regions: {manifest_path}")
+            return 2
+        if args.select_only:
+            payload = _split_manifest_payload(
+                left_video,
+                right_video,
+                output_root,
+                regions,
+                fps,
+                select_only=True,
+            )
+            payload["completed_at"] = _utc_now()
+            _atomic_write_json(manifest_path, payload)
+            print(
+                f"[RESUME] Converted {len(regions)} selected region(s) to virtual clips: "
+                f"{manifest_path}"
+            )
+        else:
+            print(f"[RESUME] Exporting {len(regions)} selected clip pair(s) from {manifest_path}")
+    else:
+        print("\nPicking clip regions on RIGHT video:")
+        print(reference_video)
+        regions, fps = pick_regions(reference_video)
+        if not regions:
+            return 1
+
+        action = "selected as virtual ranges" if args.select_only else "to export from BOTH videos"
+        print(f"\n{len(regions)} clip(s) {action}:")
+        for i, (s, e) in enumerate(regions):
+            dur = (e - s) / fps
+            print(
+                f"  Clip {i + 1}: {format_time(s, fps)}  ->  "
+                f"{format_time(e, fps)}  ({dur:.1f}s)"
+            )
+
+        if not args.yes:
+            confirm = input("\nProceed with export for both videos? [Y/n]: ").strip().lower()
+            if confirm == "n":
+                print("Cancelled.")
+                return 1
+        payload = _split_manifest_payload(
+            left_video,
+            right_video,
+            output_root,
+            regions,
+            fps,
+            select_only=args.select_only,
+        )
+        if manifest_path is not None:
+            if args.select_only:
+                payload["completed_at"] = _utc_now()
+            _atomic_write_json(manifest_path, payload)
+
+    if args.select_only:
+        if manifest_path is None:
+            print("Error: --select-only requires --manifest.")
+            return 2
+        print(f"[OK] Saved {len(regions)} virtual clip range(s): {manifest_path}")
+        return 0
+
+    print(f"Output root: {output_root}")
+    clips = export_dual(left_video, right_video, regions, fps, output_root)
+    if not all(
+        Path(clip[side]).is_file() and Path(clip[side]).stat().st_size > 0
+        for clip in clips
+        for side in ("left_video", "right_video")
+    ):
+        print("Error: one or more expected split clips were not created.")
+        return 1
+    if payload is not None and manifest_path is not None:
+        payload["status"] = "complete"
+        payload["updated_at"] = _utc_now()
+        payload["completed_at"] = _utc_now()
+        payload["clips"] = clips
+        _atomic_write_json(manifest_path, payload)
+        print(f"[OK] Split manifest: {manifest_path}")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

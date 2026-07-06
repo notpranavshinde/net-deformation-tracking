@@ -362,7 +362,9 @@ def write_setup_package(out_root: Path,
                         left_points,
                         right_points,
                         crop_left,
-                        crop_right):
+                        crop_right,
+                        start_frame: int = 0,
+                        end_frame: int = None):
     """Write portable interactive setup files for later headless SAM2 runs."""
     out_root.mkdir(parents=True, exist_ok=True)
 
@@ -379,6 +381,10 @@ def write_setup_package(out_root: Path,
         "crops": {
             "left": left_crop_meta,
             "right": right_crop_meta,
+        },
+        "frame_range": {
+            "start_frame": int(start_frame),
+            "end_frame": int(end_frame) if end_frame is not None else None,
         },
         "notes": (
             "Portable SAM2 setup package. Run headlessly with "
@@ -406,6 +412,7 @@ def write_setup_package(out_root: Path,
         "points_json": str(shared_prompts_dir / "points_left_right.json"),
         "left_count": len(left_points),
         "right_count": len(right_points),
+        "frame_range": shared_payload["frame_range"],
         "headless_command_example": (
             "python run_sam2_markers.py --left-input ./in/left.mp4 --right-input ./in/right.mp4 "
             f"--points-json {headless_points_rel} --out ./out "
@@ -1528,14 +1535,17 @@ def select_crop_with_review(video_path: str, label: str):
             return crop
 
 
-def load_first_frame_from_video(video_path: str, crop=None):
+def load_first_frame_from_video(video_path: str, crop=None, frame_idx: int = 0):
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         raise RuntimeError(f"Could not open video: {video_path}")
+    frame_idx = max(0, int(frame_idx))
+    if frame_idx:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
     ok, frame = cap.read()
     cap.release()
     if not ok or frame is None or frame.size == 0:
-        raise RuntimeError(f"Could not read first frame from {video_path}")
+        raise RuntimeError(f"Could not read frame {frame_idx} from {video_path}")
 
     if crop is not None:
         x, y, w, h = crop
@@ -1983,19 +1993,19 @@ def _stable_hash(payload) -> str:
 def _count_cached_frames(frames_dir: Path) -> int:
     if not frames_dir.exists():
         return 0
-    return sum(1 for _ in frames_dir.glob("*.jpg"))
+    return sum(1 for _ in frames_dir.glob("*.png"))
 
 
 def _frame_cache_status(frames_dir: Path, expected_count: int):
     cached_count = _count_cached_frames(frames_dir)
     if cached_count <= 0:
-        return False, cached_count, "no JPEG frames found"
+        return False, cached_count, "no PNG frames found"
     if expected_count <= 0:
         return True, cached_count, "OpenCV could not report the video frame count"
     if cached_count != expected_count:
-        return False, cached_count, f"expected {expected_count} JPEG frames, found {cached_count}"
-    first_frame = frames_dir / "000000.jpg"
-    last_frame = frames_dir / f"{expected_count - 1:06d}.jpg"
+        return False, cached_count, f"expected {expected_count} PNG frames, found {cached_count}"
+    first_frame = frames_dir / "000000.png"
+    last_frame = frames_dir / f"{expected_count - 1:06d}.png"
     if not first_frame.exists():
         return False, cached_count, f"missing first frame {first_frame.name}"
     if not last_frame.exists():
@@ -2003,12 +2013,27 @@ def _frame_cache_status(frames_dir: Path, expected_count: int):
     return True, cached_count, ""
 
 
-def _frame_cache_meta(video_path: str, crop, scale: float, frame_extractor: str):
+def _frame_cache_meta(
+    video_path: str,
+    crop,
+    scale: float,
+    frame_extractor: str,
+    start_frame: int = 0,
+    end_frame: int = None,
+):
+    video = _video_signature(video_path)
+    end = int(end_frame) if end_frame is not None else int(video["frame_count"])
     return {
-        "video": _video_signature(video_path),
+        "video": video,
+        "frame_range": {
+            "start_frame": int(start_frame),
+            "end_frame": end,
+            "frame_count": end - int(start_frame),
+        },
         "crop": list(crop) if crop is not None else None,
         "scale": float(scale),
         "frame_extractor": str(frame_extractor),
+        "image_format": "png",
     }
 
 
@@ -2018,10 +2043,19 @@ def prepare_frame_cache(video_path: str,
                         scale: float = 1.0,
                         frame_extractor: str = "auto",
                         meta_name: str = "frames_meta.json",
-                        label: str = ""):
+                        label: str = "",
+                        start_frame: int = 0,
+                        end_frame: int = None):
     frames_dir = Path(frames_dir)
     meta_path = frames_dir.parent / meta_name
-    frame_meta = _frame_cache_meta(video_path, crop, scale, frame_extractor)
+    frame_meta = _frame_cache_meta(
+        video_path,
+        crop,
+        scale,
+        frame_extractor,
+        start_frame=start_frame,
+        end_frame=end_frame,
+    )
     frame_hash = _stable_hash(frame_meta)
     old_hash = None
     if meta_path.exists():
@@ -2030,7 +2064,7 @@ def prepare_frame_cache(video_path: str,
         except Exception:
             old_hash = None
 
-    expected_count = int(frame_meta["video"].get("frame_count", -1))
+    expected_count = int(frame_meta["frame_range"]["frame_count"])
     cache_complete, cached_count, cache_reason = _frame_cache_status(frames_dir, expected_count)
     prefix = f"[{label}] " if label else ""
     if old_hash != frame_hash or not cache_complete:
@@ -2040,7 +2074,15 @@ def prepare_frame_cache(video_path: str,
             print(f"[INFO]{prefix}Frame cache metadata changed; rebuilding {frames_dir}")
         if frames_dir.exists():
             shutil.rmtree(frames_dir)
-        extract_frames(video_path, frames_dir, crop=crop, scale=scale, frame_extractor=frame_extractor)
+        extract_frames(
+            video_path,
+            frames_dir,
+            crop=crop,
+            scale=scale,
+            frame_extractor=frame_extractor,
+            start_frame=start_frame,
+            end_frame=end_frame,
+        )
         cache_complete, cached_count, cache_reason = _frame_cache_status(frames_dir, expected_count)
         if not cache_complete:
             if frames_dir.exists():
@@ -2072,7 +2114,14 @@ def _ffmpeg_filter(crop, scale: float):
     return ",".join(filters)
 
 
-def extract_frames_ffmpeg(video_path: str, frames_dir: Path, crop=None, scale: float = 1.0):
+def extract_frames_ffmpeg(
+    video_path: str,
+    frames_dir: Path,
+    crop=None,
+    scale: float = 1.0,
+    start_frame: int = 0,
+    end_frame: int = None,
+):
     if shutil.which("ffmpeg") is None:
         raise RuntimeError("ffmpeg not found on PATH")
 
@@ -2082,38 +2131,71 @@ def extract_frames_ffmpeg(video_path: str, frames_dir: Path, crop=None, scale: f
         print(f"[INFO] Applying crop ROI x={x}, y={y}, w={w}, h={h}")
 
     frames_dir.mkdir(parents=True, exist_ok=True)
-    output_pattern = str(frames_dir / "%06d.jpg")
+    signature = _video_signature(video_path)
+    source_count = int(signature["frame_count"])
+    fps = float(signature["fps"])
+    start_frame = int(start_frame)
+    end_frame = int(end_frame) if end_frame is not None else source_count
+    if fps <= 0 or start_frame < 0 or end_frame <= start_frame or end_frame > source_count:
+        raise ValueError(f"Invalid frame range [{start_frame}, {end_frame}) for {video_path}")
+    frame_count = end_frame - start_frame
+    start_seconds = start_frame / fps
+    pre_seek = min(5.0, start_seconds)
+    output_pattern = str(frames_dir / "%06d.png")
     cmd = [
         "ffmpeg",
         "-hide_banner",
         "-loglevel",
         "error",
         "-y",
+        "-ss",
+        f"{start_seconds - pre_seek:.9f}",
         "-i",
         str(video_path),
+        "-ss",
+        f"{pre_seek:.9f}",
     ]
     vf = _ffmpeg_filter(crop_roi, scale)
     if vf:
         cmd.extend(["-vf", vf])
-    cmd.extend(["-q:v", "2", "-start_number", "0", output_pattern])
+    cmd.extend([
+        "-frames:v", str(frame_count),
+        "-compression_level", "3",
+        "-start_number", "0",
+        output_pattern,
+    ])
 
-    print("[INFO] Using ffmpeg frame extraction")
+    print(f"[INFO] Using ffmpeg PNG extraction for source frames [{start_frame}, {end_frame})")
     subprocess.run(cmd, check=True)
-    n_frames = len(list(frames_dir.glob("*.jpg")))
+    n_frames = len(list(frames_dir.glob("*.png")))
     if n_frames <= 0:
         raise RuntimeError(f"ffmpeg did not write any frames to {frames_dir}")
     print(f"[OK] Extracted {n_frames} frames to {frames_dir}")
 
 
-def extract_frames_opencv(video_path: str, frames_dir: Path, crop=None, scale: float = 1.0):
+def extract_frames_opencv(
+    video_path: str,
+    frames_dir: Path,
+    crop=None,
+    scale: float = 1.0,
+    start_frame: int = 0,
+    end_frame: int = None,
+):
     frames_dir.mkdir(parents=True, exist_ok=True)
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         raise RuntimeError(f"Could not open video: {video_path}")
 
+    source_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    start_frame = int(start_frame)
+    end_frame = int(end_frame) if end_frame is not None else source_count
+    if start_frame < 0 or end_frame <= start_frame or end_frame > source_count:
+        cap.release()
+        raise ValueError(f"Invalid frame range [{start_frame}, {end_frame}) for {video_path}")
+    cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
     crop_roi = None
     i = 0
-    while True:
+    while i < end_frame - start_frame:
         ok, frame = cap.read()
         if not ok:
             break
@@ -2132,7 +2214,11 @@ def extract_frames_opencv(video_path: str, frames_dir: Path, crop=None, scale: f
             new_h = max(1, int(round(frame.shape[0] * scale)))
             frame = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
 
-        cv2.imwrite(str(frames_dir / f"{i:06d}.jpg"), frame)
+        cv2.imwrite(
+            str(frames_dir / f"{i:06d}.png"),
+            frame,
+            [cv2.IMWRITE_PNG_COMPRESSION, 3],
+        )
         i += 1
     cap.release()
     print(f"[OK] Extracted {i} frames to {frames_dir}")
@@ -2142,7 +2228,9 @@ def extract_frames(video_path: str,
                    frames_dir: Path,
                    crop=None,
                    scale: float = 1.0,
-                   frame_extractor: str = "auto"):
+                   frame_extractor: str = "auto",
+                   start_frame: int = 0,
+                   end_frame: int = None):
     print(f"[INFO] Extracting frames from {video_path} to {frames_dir}")
     if scale <= 0:
         raise ValueError("--scale must be > 0")
@@ -2158,7 +2246,14 @@ def extract_frames(video_path: str,
 
     if method in ("auto", "ffmpeg"):
         try:
-            return extract_frames_ffmpeg(video_path, frames_dir, crop=crop, scale=scale)
+            return extract_frames_ffmpeg(
+                video_path,
+                frames_dir,
+                crop=crop,
+                scale=scale,
+                start_frame=start_frame,
+                end_frame=end_frame,
+            )
         except Exception as e:
             if method == "ffmpeg":
                 raise
@@ -2167,10 +2262,17 @@ def extract_frames(video_path: str,
                 shutil.rmtree(frames_dir)
 
     print("[INFO] Using OpenCV frame extraction")
-    return extract_frames_opencv(video_path, frames_dir, crop=crop, scale=scale)
+    return extract_frames_opencv(
+        video_path,
+        frames_dir,
+        crop=crop,
+        scale=scale,
+        start_frame=start_frame,
+        end_frame=end_frame,
+    )
 
 def load_first_frame(frames_dir: Path):
-    first = frames_dir / "000000.jpg"
+    first = frames_dir / "000000.png"
     if not first.exists():
         raise RuntimeError(f"Missing {first}")
     img = cv2.imread(str(first))
@@ -2751,6 +2853,8 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Run SAM2 marker tracking on LEFT and RIGHT videos.")
     parser.add_argument("--left-input", default=str(Path("in") / "left.mp4"), help="Path to LEFT input video file")
     parser.add_argument("--right-input", default=str(Path("in") / "right.mp4"), help="Path to RIGHT input video file")
+    parser.add_argument("--start-frame", type=int, default=0, help="Inclusive source frame for a virtual clip")
+    parser.add_argument("--end-frame", type=int, default=None, help="Exclusive source frame for a virtual clip")
     parser.add_argument("--out", default=str(DEFAULT_OUT_DIR), help="Output root directory")
     parser.add_argument(
         "--corrections-json",
@@ -5012,6 +5116,19 @@ def main():
 
     left_video = resolve_video_path(args.left_input)
     right_video = resolve_video_path(args.right_input)
+    start_frame = int(args.start_frame)
+    if start_frame < 0:
+        raise RuntimeError("--start-frame must be >= 0")
+    source_counts = []
+    for video_path in (left_video, right_video):
+        cap = cv2.VideoCapture(video_path)
+        source_counts.append(int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) if cap.isOpened() else -1)
+        cap.release()
+    end_frame = int(args.end_frame) if args.end_frame is not None else min(source_counts)
+    if end_frame <= start_frame or any(count > 0 and end_frame > count for count in source_counts):
+        raise RuntimeError(
+            f"Invalid virtual clip range [{start_frame}, {end_frame}) for source counts {source_counts}"
+        )
     out_root = Path(args.out)
     corrections_path = Path(args.corrections_json)
 
@@ -5105,8 +5222,8 @@ def main():
             print(f"[INFO] RIGHT crop disabled; shifted saved crop-local points by x={loaded_crop_right[0]}, y={loaded_crop_right[1]}")
         print(f"[OK] Loaded headless points from {args.points_json}")
         if args.modify_setup:
-            left_first = load_first_frame_from_video(left_video, crop=crop_left)
-            right_first = load_first_frame_from_video(right_video, crop=crop_right)
+            left_first = load_first_frame_from_video(left_video, crop=crop_left, frame_idx=start_frame)
+            right_first = load_first_frame_from_video(right_video, crop=crop_right, frame_idx=start_frame)
             print(
                 f"[INFO] Modify setup: loaded {len(left_points)} LEFT and {len(right_points)} RIGHT existing markers."
             )
@@ -5156,8 +5273,8 @@ def main():
                 crop_right = None
                 print("[INFO] RIGHT crop disabled; using full frame")
 
-        left_first = load_first_frame_from_video(left_video, crop=crop_left)
-        right_first = load_first_frame_from_video(right_video, crop=crop_right)
+        left_first = load_first_frame_from_video(left_video, crop=crop_left, frame_idx=start_frame)
+        right_first = load_first_frame_from_video(right_video, crop=crop_right, frame_idx=start_frame)
 
         if args.semi_auto_setup:
             cols = args.grid_cols
@@ -5287,6 +5404,8 @@ def main():
         right_points=right_points,
         crop_left=crop_left,
         crop_right=crop_right,
+        start_frame=start_frame,
+        end_frame=end_frame,
     )
     if semi_auto_debug_payload is not None:
         left_first, right_first, left_meta, right_meta = semi_auto_debug_payload

@@ -19,6 +19,8 @@ SAM2_DIR = REPO_ROOT / "sam2" / "sam2"
 MARKERS_SCRIPT = SAM2_DIR / "run_sam2_markers.py"
 OBJECTWISE_SCRIPT = SAM2_DIR / "run_sam2_objectwise.py"
 TRIANGULATION_SCRIPT = REPO_ROOT / "triangulation" / "points_to_3d.py"
+SPLITTER_SCRIPT = REPO_ROOT / "dual_video_splitter_linux.py"
+CALIBRATION_SCRIPT = REPO_ROOT / "calibration" / "stereo_checker_debug.py"
 QUEUE_ROOT = REPO_ROOT / "work" / "pipeline_queue"
 RESULTS_ROOT = REPO_ROOT / "triangulation" / "results"
 SAM2_MODEL_ID = "facebook/sam2-hiera-large"
@@ -60,6 +62,38 @@ def velocity_slug(value):
     slug = re.sub(r"[^A-Za-z0-9._+-]+", "_", value.strip())
     slug = slug.strip("._")
     return slug
+
+
+def restore_terminal_input():
+    """Restore normal line input after an OpenCV/Qt interactive child exits."""
+    if os.name == "nt" or not sys.stdin.isatty():
+        return
+    try:
+        import termios
+
+        attrs = termios.tcgetattr(sys.stdin.fileno())
+        attrs[3] |= termios.ICANON | termios.ECHO
+        termios.tcsetattr(sys.stdin.fileno(), termios.TCSANOW, attrs)
+    except (ImportError, OSError):
+        pass
+
+
+def prompt_velocity(index, total, used_velocities):
+    while True:
+        velocity = input(f"  Clip {index}/{total} velocity label: ").strip()
+        slug = velocity_slug(velocity)
+        if not slug:
+            print("Velocity must contain at least one usable character.")
+            continue
+        if slug in used_velocities:
+            print(f"Velocity directory '{slug}' is already used in this queue.")
+            continue
+        result_dir = RESULTS_ROOT / slug
+        if result_dir.exists() and any(result_dir.iterdir()):
+            print(f"Result directory already exists and is not empty: {result_dir}")
+            continue
+        used_velocities.add(slug)
+        return velocity, slug
 
 
 def atomic_write_json(path, payload):
@@ -149,6 +183,18 @@ def objectwise_video_signature(path):
         "width": int(width),
         "height": int(height),
         "fps": float(fps),
+    }
+
+
+def frame_range_signature(start_frame, end_frame):
+    start = int(start_frame)
+    end = int(end_frame)
+    if start < 0 or end <= start:
+        raise ValueError(f"Invalid frame range [{start}, {end})")
+    return {
+        "start_frame": start,
+        "end_frame": end,
+        "frame_count": end - start,
     }
 
 
@@ -252,6 +298,20 @@ def setup_complete(job, manifest=None):
         return False
     if int(setup_meta.get("right_count", -1)) != len(right_points):
         return False
+    expected_range = frame_range_signature(job["start_frame"], job["end_frame"])
+    recorded_range = setup_meta.get("frame_range", {})
+    legacy_full_video = bool(
+        manifest
+        and manifest.get("preprocessing", {}).get("mode") == "legacy_existing_clips"
+        and not recorded_range
+        and expected_range["start_frame"] == 0
+    )
+    if not legacy_full_video:
+        if (
+            int(recorded_range.get("start_frame", -1)) != expected_range["start_frame"]
+            or int(recorded_range.get("end_frame", -1)) != expected_range["end_frame"]
+        ):
+            return False
     return True
 
 
@@ -275,11 +335,13 @@ def load_setup_payload(job):
             "points": payload["left"],
             "crop": side_crop("left"),
             "video": job["left_video"],
+            "frame_range": frame_range_signature(job["start_frame"], job["end_frame"]),
         },
         "right": {
             "points": payload["right"],
             "crop": side_crop("right"),
             "video": job["right_video"],
+            "frame_range": frame_range_signature(job["start_frame"], job["end_frame"]),
         },
     }
 
@@ -326,6 +388,7 @@ def batch_fingerprint(side_name, batch_ids, setup_side, manifest, corrections):
         "side": side_name,
         "object_ids": [int(obj_id) for obj_id in batch_ids],
         "video": objectwise_video_signature(setup_side["video"]),
+        "frame_range": setup_side["frame_range"],
         "crop": list(setup_side["crop"]) if setup_side["crop"] is not None else None,
         "scale": float(manifest["settings"]["scale"]),
         "points": [setup_side["points"][obj_id] for obj_id in batch_ids],
@@ -341,6 +404,7 @@ def sam2_stage_fingerprint(job, manifest):
         "stage": "sam2",
         "left_video": video_signature(job["left_video"]),
         "right_video": video_signature(job["right_video"]),
+        "frame_range": frame_range_signature(job["start_frame"], job["end_frame"]),
         "setup_json": file_signature(job["setup_json"], include_hash=True),
         "corrections_json": file_signature(job["corrections_json"], include_hash=True),
         "settings": {
@@ -381,9 +445,10 @@ def validate_sam2_side(job, manifest, side_name, root_summary, setup, correction
         return False
 
     frames = int(side_summary.get("frames", -1))
-    if frames <= 0:
+    expected_range = frame_range_signature(job["start_frame"], job["end_frame"])
+    if frames != expected_range["frame_count"]:
         return False
-    if int(frame_meta.get("video", {}).get("frame_count", -1)) != frames:
+    if frame_meta.get("frame_range") != expected_range:
         return False
     if not same_path(frame_meta.get("video", {}).get("path"), job[f"{side_name}_video"]):
         return False
@@ -491,6 +556,7 @@ def visualization_outputs(result_dir):
 
 def triangulation_data_fingerprint(job, manifest):
     sam2_out = Path(job["sam2_out"])
+    sync_json, stereo_npz = calibration_paths(manifest)
     return stable_hash({
         "version": 1,
         "stage": "triangulation-data",
@@ -498,12 +564,13 @@ def triangulation_data_fingerprint(job, manifest):
         "right_tracks": file_signature(sam2_out / "right" / "tracks_2d.csv", include_hash=True),
         "left_video": video_signature(job["left_video"]),
         "right_video": video_signature(job["right_video"]),
-        "stereo": file_signature(REPO_ROOT / "calibration" / "work" / "stereo.npz", include_hash=True),
-        "sync_json": file_signature(REPO_ROOT / "calibration" / "work" / "sync.json", include_hash=True),
+        "frame_range": frame_range_signature(job["start_frame"], job["end_frame"]),
+        "stereo": file_signature(stereo_npz, include_hash=True),
+        "sync_json": file_signature(sync_json, include_hash=True),
         "quality_min": 0.0,
         "max_reproj": 20.0,
         "sync_mode": "default",
-        "sync_json_arg": "calibration/work/sync.json",
+        "sync_json_arg": str(sync_json),
     })
 
 
@@ -572,46 +639,229 @@ def write_triangulation_queue_meta(job, manifest):
     atomic_write_json(Path(job["result_dir"]) / QUEUE_TRIANGULATION_META, payload)
 
 
-def create_manifest():
-    run_count = prompt_positive_int("How many runs do you want to queue")
-    jobs = []
-    used_velocities = set()
+def _new_job(
+    queue_dir,
+    index,
+    velocity,
+    slug,
+    left_video,
+    right_video,
+    split_index,
+    start_frame,
+    end_frame,
+):
+    run_dir = queue_dir / f"run_{index:03d}_{slug}"
+    setup_dir = run_dir / "setup"
+    return {
+        "index": int(index),
+        "split_clip_index": int(split_index),
+        "velocity": velocity,
+        "velocity_slug": slug,
+        "left_video": str(Path(left_video).resolve()),
+        "right_video": str(Path(right_video).resolve()),
+        "start_frame": int(start_frame),
+        "end_frame": int(end_frame),
+        "run_dir": str(run_dir),
+        "setup_dir": str(setup_dir),
+        "setup_json": str(setup_dir / "prompts" / "points_left_right.json"),
+        "corrections_json": str(setup_dir / "prompts" / "corrections.json"),
+        "sam2_out": str(run_dir / "sam2"),
+        "logs_dir": str(run_dir / "logs"),
+        "result_dir": str(RESULTS_ROOT / slug),
+        "stages": {
+            "setup": {"status": "pending"},
+            "sam2": {"status": "pending"},
+            "triangulation": {"status": "pending"},
+        },
+    }
 
-    for index in range(1, run_count + 1):
-        print(f"\nRun {index}/{run_count}")
-        left_video = prompt_video_path("  LEFT video path")
-        right_video = prompt_video_path("  RIGHT video path")
-        while True:
-            velocity = input("  Velocity label: ").strip()
-            slug = velocity_slug(velocity)
-            if not slug:
-                print("Velocity must contain at least one usable character.")
-                continue
-            if slug in used_velocities:
-                print(f"Velocity directory '{slug}' is already used in this queue.")
-                continue
-            result_dir = RESULTS_ROOT / slug
-            if result_dir.exists() and any(result_dir.iterdir()):
-                print(f"Result directory already exists and is not empty: {result_dir}")
-                continue
-            used_velocities.add(slug)
-            break
-        jobs.append(
-            {
-                "index": index,
-                "velocity": velocity,
-                "velocity_slug": slug,
-                "left_video": str(left_video),
-                "right_video": str(right_video),
-                "stages": {
-                    "setup": {"status": "pending"},
-                    "sam2": {"status": "pending"},
-                    "triangulation": {"status": "pending"},
-                },
-            }
+
+def migrate_manifest(manifest):
+    changed = False
+    if "preprocessing" not in manifest:
+        manifest["preprocessing"] = {
+            "mode": "legacy_existing_clips",
+            "calibration": {
+                "mode": "existing",
+                "sync_json": str(REPO_ROOT / "calibration" / "work" / "sync.json"),
+                "stereo_npz": str(REPO_ROOT / "calibration" / "work" / "stereo.npz"),
+            },
+        }
+        changed = True
+    if int(manifest.get("version", 1)) < 2:
+        manifest["version"] = 2
+        changed = True
+    for job in manifest.get("jobs", []):
+        if "start_frame" not in job or "end_frame" not in job:
+            counts = [
+                int(video_signature(job[side])["frame_count"])
+                for side in ("left_video", "right_video")
+            ]
+            job["start_frame"] = 0
+            job["end_frame"] = min(count for count in counts if count > 0)
+            changed = True
+    return changed
+
+
+def splitter_complete(manifest):
+    preprocessing = manifest.get("preprocessing", {})
+    if preprocessing.get("mode") == "legacy_existing_clips":
+        return True
+    splitter = preprocessing.get("splitter", {})
+    path = Path(splitter.get("manifest", ""))
+    if not path.is_file():
+        return False
+    try:
+        payload = read_json(path)
+    except Exception:
+        return False
+    if payload.get("status") != "complete":
+        return False
+    if payload.get("mode") != "virtual":
+        return False
+    if not same_path(payload.get("output_root"), splitter.get("output_root")):
+        return False
+    for side in ("left", "right"):
+        source_path = preprocessing.get(f"raw_{side}")
+        recorded = payload.get(f"{side}_source", {})
+        current = file_signature(source_path)
+        if (
+            not same_path(recorded.get("path"), source_path)
+            or int(recorded.get("size_bytes", -1)) != int(current.get("size_bytes", -2))
+            or int(recorded.get("mtime_ns", -1)) != int(current.get("mtime_ns", -2))
+        ):
+            return False
+    clips = payload.get("clips", [])
+    indices = [int(clip.get("index", -1)) for clip in clips]
+    return indices == list(range(1, len(clips) + 1)) and len(clips) >= 2 and all(
+        Path(clip.get(side, "")).is_file() and Path(clip[side]).stat().st_size > 0
+        for clip in clips
+        for side in ("left_video", "right_video")
+    )
+
+
+def prepare_splitter(manifest_path, manifest):
+    preprocessing = manifest["preprocessing"]
+    if preprocessing.get("mode") == "legacy_existing_clips":
+        return True
+    splitter = preprocessing["splitter"]
+    stage = splitter["stage"]
+    if splitter_complete(manifest):
+        stage.update({"status": "complete", "completed_at": stage.get("completed_at", utc_now())})
+        save_manifest(manifest_path, manifest)
+        print("[SKIP][SPLIT] Virtual frame ranges already complete.")
+        return True
+
+    stage.update({"status": "running", "started_at": utc_now(), "error": None})
+    save_manifest(manifest_path, manifest)
+    command = [
+        sys.executable,
+        str(SPLITTER_SCRIPT),
+        "--left", preprocessing["raw_left"],
+        "--right", preprocessing["raw_right"],
+        "--output-root", splitter["output_root"],
+        "--manifest", splitter["manifest"],
+        "--yes",
+        "--select-only",
+    ]
+    return_code = run_logged(
+        command,
+        REPO_ROOT,
+        Path(manifest_path).parent / "split" / "splitter.log",
+    )
+    if return_code == 0 and splitter_complete(manifest):
+        stage.update({"status": "complete", "completed_at": utc_now(), "error": None})
+        save_manifest(manifest_path, manifest)
+        return True
+    stage.update({
+        "status": "failed",
+        "failed_at": utc_now(),
+        "error": f"Splitter incomplete (exit code {return_code})",
+    })
+    save_manifest(manifest_path, manifest)
+    return False
+
+
+def ensure_jobs_from_split(manifest_path, manifest):
+    preprocessing = manifest["preprocessing"]
+    if preprocessing.get("mode") == "legacy_existing_clips":
+        return True
+    split_payload = read_json(preprocessing["splitter"]["manifest"])
+    clips = sorted(split_payload.get("clips", []), key=lambda clip: int(clip["index"]))
+    if [int(clip["index"]) for clip in clips] != list(range(1, len(clips) + 1)):
+        raise RuntimeError("Split manifest clip indices are not contiguous from 1.")
+    if len(clips) < 2:
+        raise RuntimeError(
+            "At least two clip pairs are required: clip 1 for calibration and one experiment clip."
         )
 
-    print("\nMarker grid used by every queued run")
+    calibration_clip = clips[0]
+    calibration = preprocessing["calibration"]
+    calibration["left_video"] = calibration_clip["left_video"]
+    calibration["right_video"] = calibration_clip["right_video"]
+    calibration["split_clip_index"] = int(calibration_clip["index"])
+    calibration["start_frame"] = int(calibration_clip["start_frame"])
+    calibration["end_frame"] = int(calibration_clip["end_frame"])
+
+    experiment_clips = clips[1:]
+    existing_jobs = manifest.get("jobs", [])
+    if len(existing_jobs) > len(experiment_clips):
+        raise RuntimeError("Split clip count is smaller than the labeled queue job count.")
+    if existing_jobs:
+        for job, clip in zip(existing_jobs, experiment_clips):
+            if not same_path(job["left_video"], clip["left_video"]) or not same_path(
+                job["right_video"], clip["right_video"]
+            ):
+                raise RuntimeError("Split clip paths changed after queue jobs were labeled.")
+            if frame_range_signature(job["start_frame"], job["end_frame"]) != frame_range_signature(
+                clip["start_frame"], clip["end_frame"]
+            ):
+                raise RuntimeError("Split frame ranges changed after queue jobs were labeled.")
+        if len(existing_jobs) == len(experiment_clips):
+            save_manifest(manifest_path, manifest)
+            return True
+
+    if not existing_jobs:
+        print("\n[QUEUE] Clip pair 1 is reserved for calibration.")
+        print(f"[CALIBRATION] LEFT:  {calibration['left_video']}")
+        print(f"[CALIBRATION] RIGHT: {calibration['right_video']}")
+        print("\nEnter velocity labels for the remaining experiment clips.")
+    else:
+        print(
+            f"\n[QUEUE] Resuming velocity labels at clip "
+            f"{len(existing_jobs) + 1}/{len(experiment_clips)}."
+        )
+    restore_terminal_input()
+
+    queue_dir = Path(manifest_path).parent
+    used_velocities = {job["velocity_slug"] for job in existing_jobs}
+    total = len(experiment_clips)
+    for index in range(len(existing_jobs) + 1, total + 1):
+        clip = experiment_clips[index - 1]
+        velocity, slug = prompt_velocity(index, total, used_velocities)
+        manifest.setdefault("jobs", []).append(
+            _new_job(
+                queue_dir,
+                index,
+                velocity,
+                slug,
+                clip["left_video"],
+                clip["right_video"],
+                clip["index"],
+                clip["start_frame"],
+                clip["end_frame"],
+            )
+        )
+        save_manifest(manifest_path, manifest)
+    return True
+
+
+def create_manifest():
+    print("Enter the raw stereo videos that contain calibration first, then experiment runs.")
+    left_video = prompt_video_path("Raw LEFT video path")
+    right_video = prompt_video_path("Raw RIGHT video path")
+
+    print("\nMarker grid used by every experiment run")
     grid_cols = prompt_positive_int("Grid columns")
     grid_rows = prompt_positive_int("Grid rows")
     if grid_cols < 2 or grid_rows < 2:
@@ -619,28 +869,51 @@ def create_manifest():
 
     queue_id = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     queue_dir = QUEUE_ROOT / queue_id
-    for job in jobs:
-        run_dir = queue_dir / f"run_{job['index']:03d}_{job['velocity_slug']}"
-        setup_dir = run_dir / "setup"
-        job.update(
-            {
-                "run_dir": str(run_dir),
-                "setup_dir": str(setup_dir),
-                "setup_json": str(setup_dir / "prompts" / "points_left_right.json"),
-                "corrections_json": str(setup_dir / "prompts" / "corrections.json"),
-                "sam2_out": str(run_dir / "sam2"),
-                "logs_dir": str(run_dir / "logs"),
-                "result_dir": str(RESULTS_ROOT / job["velocity_slug"]),
-            }
-        )
-
+    split_dir = queue_dir / "split"
+    calibration_dir = queue_dir / "calibration"
     manifest = {
-        "version": 1,
+        "version": 2,
         "queue_id": queue_id,
         "created_at": utc_now(),
         "updated_at": utc_now(),
         "grid_cols": grid_cols,
         "grid_rows": grid_rows,
+        "preprocessing": {
+            "mode": "split_raw_pair",
+            "raw_left": str(left_video),
+            "raw_right": str(right_video),
+            "splitter": {
+                "output_root": str(split_dir / "clips"),
+                "manifest": str(split_dir / "split_manifest.json"),
+                "stage": {"status": "pending"},
+            },
+            "calibration": {
+                "mode": "generated",
+                "work_dir": str(calibration_dir),
+                "sync_json": str(calibration_dir / "sync.json"),
+                "stats_dir": str(calibration_dir / "stats"),
+                "mono_npz": str(calibration_dir / "mono.npz"),
+                "stereo_npz": str(calibration_dir / "stereo.npz"),
+                "settings": {
+                    "cols": 9,
+                    "rows": 7,
+                    "square_mm": 40.0,
+                    "scale": 1.0,
+                    "workers": 32,
+                    "sync_mode": "audio",
+                    "stats_step": 1,
+                    "stats_max_scan": 100000,
+                    "mono_max_scan": 100,
+                    "stereo_max_pairs": 50,
+                },
+                "stages": {
+                    "sync": {"status": "pending"},
+                    "stats": {"status": "pending"},
+                    "mono": {"status": "pending"},
+                    "stereo": {"status": "pending"},
+                },
+            },
+        },
         "settings": {
             "scale": 0.25,
             "gpu_mode": "dual",
@@ -649,7 +922,7 @@ def create_manifest():
             "visualize": True,
             "visualization_workers": 16,
         },
-        "jobs": jobs,
+        "jobs": [],
     }
     manifest_path = queue_dir / "queue_manifest.json"
     save_manifest(manifest_path, manifest)
@@ -664,6 +937,187 @@ def load_manifest(path_value):
     if not path.is_file():
         raise FileNotFoundError(f"Queue manifest not found: {path}")
     return path, json.loads(path.read_text())
+
+
+def calibration_paths(manifest):
+    calibration = manifest["preprocessing"]["calibration"]
+    return Path(calibration["sync_json"]), Path(calibration["stereo_npz"])
+
+
+def calibration_stage_outputs(calibration, stage_name):
+    if stage_name == "sync":
+        return [Path(calibration["sync_json"])]
+    if stage_name == "stats":
+        stats_dir = Path(calibration["stats_dir"])
+        return [stats_dir / "stats_left.json", stats_dir / "stats_right.json"]
+    if stage_name == "mono":
+        mono = Path(calibration["mono_npz"])
+        return [mono, mono.with_name(mono.stem + "_report.json")]
+    if stage_name == "stereo":
+        stereo = Path(calibration["stereo_npz"])
+        return [stereo, stereo.with_name(stereo.stem + "_report.json")]
+    raise ValueError(f"Unknown calibration stage: {stage_name}")
+
+
+def calibration_stage_fingerprint(manifest, stage_name):
+    calibration = manifest["preprocessing"]["calibration"]
+    payload = {
+        "version": 1,
+        "stage": stage_name,
+        "left_video": video_signature(calibration["left_video"]),
+        "right_video": video_signature(calibration["right_video"]),
+        "frame_range": frame_range_signature(
+            calibration["start_frame"], calibration["end_frame"]
+        ),
+        "settings": calibration["settings"],
+    }
+    dependencies = {
+        "sync": [],
+        "stats": ["sync"],
+        "mono": ["sync", "stats"],
+        "stereo": ["sync", "stats", "mono"],
+    }[stage_name]
+    payload["dependencies"] = {
+        dependency: [
+            file_signature(path, include_hash=True)
+            for path in calibration_stage_outputs(calibration, dependency)
+        ]
+        for dependency in dependencies
+    }
+    return stable_hash(payload)
+
+
+def calibration_stage_complete(manifest, stage_name):
+    calibration = manifest["preprocessing"]["calibration"]
+    if calibration.get("mode") == "existing":
+        return all(
+            path.is_file() and path.stat().st_size > 0
+            for path in calibration_stage_outputs(calibration, stage_name)
+        )
+    stage = calibration["stages"][stage_name]
+    outputs = calibration_stage_outputs(calibration, stage_name)
+    return (
+        stage.get("status") == "complete"
+        and stage.get("fingerprint") == calibration_stage_fingerprint(manifest, stage_name)
+        and all(path.is_file() and path.stat().st_size > 0 for path in outputs)
+    )
+
+
+def calibration_complete(manifest):
+    calibration = manifest["preprocessing"]["calibration"]
+    if calibration.get("mode") == "existing":
+        sync_json, stereo_npz = calibration_paths(manifest)
+        return sync_json.is_file() and stereo_npz.is_file()
+    return all(
+        calibration_stage_complete(manifest, stage_name)
+        for stage_name in ("sync", "stats", "mono", "stereo")
+    )
+
+
+def calibration_command(calibration, stage_name):
+    settings = calibration["settings"]
+    common = [
+        "--left", calibration["left_video"],
+        "--right", calibration["right_video"],
+        "--start-frame", str(calibration["start_frame"]),
+        "--end-frame", str(calibration["end_frame"]),
+    ]
+    board = [
+        "--cols", str(settings["cols"]),
+        "--rows", str(settings["rows"]),
+        "--square-mm", str(settings["square_mm"]),
+        "--scale", str(settings["scale"]),
+    ]
+    workers = ["--workers", str(settings["workers"])]
+    command = [sys.executable, str(CALIBRATION_SCRIPT), stage_name, *common]
+    if stage_name == "sync":
+        command.extend([
+            "--out", calibration["sync_json"],
+            "--scale", str(settings["scale"]),
+            "--sync-mode", settings["sync_mode"],
+            "--accept-sync",
+        ])
+    elif stage_name == "stats":
+        command.extend([
+            "--sync", calibration["sync_json"],
+            "--out", calibration["stats_dir"],
+            *board,
+            "--step", str(settings["stats_step"]),
+            "--max-scan", str(settings["stats_max_scan"]),
+            *workers,
+            "--no-adaptive",
+        ])
+    elif stage_name == "mono":
+        command.extend([
+            "--sync", calibration["sync_json"],
+            "--out", calibration["mono_npz"],
+            *board,
+            "--max-scan", str(settings["mono_max_scan"]),
+            *workers,
+            "--reuse-stats-indices", "true",
+            "--stats-dir", calibration["stats_dir"],
+        ])
+    elif stage_name == "stereo":
+        command.extend([
+            "--sync", calibration["sync_json"],
+            "--mono", calibration["mono_npz"],
+            "--out", calibration["stereo_npz"],
+            *board,
+            "--max-pairs", str(settings["stereo_max_pairs"]),
+            *workers,
+            "--reuse-stats-indices", "true",
+            "--stats-dir", calibration["stats_dir"],
+        ])
+    else:
+        raise ValueError(f"Unknown calibration stage: {stage_name}")
+    return command
+
+
+def prepare_calibration(manifest_path, manifest):
+    calibration = manifest["preprocessing"]["calibration"]
+    if calibration.get("mode") == "existing":
+        if not calibration_complete(manifest):
+            sync_json, stereo_npz = calibration_paths(manifest)
+            raise RuntimeError(
+                f"Existing calibration is incomplete: sync={sync_json}, stereo={stereo_npz}"
+            )
+        print("[SKIP][CALIBRATION] Using calibration files recorded by this legacy queue.")
+        return True
+
+    print("\n[CALIBRATION] Clip pair 1: sync -> stats -> mono -> stereo")
+    logs_dir = Path(calibration["work_dir"]) / "logs"
+    for stage_name in ("sync", "stats", "mono", "stereo"):
+        stage = calibration["stages"][stage_name]
+        if calibration_stage_complete(manifest, stage_name):
+            print(f"[SKIP][CALIBRATION:{stage_name.upper()}] Already complete.")
+            continue
+        stage.update({"status": "running", "started_at": utc_now(), "error": None})
+        save_manifest(manifest_path, manifest)
+        return_code = run_logged(
+            calibration_command(calibration, stage_name),
+            REPO_ROOT / "calibration",
+            logs_dir / f"{stage_name}.log",
+        )
+        outputs = calibration_stage_outputs(calibration, stage_name)
+        if return_code == 0 and all(
+            path.is_file() and path.stat().st_size > 0 for path in outputs
+        ):
+            stage.update({
+                "status": "complete",
+                "completed_at": utc_now(),
+                "error": None,
+                "fingerprint": calibration_stage_fingerprint(manifest, stage_name),
+            })
+            save_manifest(manifest_path, manifest)
+            continue
+        stage.update({
+            "status": "failed",
+            "failed_at": utc_now(),
+            "error": f"Calibration {stage_name} incomplete (exit code {return_code})",
+        })
+        save_manifest(manifest_path, manifest)
+        return False
+    return calibration_complete(manifest)
 
 
 def prepare_setups(manifest_path, manifest):
@@ -689,6 +1143,8 @@ def prepare_setups(manifest_path, manifest):
             str(MARKERS_SCRIPT),
             "--left-input", job["left_video"],
             "--right-input", job["right_video"],
+            "--start-frame", str(job["start_frame"]),
+            "--end-frame", str(job["end_frame"]),
             "--out", job["setup_dir"],
             "--corrections-json", job["corrections_json"],
             "--semi-auto-setup",
@@ -729,13 +1185,15 @@ def run_objectwise(manifest_path, manifest, job):
         str(OBJECTWISE_SCRIPT),
         "--left-input", job["left_video"],
         "--right-input", job["right_video"],
+        "--start-frame", str(job["start_frame"]),
+        "--end-frame", str(job["end_frame"]),
         "--setup-json", job["setup_json"],
         "--corrections-json", job["corrections_json"],
         "--out", job["sam2_out"],
-        "--scale", "0.25",
-        "--gpu-mode", "dual",
-        "--batch-size", "36",
-        "--preview", "false",
+        "--scale", str(manifest["settings"]["scale"]),
+        "--gpu-mode", str(manifest["settings"]["gpu_mode"]),
+        "--batch-size", str(manifest["settings"]["batch_size"]),
+        "--preview", str(bool(manifest["settings"]["preview"])).lower(),
     ]
     return_code = run_logged(
         command,
@@ -772,6 +1230,7 @@ def run_triangulation(manifest_path, manifest, job):
     stage.update({"status": "running", "started_at": utc_now(), "error": None})
     save_manifest(manifest_path, manifest)
     sam2_out = Path(job["sam2_out"])
+    sync_json, stereo_npz = calibration_paths(manifest)
     out_csv = result_dir / "triangulated_3d.csv"
     out_summary = result_dir / "summary.json"
     command = [sys.executable, str(TRIANGULATION_SCRIPT)]
@@ -789,12 +1248,16 @@ def run_triangulation(manifest_path, manifest, job):
             ]
         )
     command.extend([
+        "--stereo", str(stereo_npz),
+        "--sync-json", str(sync_json),
         "--left-video", job["left_video"],
+        "--start-frame", str(job["start_frame"]),
+        "--end-frame", str(job["end_frame"]),
         "--out-csv", str(out_csv),
         "--out-summary", str(out_summary),
         "--visualize",
         "--viz-out", str(result_dir / "triangulated_3d_viz.mp4"),
-        "--workers", "16",
+        "--workers", str(manifest["settings"]["visualization_workers"]),
         "--viz-grid-cols", str(manifest["grid_cols"]),
         "--viz-grid-rows", str(manifest["grid_rows"]),
     ])
@@ -839,7 +1302,7 @@ def process_jobs(manifest_path, manifest):
             continue
         print(f"[OK] Results: {job['result_dir']}")
 
-    complete = all(
+    complete = calibration_complete(manifest) and bool(manifest["jobs"]) and all(
         setup_complete(job, manifest) and sam2_complete(job, manifest) and triangulation_complete(job, manifest)
         for job in manifest["jobs"]
     )
@@ -851,7 +1314,10 @@ def process_jobs(manifest_path, manifest):
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Queue stereo videos for semi-auto setup, objectwise SAM2, and triangulation."
+        description=(
+            "Select virtual ranges from one raw stereo pair, calibrate from range 1, "
+            "then queue the remaining ranges for SAM2 tracking and triangulation."
+        )
     )
     parser.add_argument(
         "--resume",
@@ -865,9 +1331,18 @@ def main():
     args = parse_args()
     if args.resume:
         manifest_path, manifest = load_manifest(args.resume)
+        if migrate_manifest(manifest):
+            save_manifest(manifest_path, manifest)
         print(f"[QUEUE] Resuming: {manifest_path}")
     else:
         manifest_path, manifest = create_manifest()
+    if not prepare_splitter(manifest_path, manifest):
+        print("[QUEUE] Splitter is incomplete. Resume this manifest to try again.")
+        return
+    ensure_jobs_from_split(manifest_path, manifest)
+    if not prepare_calibration(manifest_path, manifest):
+        print("[QUEUE] Calibration is incomplete. Resume this manifest to try again.")
+        return
     prepare_setups(manifest_path, manifest)
     process_jobs(manifest_path, manifest)
 

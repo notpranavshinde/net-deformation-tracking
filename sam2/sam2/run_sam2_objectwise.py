@@ -128,6 +128,8 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Run SAM2 one marker object at a time, then merge tracks.")
     parser.add_argument("--left-input", default=str(Path("in") / "left.mp4"))
     parser.add_argument("--right-input", default=str(Path("in") / "right.mp4"))
+    parser.add_argument("--start-frame", type=int, default=0, help="Inclusive source frame for a virtual clip")
+    parser.add_argument("--end-frame", type=int, default=None, help="Exclusive source frame for a virtual clip")
     parser.add_argument("--out", default=str(sam2run.DEFAULT_OUT_DIR))
     parser.add_argument("--setup-json", default=str(sam2run.DEFAULT_LOCAL_SETUP_DIR / "prompts" / "points_left_right.json"))
     parser.add_argument(
@@ -246,8 +248,20 @@ def load_setup(args):
                 },
             )
     return {
-        "left": {"points": left_points, "crop": crop_left, "video": args.left_input},
-        "right": {"points": right_points, "crop": crop_right, "video": args.right_input},
+        "left": {
+            "points": left_points,
+            "crop": crop_left,
+            "video": args.left_input,
+            "start_frame": int(args.start_frame),
+            "end_frame": args.end_frame,
+        },
+        "right": {
+            "points": right_points,
+            "crop": crop_right,
+            "video": args.right_input,
+            "start_frame": int(args.start_frame),
+            "end_frame": args.end_frame,
+        },
         "corrections": corrections,
         "corrections_path": corrections_path,
     }
@@ -256,19 +270,19 @@ def load_setup(args):
 def count_cached_frames(frames_dir: Path) -> int:
     if not frames_dir.exists():
         return 0
-    return sum(1 for _ in frames_dir.glob("*.jpg"))
+    return sum(1 for _ in frames_dir.glob("*.png"))
 
 
 def frame_cache_status(frames_dir: Path, expected_count: int):
     cached_count = count_cached_frames(frames_dir)
     if cached_count <= 0:
-        return False, cached_count, "no JPEG frames found"
+        return False, cached_count, "no PNG frames found"
     if expected_count <= 0:
         return True, cached_count, "OpenCV could not report the video frame count"
-    first_frame = frames_dir / "000000.jpg"
-    last_frame = frames_dir / f"{expected_count - 1:06d}.jpg"
+    first_frame = frames_dir / "000000.png"
+    last_frame = frames_dir / f"{expected_count - 1:06d}.png"
     if cached_count != expected_count:
-        return False, cached_count, f"expected {expected_count} JPEG frames, found {cached_count}"
+        return False, cached_count, f"expected {expected_count} PNG frames, found {cached_count}"
     if not first_frame.exists():
         return False, cached_count, f"missing first frame {first_frame.name}"
     if not last_frame.exists():
@@ -292,6 +306,8 @@ def prepare_frames(side_name, video_path, crop, args, side_out: Path):
         frame_extractor=args.frame_extractor,
         meta_name="frames_objectwise_meta.json",
         label=side_name.upper(),
+        start_frame=args.start_frame,
+        end_frame=args.end_frame,
     )
     return frames_dir, cached_count
 
@@ -302,10 +318,14 @@ def object_fingerprint(side_name, obj_id, point, crop, video_path, args, correct
         if int(corr.get("obj_id", -1)) == int(obj_id)
     ]
     return stable_hash({
-        "version": 1,
+        "version": 2,
         "side": side_name,
         "obj_id": int(obj_id),
-    "video": video_signature(video_path),
+        "video": video_signature(video_path),
+        "frame_range": {
+            "start_frame": int(args.start_frame),
+            "end_frame": int(args.end_frame),
+        },
         "crop": list(crop) if crop is not None else None,
         "scale": float(args.scale),
         "point": point,
@@ -325,6 +345,10 @@ def batch_fingerprint(side_name, batch_ids, side_data, args, corrections):
         "side": side_name,
         "object_ids": [int(obj_id) for obj_id in batch_ids],
         "video": video_signature(side_data["video"]),
+        "frame_range": {
+            "start_frame": int(side_data["start_frame"]),
+            "end_frame": int(side_data["end_frame"]),
+        },
         "crop": list(side_data["crop"]) if side_data["crop"] is not None else None,
         "scale": float(args.scale),
         "points": [side_data["points"][obj_id] for obj_id in batch_ids],
@@ -695,6 +719,21 @@ def main():
         raise RuntimeError("--scale must be > 0")
     args.left_input = sam2run.resolve_video_path(args.left_input)
     args.right_input = sam2run.resolve_video_path(args.right_input)
+    source_counts = [
+        int(video_signature(path)["frame_count"])
+        for path in (args.left_input, args.right_input)
+    ]
+    if args.end_frame is None:
+        args.end_frame = min(source_counts)
+    if (
+        args.start_frame < 0
+        or args.end_frame <= args.start_frame
+        or any(count > 0 and args.end_frame > count for count in source_counts)
+    ):
+        raise RuntimeError(
+            f"Invalid virtual clip range [{args.start_frame}, {args.end_frame}) "
+            f"for source counts {source_counts}"
+        )
 
     setup = load_setup(args)
     out_root = Path(args.out)

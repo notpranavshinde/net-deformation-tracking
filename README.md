@@ -211,18 +211,36 @@ sam2/sam2/out/right/tracks_2d.csv
 
 ## Queued Runs
 
-Use the queue runner when several stereo clips need the same setup, objectwise
-tracking, and triangulation workflow:
+Use the queue runner to split one raw stereo recording, calibrate, track every
+experiment, and triangulate the results:
 
 ```bash
 python run_pipeline_queue.py
 ```
 
-It asks for the number of runs, then the LEFT video, RIGHT video, and velocity
-label for each run. Grid columns and rows are entered once. It opens the
-semi-auto setup for every run first so all manual marker adjustments can be
-finished in one pass. After that it processes each prepared run unattended
-with:
+It asks once for the raw LEFT and RIGHT videos, then opens the Linux dual-video
+splitter using RIGHT as the cutting reference. Mark the clips in this order:
+
+1. Checkerboard calibration clip.
+2. First experiment clip.
+3. Remaining experiment clips.
+
+Clip pair 1 is reserved for calibration and is never sent to SAM2. The runner
+asks only for velocity labels for clip pairs 2 onward. It then runs calibration
+on clip pair 1 using `sync`, exhaustive `stats`, `mono`, and `stereo` with the
+9x7 checkerboard, 40 mm squares, scale 1.0, and 32 workers. Calibration outputs
+are isolated inside the queue directory and passed explicitly to every
+triangulation run.
+
+The splitter does not create or reencode clip videos for queued runs. It stores
+the original stereo paths plus inclusive start and exclusive end frame indices
+in `split_manifest.json`. Calibration and SAM2 read those ranges directly from
+the originals. SAM2's 0.25-scale working cache uses lossless PNG frames, so the
+only image reduction is the explicitly requested processing scale.
+
+After calibration, the runner opens semi-auto setup for every experiment so
+all manual marker adjustments can be finished in one pass. It then processes
+each prepared run unattended with:
 
 ```text
 --scale 0.25 --gpu-mode dual --batch-size 36 --preview false
@@ -236,7 +254,8 @@ video, and Three.js viewer to:
 triangulation/results/<velocity>/
 ```
 
-Queue state, isolated setup files, SAM2 outputs, and logs are retained under:
+The virtual split manifest, calibration products, queue state, isolated setup
+files, SAM2 outputs, and logs are retained under:
 
 ```text
 work/pipeline_queue/<queue-id>/
@@ -249,12 +268,14 @@ completed setups or batches:
 python run_pipeline_queue.py --resume work/pipeline_queue/<queue-id>
 ```
 
-Resume checks are data-aware. The queue runner verifies each setup belongs to
-the queued left/right videos, verifies objectwise batch fingerprints, frame
-cache scale, frame counts, and merged track row counts, and fingerprints the
-triangulation inputs before reusing `--viz-only`. If tracks, videos,
-calibration, sync JSON, setup points, corrections, grid size, or queue settings
-change, the affected stage is recomputed instead of reusing stale files.
+Resume checks are data-aware. The runner reuses selected virtual frame ranges,
+validates each calibration stage against the original videos, exact range, and
+dependencies, verifies each setup belongs to its source videos and range,
+verifies objectwise batch fingerprints, frame cache scale, frame counts, and
+merged track row counts, and fingerprints triangulation inputs before reusing
+`--viz-only`. If tracks, source videos, ranges, calibration, sync JSON, setup
+points, corrections, grid size, or queue settings change, the affected stage
+is recomputed instead of reusing stale files.
 
 The setup and objectwise scripts also accept `--corrections-json` for isolated
 correction files. Semi-auto setup accepts `--grid-cols` and `--grid-rows` to

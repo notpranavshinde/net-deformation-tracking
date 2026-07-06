@@ -517,12 +517,14 @@ def draw_cross(img: np.ndarray, x: int, y: int, color, size: int = 6, thickness:
 def create_3d_visualization_video(out_rows: list,
                                   left_video: str,
                                   out_path: str,
-                                  max_frames: int = -1):
+                                  max_frames: int = -1,
+                                  source_start_frame: int = 0):
     if len(out_rows) == 0:
         print("[VIS] No rows to visualize. Skipping.")
         return
 
     capL = open_video(left_video)
+    capL.set(cv2.CAP_PROP_POS_FRAMES, int(source_start_frame))
     fpsL = float(capL.get(cv2.CAP_PROP_FPS))
     fps = _visualization_fps(fpsL)
 
@@ -1461,7 +1463,8 @@ def create_3d_scene_visualization(out_rows: list,
                                   workers: int = 0,
                                   encoder: str = "auto",
                                   grid_cols: int = 0,
-                                  grid_rows: int = 0):
+                                  grid_rows: int = 0,
+                                  source_start_frame: int = 0):
     """Render left overlay, isometric 3D, and top-down videos as separate files."""
     _ = trail_len
     if len(out_rows) == 0:
@@ -1471,7 +1474,9 @@ def create_3d_scene_visualization(out_rows: list,
     valid_rows = [r for r in out_rows if int(r["valid_3d"]) == 1]
     if not valid_rows:
         print("[VIS] No valid 3D rows. Falling back to side-by-side viz.")
-        create_3d_visualization_video(out_rows, left_video, out_path, max_frames)
+        create_3d_visualization_video(
+            out_rows, left_video, out_path, max_frames, source_start_frame
+        )
         return
 
     refs, fixed_ids, disp_max = _attach_displacements(valid_rows)
@@ -1509,6 +1514,7 @@ def create_3d_scene_visualization(out_rows: list,
     z_lim = pad_lim(Zs_all)
 
     capL = open_video(left_video)
+    capL.set(cv2.CAP_PROP_POS_FRAMES, int(source_start_frame))
     fpsL = float(capL.get(cv2.CAP_PROP_FPS))
     fps = _visualization_fps(fpsL)
 
@@ -1667,6 +1673,7 @@ def visualize_existing_rows(args, out_rows):
             encoder=args.viz_encoder,
             grid_cols=args.viz_grid_cols,
             grid_rows=args.viz_grid_rows,
+            source_start_frame=args.start_frame,
         )
     else:
         create_3d_visualization_video(
@@ -1674,6 +1681,7 @@ def visualize_existing_rows(args, out_rows):
             left_video=args.left_video,
             out_path=args.viz_out,
             max_frames=args.viz_max_frames,
+            source_start_frame=args.start_frame,
         )
 
 
@@ -1698,6 +1706,8 @@ def main():
     ap.add_argument("--right", default="sam2/sam2/out/right/tracks_2d.csv", help="Right tracks_2d.csv")
     ap.add_argument("--left-video", default="sam2/sam2/in/left.mp4", help="Left video path for per-run sync detection or visualization")
     ap.add_argument("--right-video", default="sam2/sam2/in/right.mp4", help="Right video path for per-run sync detection")
+    ap.add_argument("--start-frame", type=int, default=0, help="Inclusive source frame for the virtual clip")
+    ap.add_argument("--end-frame", type=int, default=None, help="Exclusive source frame for the virtual clip")
     ap.add_argument("--sync-mode", choices=["flash", "audio", "hybrid"], default=None,
                     help="Sync detection mode: audio peak, flash, or hybrid(visual)")
     ap.add_argument("--sync-scale", type=float, default=0.25, help="Downscale for sync detection")
@@ -1892,6 +1902,8 @@ def main():
             "gframe": gframe,
             "frame_L": lframe,
             "frame_R": rframe,
+            "source_frame_L": int(args.start_frame) + int(lframe),
+            "source_frame_R": int(args.start_frame) + int(rframe),
             "obj_id": obj_id,
             "uL": float(u1),
             "vL": float(v1),

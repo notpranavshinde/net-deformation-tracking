@@ -141,6 +141,14 @@ def parse_bool(value):
 
 
 def validate_args(args):
+    if hasattr(args, "start_frame") and args.start_frame < 0:
+        raise ValueError("--start-frame must be >= 0")
+    if (
+        hasattr(args, "end_frame")
+        and args.end_frame is not None
+        and args.end_frame <= args.start_frame
+    ):
+        raise ValueError("--end-frame must be greater than --start-frame")
     if hasattr(args, "scale") and args.scale <= 0:
         raise ValueError("--scale must be > 0")
     if hasattr(args, "step") and args.step < 1:
@@ -421,13 +429,31 @@ def get_video_fps_and_frames(video_path: str):
         raise RuntimeError(f"Could not read FPS from video: {video_path}")
     return fps, total
 
-def extract_audio_envelope(video_path: str, max_frames: int, sample_rate: int = 16000):
+def resolve_frame_range(video_path: str, start_frame: int = 0, end_frame: Optional[int] = None):
+    fps, total = get_video_fps_and_frames(video_path)
+    start = int(start_frame)
+    end = int(end_frame) if end_frame is not None else int(total)
+    if start < 0 or end <= start or end > total:
+        raise RuntimeError(f"Invalid frame range [{start}, {end}) for {video_path} ({total} frames)")
+    return start, end, fps, total
+
+
+def extract_audio_envelope(
+    video_path: str,
+    max_frames: int,
+    sample_rate: int = 16000,
+    start_frame: int = 0,
+    end_frame: Optional[int] = None,
+):
     ffmpeg = shutil.which("ffmpeg")
     if ffmpeg is None:
         raise RuntimeError("ffmpeg not found on PATH. Install ffmpeg for --sync-mode audio.")
 
-    fps, total_frames = get_video_fps_and_frames(video_path)
-    max_scan_frames = total_frames if max_frames < 0 else min(total_frames, max_frames)
+    start_frame, end_frame, fps, _total_frames = resolve_frame_range(
+        video_path, start_frame, end_frame
+    )
+    range_frames = end_frame - start_frame
+    max_scan_frames = range_frames if max_frames < 0 else min(range_frames, max_frames)
     max_sec = max_scan_frames / fps
 
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
@@ -437,6 +463,7 @@ def extract_audio_envelope(video_path: str, max_frames: int, sample_rate: int = 
         cmd = [
             ffmpeg,
             "-y",
+            "-ss", f"{start_frame / fps:.9f}",
             "-i", video_path,
             "-vn",
             "-ac", "1",
@@ -475,6 +502,7 @@ def extract_audio_envelope(video_path: str, max_frames: int, sample_rate: int = 
             "video_fps": float(fps),
             "audio_rate": int(fr),
             "max_scan_frames": int(max_scan_frames),
+            "frame_offset": int(start_frame),
             "env": env_smooth.astype(np.float32),
         }
     finally:
@@ -607,15 +635,25 @@ def prompt_yes_no(question: str, default_yes: bool = True) -> bool:
 # -----------------------------
 # Sync by flash (same logic as your script)
 # -----------------------------
-def brightness_curve(video_path: str, scale: float, step: int, max_frames: int, use_cuda: bool = False):
+def brightness_curve(
+    video_path: str,
+    scale: float,
+    step: int,
+    max_frames: int,
+    use_cuda: bool = False,
+    start_frame: int = 0,
+    end_frame: Optional[int] = None,
+):
     cap = open_video(video_path)
     total, fps, _ = get_video_info(cap)
-    max_scan = min(total, max_frames if max_frames > 0 else total)
-    effective_total = stepped_iteration_count(max_scan, 0, step)
+    start_frame = int(start_frame)
+    end_frame = int(end_frame) if end_frame is not None else total
+    max_scan = min(end_frame, start_frame + max_frames) if max_frames > 0 else end_frame
+    effective_total = stepped_iteration_count(max_scan, start_frame, step)
 
     means, idxs = [], []
     pbar = progress_bar(total=effective_total, desc="[Brightness scan]", unit="frame")
-    i = 0
+    i = start_frame
     next_idx = None
     while i < max_scan:
         ok, frame, next_idx = read_frame_progressive(cap, i, next_idx)
@@ -741,10 +779,12 @@ def collect_samples_checker(video_path: str,
                             progress_position: int = 0,
                             show_progress: bool = True,
                             progress_queue=None,
-                            quiet: bool = False):
+                            quiet: bool = False,
+                            end_frame: Optional[int] = None):
     ensure_dir(out_dir)
     cap = open_video(video_path)
     total, fps, (W, H) = get_video_info(cap)
+    range_end = min(total, int(end_frame)) if end_frame is not None else total
     image_size = (int(W*scale), int(H*scale))
 
     obj_template = make_object_points(pattern, square_m)
@@ -759,7 +799,7 @@ def collect_samples_checker(video_path: str,
         idx_list = []
         for i in frame_indices:
             ii = int(i)
-            if ii < 0 or ii >= total or ii in seen:
+            if ii < int(sync_start) or ii >= range_end or ii in seen:
                 continue
             seen.add(ii)
             idx_list.append(ii)
@@ -808,7 +848,7 @@ def collect_samples_checker(video_path: str,
         scan_source = "provided_indices"
     else:
         scan_lo = max(0, int(sync_start))
-        scan_hi = total - 1
+        scan_hi = range_end - 1
         intervals = [(scan_lo, scan_hi)]
         steps = [int(step)] if no_adaptive else adaptive_halving_steps(step, levels=4)
         visited = set()
@@ -989,8 +1029,20 @@ def cmd_sync(args):
     ensure_dir(os.path.dirname(args.out) or ".")
     if args.sync_mode == "audio":
         print("\n[SYNC] Scanning audio peaks...")
-        left_audio = extract_audio_envelope(args.left, max_frames=args.max_frames, sample_rate=args.audio_sample_rate)
-        right_audio = extract_audio_envelope(args.right, max_frames=args.max_frames, sample_rate=args.audio_sample_rate)
+        left_audio = extract_audio_envelope(
+            args.left,
+            max_frames=args.max_frames,
+            sample_rate=args.audio_sample_rate,
+            start_frame=args.start_frame,
+            end_frame=args.end_frame,
+        )
+        right_audio = extract_audio_envelope(
+            args.right,
+            max_frames=args.max_frames,
+            sample_rate=args.audio_sample_rate,
+            start_frame=args.start_frame,
+            end_frame=args.end_frame,
+        )
 
         candL = find_audio_peak_candidates(
             left_audio["env"],
@@ -1008,6 +1060,10 @@ def cmd_sync(args):
             top_k=AUDIO_TOPK_DEFAULT,
             min_separation_frames=AUDIO_MIN_SEPARATION_FRAMES_DEFAULT,
         )
+        for candidate in candL:
+            candidate["frame_idx"] += int(left_audio["frame_offset"])
+        for candidate in candR:
+            candidate["frame_idx"] += int(right_audio["frame_offset"])
 
         if len(candL) == 0 or len(candR) == 0:
             raise RuntimeError("[SYNC] No audio peak candidates found. Try increasing --max-frames.")
@@ -1029,7 +1085,11 @@ def cmd_sync(args):
             f"[SYNC] First guess from strongest peaks: "
             f"LEFT frame={candL[0]['frame_idx']}, RIGHT frame={candR[0]['frame_idx']}"
         )
-        accept_guess = prompt_yes_no("[SYNC] Accept this audio sync guess?", default_yes=True)
+        accept_guess = bool(args.accept_sync) or prompt_yes_no(
+            "[SYNC] Accept this audio sync guess?", default_yes=True
+        )
+        if args.accept_sync:
+            print("[SYNC] Automatically accepted strongest audio peaks.")
         if not accept_guess:
             chooseL = prompt_audio_choice("LEFT", candL, default_rank=1)
             chooseR = prompt_audio_choice("RIGHT", candR, default_rank=1)
@@ -1043,8 +1103,14 @@ def cmd_sync(args):
             reasonR = f"audio-peak-candidate-{chooseR + 1}"
     else:
         print("\n[SYNC] Scanning brightness for flash...")
-        idxL, meanL, _ = brightness_curve(args.left, args.scale, args.step, args.max_frames, use_cuda=args.use_cuda)
-        idxR, meanR, _ = brightness_curve(args.right, args.scale, args.step, args.max_frames, use_cuda=args.use_cuda)
+        idxL, meanL, _ = brightness_curve(
+            args.left, args.scale, args.step, args.max_frames,
+            use_cuda=args.use_cuda, start_frame=args.start_frame, end_frame=args.end_frame,
+        )
+        idxR, meanR, _ = brightness_curve(
+            args.right, args.scale, args.step, args.max_frames,
+            use_cuda=args.use_cuda, start_frame=args.start_frame, end_frame=args.end_frame,
+        )
         fL = pick_flash_frame(idxL, meanL)
         fR = pick_flash_frame(idxR, meanR)
         reasonL, reasonR = "flash", "flash"
@@ -1077,6 +1143,8 @@ def cmd_sync(args):
         "left_reason": str(reasonL),
         "right_reason": str(reasonR),
         "scale": float(args.scale),
+        "source_start_frame": int(args.start_frame),
+        "source_end_frame": int(args.end_frame) if args.end_frame is not None else None,
     })
     print(f"[SYNC] Wrote: {args.out}")
 
@@ -1135,6 +1203,7 @@ def collect_stats_worker(params: dict):
         show_progress=params["show_progress"],
         progress_queue=params["progress_queue"],
         quiet=params["quiet"],
+        end_frame=params.get("end_frame"),
     )
     stats["detected_frame_indices"] = [int(s.frame_idx) for s in samples]
     return stats, image_size
@@ -1343,7 +1412,7 @@ def collect_stats_parallel_side(params: dict, workers: int, progress_queue=None,
     scale = float(params["scale"])
     image_size = (int(W * scale), int(H * scale))
     scan_lo = max(0, int(params["trim"]))
-    scan_hi = total - 1
+    scan_hi = min(total, int(params.get("end_frame") or total)) - 1
     intervals = [(scan_lo, scan_hi)]
     steps = [int(params["step"])] if params["no_adaptive"] else adaptive_halving_steps(params["step"], levels=4)
     visited = set()
@@ -1447,7 +1516,7 @@ def collect_samples_parallel_indices(params: dict, frame_indices: List[int], wor
     idx_list = []
     for i in frame_indices:
         ii = int(i)
-        if ii < 0 or ii >= total or ii in seen:
+        if ii < int(params.get("trim", 0)) or ii >= min(total, int(params.get("end_frame") or total)) or ii in seen:
             continue
         seen.add(ii)
         idx_list.append(ii)
@@ -1588,7 +1657,8 @@ def cmd_stats(args):
     jobs = [
         {
             "video_path": args.left,
-            "trim": trimL,
+            "trim": int(args.start_frame) + trimL,
+            "end_frame": args.end_frame,
             "pattern": pattern,
             "square_m": square_m,
             "scale": args.scale,
@@ -1605,7 +1675,8 @@ def cmd_stats(args):
         },
         {
             "video_path": args.right,
-            "trim": trimR,
+            "trim": int(args.start_frame) + trimR,
+            "end_frame": args.end_frame,
             "pattern": pattern,
             "square_m": square_m,
             "scale": args.scale,
@@ -1624,20 +1695,22 @@ def cmd_stats(args):
     print(f"[STATS] Scanning with {args.workers} worker process(es).")
     if args.workers == 1:
         sL, stL, sizeL = collect_samples_checker(
-            args.left, trimL, pattern, square_m,
+            args.left, int(args.start_frame) + trimL, pattern, square_m,
             scale=args.scale, step=args.step, max_scan=args.max_scan,
             debug_every=args.debug_every, label="LEFT",
             out_dir=os.path.join(args.out, "debug_left"),
             use_cuda=args.use_cuda,
             no_adaptive=args.no_adaptive,
+            end_frame=args.end_frame,
         )
         sR, stR, sizeR = collect_samples_checker(
-            args.right, trimR, pattern, square_m,
+            args.right, int(args.start_frame) + trimR, pattern, square_m,
             scale=args.scale, step=args.step, max_scan=args.max_scan,
             debug_every=args.debug_every, label="RIGHT",
             out_dir=os.path.join(args.out, "debug_right"),
             use_cuda=args.use_cuda,
             no_adaptive=args.no_adaptive,
+            end_frame=args.end_frame,
         )
         stL["detected_frame_indices"] = [int(s.frame_idx) for s in sL]
         stR["detected_frame_indices"] = [int(s.frame_idx) for s in sR]
@@ -1715,7 +1788,8 @@ def cmd_mono(args):
                 samplesL, statsL, image_size = collect_samples_parallel_indices(
                     {
                         "video_path": args.left,
-                        "trim": trimL,
+                        "trim": int(args.start_frame) + trimL,
+                        "end_frame": args.end_frame,
                         "pattern": pattern,
                         "square_m": square_m,
                         "scale": args.scale,
@@ -1733,13 +1807,14 @@ def cmd_mono(args):
                 drain_progress_queue(progress_queue, pbar)
     else:
         samplesL, statsL, image_size = collect_samples_checker(
-            args.left, trimL, pattern, square_m,
+            args.left, int(args.start_frame) + trimL, pattern, square_m,
             scale=args.scale, step=args.step, max_scan=args.max_scan,
             debug_every=args.debug_every, label="LEFT",
             out_dir=os.path.join(os.path.dirname(args.out) or ".", "mono_debug_left"),
             use_cuda=args.use_cuda,
             frame_indices=frame_indices_left,
             no_adaptive=args.no_adaptive,
+            end_frame=args.end_frame,
         )
     print(f"[MONO] LEFT used={len(samplesL)} found_pct={statsL['found_pct']:.1f}%")
 
@@ -1751,7 +1826,8 @@ def cmd_mono(args):
                 samplesR, statsR, image_size_r = collect_samples_parallel_indices(
                     {
                         "video_path": args.right,
-                        "trim": trimR,
+                        "trim": int(args.start_frame) + trimR,
+                        "end_frame": args.end_frame,
                         "pattern": pattern,
                         "square_m": square_m,
                         "scale": args.scale,
@@ -1769,13 +1845,14 @@ def cmd_mono(args):
                 drain_progress_queue(progress_queue, pbar)
     else:
         samplesR, statsR, image_size_r = collect_samples_checker(
-            args.right, trimR, pattern, square_m,
+            args.right, int(args.start_frame) + trimR, pattern, square_m,
             scale=args.scale, step=args.step, max_scan=args.max_scan,
             debug_every=args.debug_every, label="RIGHT",
             out_dir=os.path.join(os.path.dirname(args.out) or ".", "mono_debug_right"),
             use_cuda=args.use_cuda,
             frame_indices=frame_indices_right,
             no_adaptive=args.no_adaptive,
+            end_frame=args.end_frame,
         )
     print(f"[MONO] RIGHT used={len(samplesR)} found_pct={statsR['found_pct']:.1f}%")
 
@@ -1851,6 +1928,15 @@ def cmd_stereo(args):
         left_pos = load_positive_indices(left_stats_path)
         right_pos = load_positive_indices(right_stats_path)
         paired_indices = build_paired_indices_from_stats(trimL, trimR, left_pos, right_pos)
+        range_end = min(totalL, totalR, int(args.end_frame) if args.end_frame is not None else min(totalL, totalR))
+        paired_indices = [
+            (idxL, idxR)
+            for idxL, idxR in paired_indices
+            if idxL >= int(args.start_frame) + trimL
+            and idxR >= int(args.start_frame) + trimR
+            and idxL < range_end
+            and idxR < range_end
+        ]
         if args.max_scan > 0:
             paired_indices = paired_indices[:args.max_scan]
         print(
@@ -1921,7 +2007,11 @@ def cmd_stereo(args):
     else:
         capL = open_video(args.left)
         capR = open_video(args.right)
-        max_g = min(totalL - trimL, totalR - trimR) - 1
+        range_end = min(totalL, totalR, int(args.end_frame) if args.end_frame is not None else min(totalL, totalR))
+        max_g = min(
+            range_end - (int(args.start_frame) + trimL),
+            range_end - (int(args.start_frame) + trimR),
+        ) - 1
         try:
             if max_g < 0:
                 raise RuntimeError("[STEREO] No overlapping synchronized frame range after trim.")
@@ -1950,8 +2040,8 @@ def cmd_stereo(args):
                 pbar = progress_bar(total=len(g_list), desc=f"[Stereo pairing s={pass_step}]", unit="frame")
 
                 for g in g_list:
-                    idxL = trimL + int(g)
-                    idxR = trimR + int(g)
+                    idxL = int(args.start_frame) + trimL + int(g)
+                    idxR = int(args.start_frame) + trimR + int(g)
 
                     okL, fL, nextL = read_frame_progressive(capL, idxL, nextL)
                     okR, fR, nextR = read_frame_progressive(capR, idxR, nextR)
@@ -2078,7 +2168,14 @@ def main():
     ap = argparse.ArgumentParser("Stereo checkerboard debug pipeline (loud + modular)")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
+    def add_frame_range_flags(parser):
+        parser.add_argument("--start-frame", type=int, default=0,
+                            help="Inclusive source frame for a virtual clip")
+        parser.add_argument("--end-frame", type=int, default=None,
+                            help="Exclusive source frame for a virtual clip")
+
     sp = sub.add_parser("sync")
+    add_frame_range_flags(sp)
     sp.add_argument("--left", default=DEFAULT_LEFT_VIDEO)
     sp.add_argument("--right", default=DEFAULT_RIGHT_VIDEO)
     sp.add_argument("--out", default=DEFAULT_SYNC_JSON)
@@ -2092,9 +2189,12 @@ def main():
     sp.add_argument("--use-cuda", action="store_true", help="Use OpenCV CUDA ops when available; auto-fallback to CPU")
     sp.add_argument("--show-preview", action="store_true",
                     help="Open sync preview windows. By default previews are saved without being displayed.")
+    sp.add_argument("--accept-sync", action="store_true",
+                    help="Accept the strongest sync candidates without prompting.")
     sp.set_defaults(func=cmd_sync)
 
     sp = sub.add_parser("stats")
+    add_frame_range_flags(sp)
     sp.add_argument("--left", default=DEFAULT_LEFT_VIDEO)
     sp.add_argument("--right", default=DEFAULT_RIGHT_VIDEO)
     sp.add_argument("--sync", default=DEFAULT_SYNC_JSON)
@@ -2114,6 +2214,7 @@ def main():
     sp.set_defaults(func=cmd_stats)
 
     sp = sub.add_parser("mono")
+    add_frame_range_flags(sp)
     sp.add_argument("--left", default=DEFAULT_LEFT_VIDEO)
     sp.add_argument("--right", default=DEFAULT_RIGHT_VIDEO)
     sp.add_argument("--sync", default=DEFAULT_SYNC_JSON)
@@ -2138,6 +2239,7 @@ def main():
     sp.set_defaults(func=cmd_mono)
 
     sp = sub.add_parser("stereo")
+    add_frame_range_flags(sp)
     sp.add_argument("--left", default=DEFAULT_LEFT_VIDEO)
     sp.add_argument("--right", default=DEFAULT_RIGHT_VIDEO)
     sp.add_argument("--sync", default=DEFAULT_SYNC_JSON)
@@ -2164,6 +2266,7 @@ def main():
     sp.set_defaults(func=cmd_stereo)
 
     sp = sub.add_parser("rectify")
+    add_frame_range_flags(sp)
     sp.add_argument("--left", default=DEFAULT_LEFT_VIDEO)
     sp.add_argument("--right", default=DEFAULT_RIGHT_VIDEO)
     sp.add_argument("--sync", default=DEFAULT_SYNC_JSON)

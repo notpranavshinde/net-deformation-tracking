@@ -17,12 +17,39 @@ def frame_to_seconds(frame_idx, fps):
     return frame_idx / fps
 
 
-def run_ffmpeg_command(cmd, label=""):
-    result = subprocess.run(cmd, stderr=subprocess.PIPE, text=True)
-    if result.returncode != 0:
+def run_ffmpeg_command(cmd, label="", duration=None):
+    process = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1,
+    )
+    last_bucket = -1
+    assert process.stdout is not None
+    for raw_line in process.stdout:
+        line = raw_line.strip()
+        if not line.startswith("out_time=") or not duration:
+            continue
+        try:
+            hours, minutes, seconds = line.split("=", 1)[1].split(":")
+            elapsed = int(hours) * 3600 + int(minutes) * 60 + float(seconds)
+        except (ValueError, TypeError):
+            continue
+        percent = max(0.0, min(100.0, elapsed / duration * 100.0))
+        bucket = int(percent // 5)
+        if bucket > last_bucket:
+            last_bucket = bucket
+            print(f"  [{label}] {percent:5.1f}%", flush=True)
+
+    stderr = process.stderr.read() if process.stderr is not None else ""
+    return_code = process.wait()
+    if return_code != 0:
         print(f"\nFFmpeg failed on {label}:")
-        print(result.stderr[-2000:])
-        raise subprocess.CalledProcessError(result.returncode, cmd)
+        print(stderr[-2000:])
+        raise subprocess.CalledProcessError(return_code, cmd)
+    if last_bucket < 20:
+        print(f"  [{label}] 100.0%", flush=True)
 
 
 def export_regions(video_path, regions, output_dir, fps):
@@ -44,7 +71,7 @@ def export_regions(video_path, regions, output_dir, fps):
         fine_offset = pre_seek
 
         cmd = [
-            "ffmpeg", "-y",
+            "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
             "-ss", f"{fast_seek:.6f}",
             "-i", video_path,
             "-ss", f"{fine_offset:.6f}",
@@ -54,7 +81,8 @@ def export_regions(video_path, regions, output_dir, fps):
             "-crf", "18",
             "-c:a", "aac",
             "-movflags", "+faststart",
-            "-stats",
+            "-progress", "pipe:1",
+            "-nostats",
             out_path,
         ]
 
@@ -63,7 +91,11 @@ def export_regions(video_path, regions, output_dir, fps):
             f"{format_time(start_f, fps)} -> {format_time(end_f, fps)} "
             f"({duration:.1f}s)"
         )
-        run_ffmpeg_command(cmd, label=f"clip {i + 1}")
+        run_ffmpeg_command(
+            cmd,
+            label=f"{video_stem} clip {i + 1}",
+            duration=duration,
+        )
 
     print("\nDone.")
 
