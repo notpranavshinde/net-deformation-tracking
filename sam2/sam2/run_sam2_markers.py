@@ -73,6 +73,9 @@ DEFAULT_CORRECTIONS_PATH = DEFAULT_LOCAL_SETUP_DIR / "prompts" / "corrections.js
 NO_CROP_CORRECTIONS_PATH = DEFAULT_LOCAL_SETUP_DIR / "prompts" / "corrections_no_crop.json"
 MODEL_ID = "facebook/sam2-hiera-large"  # or base-plus for speed
 # MODEL_ID = "facebook/sam2-hiera-base-plus"
+FRAME_CACHE_IMAGE_FORMAT = "jpg"
+FRAME_CACHE_EXT = ".jpg"
+FRAME_CACHE_GLOB = "*.jpg"
 
 DOT_AREA_MIN = 10
 DOT_AREA_MAX = 1_000_000
@@ -1993,19 +1996,19 @@ def _stable_hash(payload) -> str:
 def _count_cached_frames(frames_dir: Path) -> int:
     if not frames_dir.exists():
         return 0
-    return sum(1 for _ in frames_dir.glob("*.png"))
+    return sum(1 for _ in frames_dir.glob(FRAME_CACHE_GLOB))
 
 
 def _frame_cache_status(frames_dir: Path, expected_count: int):
     cached_count = _count_cached_frames(frames_dir)
     if cached_count <= 0:
-        return False, cached_count, "no PNG frames found"
+        return False, cached_count, "no JPEG frames found"
     if expected_count <= 0:
         return True, cached_count, "OpenCV could not report the video frame count"
     if cached_count != expected_count:
-        return False, cached_count, f"expected {expected_count} PNG frames, found {cached_count}"
-    first_frame = frames_dir / "000000.png"
-    last_frame = frames_dir / f"{expected_count - 1:06d}.png"
+        return False, cached_count, f"expected {expected_count} JPEG frames, found {cached_count}"
+    first_frame = frames_dir / f"000000{FRAME_CACHE_EXT}"
+    last_frame = frames_dir / f"{expected_count - 1:06d}{FRAME_CACHE_EXT}"
     if not first_frame.exists():
         return False, cached_count, f"missing first frame {first_frame.name}"
     if not last_frame.exists():
@@ -2033,7 +2036,7 @@ def _frame_cache_meta(
         "crop": list(crop) if crop is not None else None,
         "scale": float(scale),
         "frame_extractor": str(frame_extractor),
-        "image_format": "png",
+        "image_format": FRAME_CACHE_IMAGE_FORMAT,
     }
 
 
@@ -2141,7 +2144,7 @@ def extract_frames_ffmpeg(
     frame_count = end_frame - start_frame
     start_seconds = start_frame / fps
     pre_seek = min(5.0, start_seconds)
-    output_pattern = str(frames_dir / "%06d.png")
+    output_pattern = str(frames_dir / f"%06d{FRAME_CACHE_EXT}")
     cmd = [
         "ffmpeg",
         "-hide_banner",
@@ -2160,14 +2163,14 @@ def extract_frames_ffmpeg(
         cmd.extend(["-vf", vf])
     cmd.extend([
         "-frames:v", str(frame_count),
-        "-compression_level", "3",
+        "-q:v", "2",
         "-start_number", "0",
         output_pattern,
     ])
 
-    print(f"[INFO] Using ffmpeg PNG extraction for source frames [{start_frame}, {end_frame})")
+    print(f"[INFO] Using ffmpeg JPEG extraction for source frames [{start_frame}, {end_frame})")
     subprocess.run(cmd, check=True)
-    n_frames = len(list(frames_dir.glob("*.png")))
+    n_frames = len(list(frames_dir.glob(FRAME_CACHE_GLOB)))
     if n_frames <= 0:
         raise RuntimeError(f"ffmpeg did not write any frames to {frames_dir}")
     print(f"[OK] Extracted {n_frames} frames to {frames_dir}")
@@ -2215,9 +2218,9 @@ def extract_frames_opencv(
             frame = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
 
         cv2.imwrite(
-            str(frames_dir / f"{i:06d}.png"),
+            str(frames_dir / f"{i:06d}{FRAME_CACHE_EXT}"),
             frame,
-            [cv2.IMWRITE_PNG_COMPRESSION, 3],
+            [cv2.IMWRITE_JPEG_QUALITY, 95],
         )
         i += 1
     cap.release()
@@ -2272,7 +2275,7 @@ def extract_frames(video_path: str,
     )
 
 def load_first_frame(frames_dir: Path):
-    first = frames_dir / "000000.png"
+    first = frames_dir / f"000000{FRAME_CACHE_EXT}"
     if not first.exists():
         raise RuntimeError(f"Missing {first}")
     img = cv2.imread(str(first))

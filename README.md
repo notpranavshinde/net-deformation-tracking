@@ -230,7 +230,8 @@ asks only for velocity labels for clip pairs 2 onward. It then runs calibration
 on clip pair 1 using `sync`, exhaustive `stats`, `mono`, and `stereo` with the
 9x7 checkerboard, 40 mm squares, scale 1.0, and 32 workers. Calibration outputs
 are isolated inside the queue directory and passed explicitly to every
-triangulation run.
+triangulation run. Audio sync uses whole-range frame-level correlation and asks
+you to confirm the proposed LEFT-minus-RIGHT offset before continuing.
 
 The splitter does not create or reencode clip videos for queued runs. It stores
 the original stereo paths plus inclusive start and exclusive end frame indices
@@ -247,8 +248,7 @@ each prepared run unattended with:
 ```
 
 LEFT runs on CUDA 0 and RIGHT runs on CUDA 1. After each objectwise run,
-triangulation writes the CSV, summary, left-overlay video, iso video, top-down
-video, and Three.js viewer to:
+triangulation writes the CSV, summary, and interactive Three.js viewer to:
 
 ```text
 triangulation/results/<velocity>/
@@ -271,8 +271,8 @@ python run_pipeline_queue.py --resume work/pipeline_queue/<queue-id>
 Resume checks are data-aware. The runner reuses selected virtual frame ranges,
 validates each calibration stage against the original videos, exact range, and
 dependencies, verifies each setup belongs to its source videos and range,
-verifies objectwise batch fingerprints, frame cache scale, frame counts, and
-merged track row counts, and fingerprints triangulation inputs before reusing
+verifies objectwise batch fingerprints, frame cache scale, and every expected
+`(frame, object)` track key, and fingerprints triangulation inputs before reusing
 `--viz-only`. If tracks, source videos, ranges, calibration, sync JSON, setup
 points, corrections, grid size, or queue settings change, the affected stage
 is recomputed instead of reusing stale files.

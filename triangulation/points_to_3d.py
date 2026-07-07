@@ -1464,7 +1464,8 @@ def create_3d_scene_visualization(out_rows: list,
                                   encoder: str = "auto",
                                   grid_cols: int = 0,
                                   grid_rows: int = 0,
-                                  source_start_frame: int = 0):
+                                  source_start_frame: int = 0,
+                                  viewer_only: bool = False):
     """Render left overlay, isometric 3D, and top-down videos as separate files."""
     _ = trail_len
     if len(out_rows) == 0:
@@ -1473,6 +1474,9 @@ def create_3d_scene_visualization(out_rows: list,
 
     valid_rows = [r for r in out_rows if int(r["valid_3d"]) == 1]
     if not valid_rows:
+        if viewer_only:
+            print("[VIS] No valid 3D rows. Skipping interactive viewer.")
+            return
         print("[VIS] No valid 3D rows. Falling back to side-by-side viz.")
         create_3d_visualization_video(
             out_rows, left_video, out_path, max_frames, source_start_frame
@@ -1513,11 +1517,6 @@ def create_3d_scene_visualization(out_rows: list,
     y_lim = pad_lim(Ys_all)
     z_lim = pad_lim(Zs_all)
 
-    capL = open_video(left_video)
-    capL.set(cv2.CAP_PROP_POS_FRAMES, int(source_start_frame))
-    fpsL = float(capL.get(cv2.CAP_PROP_FPS))
-    fps = _visualization_fps(fpsL)
-
     grouped = {}
     for row in out_rows:
         grouped.setdefault(int(row["frame_L"]), []).append(row)
@@ -1526,9 +1525,56 @@ def create_3d_scene_visualization(out_rows: list,
     if max_frames > 0:
         target_frames = target_frames[:max_frames]
     if not target_frames:
-        capL.release()
         print("[VIS] No frames selected. Skipping.")
         return
+
+    base = Path(out_path)
+    base.parent.mkdir(parents=True, exist_ok=True)
+    stem = base.with_suffix("")
+    viewer_path = Path(f"{stem}_viewer.html")
+
+    if viewer_only:
+        per_frame_xyz = []
+        for frame_idx in target_frames:
+            valid_here = [r for r in grouped[frame_idx] if int(r["valid_3d"]) == 1]
+            if valid_here:
+                local = np.array([
+                    _to_local_xyz([float(r["X"]), float(r["Y"]), float(r["Z"])], origin, basis)
+                    for r in valid_here
+                ], dtype=np.float64)
+                obj_ids = np.array([int(r["obj_id"]) for r in valid_here], dtype=np.int32)
+                displacements = np.array(
+                    [float(r.get("_disp_m", 0.0)) for r in valid_here], dtype=np.float64
+                )
+                per_frame_xyz.append(
+                    (obj_ids, local[:, 0], local[:, 1], local[:, 2], displacements)
+                )
+            else:
+                per_frame_xyz.append((
+                    np.zeros(0, dtype=np.int32),
+                    np.zeros(0),
+                    np.zeros(0),
+                    np.zeros(0),
+                    np.zeros(0),
+                ))
+        _write_threejs_viewer(
+            viewer_path,
+            target_frames,
+            per_frame_xyz,
+            x_lim,
+            y_lim,
+            z_lim,
+            disp_max,
+            edges,
+            iso_azim,
+            grid_shape,
+        )
+        return
+
+    capL = open_video(left_video)
+    capL.set(cv2.CAP_PROP_POS_FRAMES, int(source_start_frame))
+    fpsL = float(capL.get(cv2.CAP_PROP_FPS))
+    fps = _visualization_fps(fpsL)
 
     ok, first_frame = capL.read()
     if not ok:
@@ -1537,13 +1583,9 @@ def create_3d_scene_visualization(out_rows: list,
 
     h, w_single = first_frame.shape[:2]
 
-    base = Path(out_path)
-    base.parent.mkdir(parents=True, exist_ok=True)
-    stem = base.with_suffix("")
     left_path = Path(f"{stem}_left.mp4")
     iso_path = Path(f"{stem}_iso.mp4")
     top_path = Path(f"{stem}_topdown.mp4")
-    viewer_path = Path(f"{stem}_viewer.html")
 
     if encoder == "auto":
         enc = "nvenc" if _has_nvenc() else "mp4v"
@@ -1674,6 +1716,7 @@ def visualize_existing_rows(args, out_rows):
             grid_cols=args.viz_grid_cols,
             grid_rows=args.viz_grid_rows,
             source_start_frame=args.start_frame,
+            viewer_only=args.viewer_only,
         )
     else:
         create_3d_visualization_video(
@@ -1722,6 +1765,8 @@ def main():
     ap.add_argument("--visualize", action="store_true", help="Generate side-by-side original + CSV reconstruction video")
     ap.add_argument("--viz-only", action="store_true",
                     help="Skip triangulation and render visualization from an existing --out-csv")
+    ap.add_argument("--viewer-only", action="store_true",
+                    help="Write only the interactive Three.js viewer; skip visualization videos")
     ap.add_argument("--viz-out", default="triangulation/out/triangulated_3d_viz.mp4", help="Output path for visualization video")
     ap.add_argument("--viz-max-frames", type=int, default=-1, help="Max rendered frames with tracked nodes (-1=all)")
     ap.add_argument("--viz-mode", choices=["scene", "sidebyside"], default="scene",
@@ -1739,6 +1784,10 @@ def main():
     ap.add_argument("--max-reproj", type=float, default=20.0, help="Reject if mean reproj err > this (px)")
     args = ap.parse_args()
 
+    if args.viewer_only and not args.visualize:
+        raise ValueError("--viewer-only requires --visualize.")
+    if args.viewer_only and args.viz_mode != "scene":
+        raise ValueError("--viewer-only requires --viz-mode scene.")
     if args.viz_only:
         if not args.visualize:
             raise ValueError("--viz-only requires --visualize.")

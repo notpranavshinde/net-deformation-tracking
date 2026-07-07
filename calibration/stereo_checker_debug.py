@@ -556,6 +556,56 @@ def find_audio_peak_candidates(env_smooth: np.ndarray,
     selected.sort(key=lambda d: d["sample_idx"])
     return selected
 
+
+def estimate_audio_frame_offset(left_audio: dict, right_audio: dict, max_lag_frames: int = 120):
+    """Estimate integer LEFT-minus-RIGHT lag from the complete audio envelopes."""
+    frame_count = min(
+        int(left_audio["max_scan_frames"]),
+        int(right_audio["max_scan_frames"]),
+    )
+    if frame_count < 3:
+        raise RuntimeError("[SYNC] Audio range is too short for correlation sync.")
+
+    def sample_per_frame(audio):
+        env = np.asarray(audio["env"], dtype=np.float64)
+        audio_rate = float(audio["audio_rate"])
+        video_fps = float(audio["video_fps"])
+        sample_indices = np.rint(
+            (np.arange(frame_count, dtype=np.float64) + 0.5) * audio_rate / video_fps
+        ).astype(np.int64)
+        sample_indices = np.clip(sample_indices, 0, len(env) - 1)
+        values = np.log1p(env[sample_indices])
+        values -= np.mean(values)
+        std = float(np.std(values))
+        if std <= 1e-12:
+            raise RuntimeError("[SYNC] Audio envelope has no usable variation.")
+        return values / std
+
+    left_values = sample_per_frame(left_audio)
+    right_values = sample_per_frame(right_audio)
+    max_lag = min(max(1, int(max_lag_frames)), frame_count // 3)
+    scores = {}
+    for lag in range(-max_lag, max_lag + 1):
+        if lag >= 0:
+            left_slice = left_values[lag:]
+            right_slice = right_values[:frame_count - lag]
+        else:
+            left_slice = left_values[:frame_count + lag]
+            right_slice = right_values[-lag:]
+        scores[lag] = float(np.mean(left_slice * right_slice))
+
+    ranked = sorted(scores.items(), key=lambda item: item[1], reverse=True)
+    best_lag, best_score = ranked[0]
+    runner_up_score = ranked[1][1] if len(ranked) > 1 else float("nan")
+    return {
+        "offset_left_minus_right": int(best_lag),
+        "score": float(best_score),
+        "runner_up_score": float(runner_up_score),
+        "score_margin": float(best_score - runner_up_score),
+        "max_lag_frames": int(max_lag),
+    }
+
+
 def render_audio_peak_preview(left_env: np.ndarray,
                               right_env: np.ndarray,
                               left_candidates: List[dict],
@@ -1027,6 +1077,7 @@ def rectify_pair(K1, D1, K2, D2, R, T, image_size, alpha: float):
 # -----------------------------
 def cmd_sync(args):
     ensure_dir(os.path.dirname(args.out) or ".")
+    correlation = None
     if args.sync_mode == "audio":
         print("\n[SYNC] Scanning audio peaks...")
         left_audio = extract_audio_envelope(
@@ -1067,6 +1118,8 @@ def cmd_sync(args):
 
         if len(candL) == 0 or len(candR) == 0:
             raise RuntimeError("[SYNC] No audio peak candidates found. Try increasing --max-frames.")
+        correlation = estimate_audio_frame_offset(left_audio, right_audio)
+        correlation_offset = int(correlation["offset_left_minus_right"])
 
         audio_preview_png = str(Path(args.out).with_suffix("")) + "_audio_peaks.png"
         try:
@@ -1080,27 +1133,42 @@ def cmd_sync(args):
         except Exception as e:
             print(f"[SYNC] WARNING: audio peak preview failed ({e}). Continuing.")
 
-        chooseL = chooseR = 0
+        matched_left, matched_right = min(
+            (
+                (left_candidate, right_candidate)
+                for left_candidate in candL
+                for right_candidate in candR
+            ),
+            key=lambda pair: (
+                abs(
+                    (int(pair[0]["frame_idx"]) - int(pair[1]["frame_idx"]))
+                    - correlation_offset
+                ),
+                -(float(pair[0]["score"]) + float(pair[1]["score"])),
+            ),
+        )
+        fR_guess = int(matched_right["frame_idx"])
+        fL_guess = fR_guess + correlation_offset
         print(
-            f"[SYNC] First guess from strongest peaks: "
-            f"LEFT frame={candL[0]['frame_idx']}, RIGHT frame={candR[0]['frame_idx']}"
+            f"[SYNC] Audio correlation guess: LEFT-RIGHT offset={correlation_offset} frame(s), "
+            f"score={correlation['score']:.3f}, margin={correlation['score_margin']:.3f}"
         )
         accept_guess = bool(args.accept_sync) or prompt_yes_no(
-            "[SYNC] Accept this audio sync guess?", default_yes=True
+            "[SYNC] Accept this audio correlation sync guess?", default_yes=True
         )
         if args.accept_sync:
-            print("[SYNC] Automatically accepted strongest audio peaks.")
+            print("[SYNC] Automatically accepted audio correlation offset.")
         if not accept_guess:
             chooseL = prompt_audio_choice("LEFT", candL, default_rank=1)
             chooseR = prompt_audio_choice("RIGHT", candR, default_rank=1)
-
-        fL = int(candL[chooseL]["frame_idx"])
-        fR = int(candR[chooseR]["frame_idx"])
-        if accept_guess:
-            reasonL, reasonR = "audio-peak-auto", "audio-peak-auto"
-        else:
+            fL = int(candL[chooseL]["frame_idx"])
+            fR = int(candR[chooseR]["frame_idx"])
             reasonL = f"audio-peak-candidate-{chooseL + 1}"
             reasonR = f"audio-peak-candidate-{chooseR + 1}"
+        else:
+            fL = fL_guess
+            fR = fR_guess
+            reasonL, reasonR = "audio-correlation-auto", "audio-correlation-auto"
     else:
         print("\n[SYNC] Scanning brightness for flash...")
         idxL, meanL, _ = brightness_curve(
@@ -1145,6 +1213,7 @@ def cmd_sync(args):
         "scale": float(args.scale),
         "source_start_frame": int(args.start_frame),
         "source_end_frame": int(args.end_frame) if args.end_frame is not None else None,
+        "audio_correlation": correlation,
     })
     print(f"[SYNC] Wrote: {args.out}")
 

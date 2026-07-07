@@ -2,7 +2,9 @@
 """Prepare multiple stereo runs interactively, then process them unattended."""
 
 import argparse
+import codecs
 import csv
+import errno
 import hashlib
 import json
 import os
@@ -213,35 +215,89 @@ def count_csv_rows(path):
         return sum(1 for _ in csv.DictReader(f))
 
 
+def track_grid_is_complete(path, frame_count, object_ids):
+    expected_ids = {int(obj_id) for obj_id in object_ids}
+    expected_rows = int(frame_count) * len(expected_ids)
+    seen = set()
+    try:
+        with Path(path).open(newline="") as f:
+            for row in csv.DictReader(f):
+                frame = int(row["frame"])
+                obj_id = int(row["obj_id"])
+                key = (frame, obj_id)
+                if (
+                    frame < 0
+                    or frame >= int(frame_count)
+                    or obj_id not in expected_ids
+                    or key in seen
+                ):
+                    return False
+                seen.add(key)
+    except (OSError, KeyError, TypeError, ValueError):
+        return False
+    return len(seen) == expected_rows
+
+
 def save_manifest(manifest_path, manifest):
     manifest["updated_at"] = utc_now()
     atomic_write_json(manifest_path, manifest)
 
 
-def run_logged(command, cwd, log_path):
+def run_logged(command, cwd, log_path, use_pty=True):
     log_path.parent.mkdir(parents=True, exist_ok=True)
     print("\n$", " ".join(str(part) for part in command))
     with open(log_path, "a", buffering=1) as log:
         log.write(f"\n[{utc_now()}] $ {' '.join(str(part) for part in command)}\n")
         popen_kwargs = {}
+        master_fd = None
+        slave_fd = None
         if os.name == "nt":
             popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
         else:
             popen_kwargs["start_new_session"] = True
+            if use_pty:
+                import pty
+
+                master_fd, slave_fd = pty.openpty()
         process = subprocess.Popen(
             [str(part) for part in command],
             cwd=str(cwd),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
+            stdout=slave_fd if slave_fd is not None else subprocess.PIPE,
+            stderr=slave_fd if slave_fd is not None else subprocess.STDOUT,
             text=True,
             bufsize=1,
             **popen_kwargs,
         )
-        assert process.stdout is not None
+        if slave_fd is not None:
+            os.close(slave_fd)
+            slave_fd = None
         try:
-            for line in process.stdout:
-                print(line, end="", flush=True)
-                log.write(line)
+            if master_fd is not None:
+                decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+                while True:
+                    try:
+                        chunk = os.read(master_fd, 65536)
+                    except OSError as exc:
+                        if exc.errno == errno.EIO:
+                            break
+                        raise
+                    if not chunk:
+                        break
+                    output = decoder.decode(chunk)
+                    if output:
+                        sys.stdout.write(output)
+                        sys.stdout.flush()
+                        log.write(output)
+                output = decoder.decode(b"", final=True)
+                if output:
+                    sys.stdout.write(output)
+                    sys.stdout.flush()
+                    log.write(output)
+            else:
+                assert process.stdout is not None
+                for line in process.stdout:
+                    print(line, end="", flush=True)
+                    log.write(line)
             return_code = process.wait()
         except KeyboardInterrupt:
             if hasattr(os, "killpg"):
@@ -264,6 +320,11 @@ def run_logged(command, cwd, log_path):
                 process.wait()
             log.write(f"[{utc_now()}] interrupted\n")
             raise
+        finally:
+            if master_fd is not None:
+                os.close(master_fd)
+            if slave_fd is not None:
+                os.close(slave_fd)
         log.write(f"[{utc_now()}] exit_code={return_code}\n")
     return return_code
 
@@ -335,13 +396,15 @@ def load_setup_payload(job):
             "points": payload["left"],
             "crop": side_crop("left"),
             "video": job["left_video"],
-            "frame_range": frame_range_signature(job["start_frame"], job["end_frame"]),
+            "start_frame": int(job["start_frame"]),
+            "end_frame": int(job["end_frame"]),
         },
         "right": {
             "points": payload["right"],
             "crop": side_crop("right"),
             "video": job["right_video"],
-            "frame_range": frame_range_signature(job["start_frame"], job["end_frame"]),
+            "start_frame": int(job["start_frame"]),
+            "end_frame": int(job["end_frame"]),
         },
     }
 
@@ -384,11 +447,15 @@ def batch_fingerprint(side_name, batch_ids, setup_side, manifest, corrections):
         if int(corr.get("obj_id", -1)) in wanted
     ]
     return stable_hash({
-        "version": 2,
+        "version": 3,
         "side": side_name,
+        "frame_cache_image_format": "jpg",
         "object_ids": [int(obj_id) for obj_id in batch_ids],
         "video": objectwise_video_signature(setup_side["video"]),
-        "frame_range": setup_side["frame_range"],
+        "frame_range": {
+            "start_frame": int(setup_side["start_frame"]),
+            "end_frame": int(setup_side["end_frame"]),
+        },
         "crop": list(setup_side["crop"]) if setup_side["crop"] is not None else None,
         "scale": float(manifest["settings"]["scale"]),
         "points": [setup_side["points"][obj_id] for obj_id in batch_ids],
@@ -400,8 +467,9 @@ def batch_fingerprint(side_name, batch_ids, setup_side, manifest, corrections):
 
 def sam2_stage_fingerprint(job, manifest):
     return stable_hash({
-        "version": 1,
+        "version": 2,
         "stage": "sam2",
+        "frame_cache_image_format": "jpg",
         "left_video": video_signature(job["left_video"]),
         "right_video": video_signature(job["right_video"]),
         "frame_range": frame_range_signature(job["start_frame"], job["end_frame"]),
@@ -454,11 +522,13 @@ def validate_sam2_side(job, manifest, side_name, root_summary, setup, correction
         return False
     if abs(float(frame_meta.get("scale", -1.0)) - float(manifest["settings"]["scale"])) > 1e-9:
         return False
+    if frame_meta.get("image_format") != "jpg":
+        return False
 
     expected_total_rows = frames * len(expected_ids)
     if int(side_summary.get("rows", -1)) != expected_total_rows:
         return False
-    if count_csv_rows(side_tracks) != expected_total_rows:
+    if not track_grid_is_complete(side_tracks, frames, expected_ids):
         return False
 
     expected_batches = chunk_ids(expected_ids, int(manifest["settings"]["batch_size"]))
@@ -494,7 +564,7 @@ def validate_sam2_side(job, manifest, side_name, root_summary, setup, correction
             return False
         if [int(v) for v in batch_meta.get("object_ids", [])] != batch_ids:
             return False
-        if count_csv_rows(batch_tracks) != expected_rows:
+        if not track_grid_is_complete(batch_tracks, frames, batch_ids):
             return False
         summary_result = result_by_batch.get(batch_name)
         if not summary_result or summary_result.get("status") not in ("ok", "skipped"):
@@ -547,9 +617,6 @@ def write_sam2_queue_meta(job, manifest):
 
 def visualization_outputs(result_dir):
     return [
-        result_dir / "triangulated_3d_viz_left.mp4",
-        result_dir / "triangulated_3d_viz_iso.mp4",
-        result_dir / "triangulated_3d_viz_topdown.mp4",
         result_dir / "triangulated_3d_viz_viewer.html",
     ]
 
@@ -580,10 +647,9 @@ def triangulation_full_fingerprint(job, manifest):
         "stage": "triangulation-full",
         "data_fingerprint": triangulation_data_fingerprint(job, manifest),
         "visualize": bool(manifest["settings"]["visualize"]),
-        "workers": int(manifest["settings"]["visualization_workers"]),
         "viz_grid_cols": int(manifest["grid_cols"]),
         "viz_grid_rows": int(manifest["grid_rows"]),
-        "viz_mode": "scene",
+        "viz_mode": "viewer-only",
     })
 
 
@@ -761,7 +827,6 @@ def prepare_splitter(manifest_path, manifest):
         "--right", preprocessing["raw_right"],
         "--output-root", splitter["output_root"],
         "--manifest", splitter["manifest"],
-        "--yes",
         "--select-only",
     ]
     return_code = run_logged(
@@ -920,7 +985,6 @@ def create_manifest():
             "batch_size": 36,
             "preview": False,
             "visualize": True,
-            "visualization_workers": 16,
         },
         "jobs": [],
     }
@@ -969,6 +1033,7 @@ def calibration_stage_fingerprint(manifest, stage_name):
         "frame_range": frame_range_signature(
             calibration["start_frame"], calibration["end_frame"]
         ),
+        "sync_algorithm": "audio-frame-correlation-v1",
         "settings": calibration["settings"],
     }
     dependencies = {
@@ -1035,7 +1100,6 @@ def calibration_command(calibration, stage_name):
             "--out", calibration["sync_json"],
             "--scale", str(settings["scale"]),
             "--sync-mode", settings["sync_mode"],
-            "--accept-sync",
         ])
     elif stage_name == "stats":
         command.extend([
@@ -1199,12 +1263,14 @@ def run_objectwise(manifest_path, manifest, job):
         command,
         SAM2_DIR,
         Path(job["logs_dir"]) / "objectwise.log",
+        use_pty=False,
     )
-    if return_code == 0 and sam2_complete(job, manifest):
+    if return_code == 0:
         write_sam2_queue_meta(job, manifest)
-        stage.update({"status": "complete", "completed_at": utc_now(), "error": None})
-        save_manifest(manifest_path, manifest)
-        return True
+        if sam2_complete(job, manifest):
+            stage.update({"status": "complete", "completed_at": utc_now(), "error": None})
+            save_manifest(manifest_path, manifest)
+            return True
 
     stage.update(
         {
@@ -1256,8 +1322,8 @@ def run_triangulation(manifest_path, manifest, job):
         "--out-csv", str(out_csv),
         "--out-summary", str(out_summary),
         "--visualize",
+        "--viewer-only",
         "--viz-out", str(result_dir / "triangulated_3d_viz.mp4"),
-        "--workers", str(manifest["settings"]["visualization_workers"]),
         "--viz-grid-cols", str(manifest["grid_cols"]),
         "--viz-grid-rows", str(manifest["grid_rows"]),
     ])
@@ -1265,6 +1331,7 @@ def run_triangulation(manifest_path, manifest, job):
         command,
         REPO_ROOT,
         Path(job["logs_dir"]) / "triangulation.log",
+        use_pty=False,
     )
     if return_code == 0:
         write_triangulation_queue_meta(job, manifest)

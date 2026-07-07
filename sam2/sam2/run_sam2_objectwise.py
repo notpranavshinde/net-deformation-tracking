@@ -33,6 +33,7 @@ import csv
 import hashlib
 import json
 import multiprocessing
+import queue
 import shutil
 from pathlib import Path
 
@@ -270,19 +271,19 @@ def load_setup(args):
 def count_cached_frames(frames_dir: Path) -> int:
     if not frames_dir.exists():
         return 0
-    return sum(1 for _ in frames_dir.glob("*.png"))
+    return sum(1 for _ in frames_dir.glob(sam2run.FRAME_CACHE_GLOB))
 
 
 def frame_cache_status(frames_dir: Path, expected_count: int):
     cached_count = count_cached_frames(frames_dir)
     if cached_count <= 0:
-        return False, cached_count, "no PNG frames found"
+        return False, cached_count, "no JPEG frames found"
     if expected_count <= 0:
         return True, cached_count, "OpenCV could not report the video frame count"
-    first_frame = frames_dir / "000000.png"
-    last_frame = frames_dir / f"{expected_count - 1:06d}.png"
+    first_frame = frames_dir / f"000000{sam2run.FRAME_CACHE_EXT}"
+    last_frame = frames_dir / f"{expected_count - 1:06d}{sam2run.FRAME_CACHE_EXT}"
     if cached_count != expected_count:
-        return False, cached_count, f"expected {expected_count} PNG frames, found {cached_count}"
+        return False, cached_count, f"expected {expected_count} JPEG frames, found {cached_count}"
     if not first_frame.exists():
         return False, cached_count, f"missing first frame {first_frame.name}"
     if not last_frame.exists():
@@ -341,8 +342,9 @@ def batch_fingerprint(side_name, batch_ids, side_data, args, corrections):
         if int(corr.get("obj_id", -1)) in batch_id_set
     ]
     return stable_hash({
-        "version": 2,
+        "version": 3,
         "side": side_name,
+        "frame_cache_image_format": sam2run.FRAME_CACHE_IMAGE_FORMAT,
         "object_ids": [int(obj_id) for obj_id in batch_ids],
         "video": video_signature(side_data["video"]),
         "frame_range": {
@@ -386,7 +388,16 @@ def batch_is_complete(batch_dir: Path, fingerprint: str, frame_count: int, batch
     return count_track_rows(tracks_path) >= int(frame_count) * int(batch_count)
 
 
-def run_side(side_name, side_data, ids, args, out_root: Path, corrections, corrections_path: Path):
+def run_side(
+    side_name,
+    side_data,
+    ids,
+    args,
+    out_root: Path,
+    corrections,
+    corrections_path: Path,
+    progress_event_q=None,
+):
     side_out = out_root / side_name
     side_out.mkdir(parents=True, exist_ok=True)
     objectwise_root = side_out / "objectwise"
@@ -407,6 +418,10 @@ def run_side(side_name, side_data, ids, args, out_root: Path, corrections, corre
         torch.backends.cudnn.allow_tf32 = True
 
     from sam2.sam2_video_predictor import SAM2VideoPredictor
+    if progress_event_q is not None:
+        from sam2.utils import misc as sam2_misc
+
+        sam2_misc.set_frame_loading_progress_sink(progress_event_q, side_name)
 
     predictor = SAM2VideoPredictor.from_pretrained(sam2run.MODEL_ID).to(device)
     shared_state = predictor.init_state(
@@ -470,6 +485,7 @@ def run_side(side_name, side_data, ids, args, out_root: Path, corrections, corre
                     release_state=False,
                     correction_restart_mode=args.correction_restart_mode,
                     auto_pause_missing=args.auto_pause_missing,
+                    progress_event_q=progress_event_q,
                 )
                 if stopped:
                     status = "stopped"
@@ -751,27 +767,60 @@ def main():
         else:
             print("[INFO][DUAL] Headless objectwise run: LEFT->cuda:0 RIGHT->cuda:1")
             mp_ctx = multiprocessing.get_context("spawn")
-            with concurrent.futures.ProcessPoolExecutor(
-                max_workers=2,
-                mp_context=mp_ctx,
-            ) as executor:
-                futures = {
-                    side_name: executor.submit(
-                        run_side,
-                        side_name,
-                        setup[side_name],
-                        ids,
-                        args,
-                        out_root,
-                        setup["corrections"],
-                        setup["corrections_path"],
-                    )
-                    for side_name in sides
-                }
-                summaries = {
-                    side_name: future.result()
-                    for side_name, future in futures.items()
-                }
+            with mp_ctx.Manager() as manager:
+                progress_event_q = manager.Queue()
+                with concurrent.futures.ProcessPoolExecutor(
+                    max_workers=2,
+                    mp_context=mp_ctx,
+                ) as executor:
+                    futures = {
+                        side_name: executor.submit(
+                            run_side,
+                            side_name,
+                            setup[side_name],
+                            ids,
+                            args,
+                            out_root,
+                            setup["corrections"],
+                            setup["corrections_path"],
+                            progress_event_q,
+                        )
+                        for side_name in sides
+                    }
+                    progress = sam2run.make_rich_progress()
+                    progress_tasks = {}
+
+                    def apply_progress_event(event):
+                        side = str(event.get("side", "")).upper()
+                        if side not in ("LEFT", "RIGHT"):
+                            return
+                        total = int(event.get("total", 0) or 0)
+                        completed = int(event.get("completed", 0) or 0)
+                        description = str(event.get("description") or f"{side} processing")
+                        if side not in progress_tasks:
+                            progress_tasks[side] = progress.add_task(description, total=total)
+                        progress.update(
+                            progress_tasks[side],
+                            description=description,
+                            total=total,
+                            completed=completed,
+                        )
+
+                    with progress:
+                        while not all(future.done() for future in futures.values()):
+                            try:
+                                apply_progress_event(progress_event_q.get(timeout=0.1))
+                            except queue.Empty:
+                                pass
+                        while True:
+                            try:
+                                apply_progress_event(progress_event_q.get_nowait())
+                            except queue.Empty:
+                                break
+                    summaries = {
+                        side_name: future.result()
+                        for side_name, future in futures.items()
+                    }
     else:
         summaries = {}
         for side_name in sides:

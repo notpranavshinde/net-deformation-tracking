@@ -651,7 +651,12 @@ def main():
             )
 
         if not args.yes:
-            confirm = input("\nProceed with export for both videos? [Y/n]: ").strip().lower()
+            prompt = (
+                "\nSave these virtual clip ranges? [Y/n]: "
+                if args.select_only
+                else "\nProceed with export for both videos? [Y/n]: "
+            )
+            confirm = input(prompt).strip().lower()
             if confirm == "n":
                 print("Cancelled.")
                 return 1

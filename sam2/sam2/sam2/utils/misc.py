@@ -122,7 +122,66 @@ def _disable_frame_loading_progress():
     return str(value).strip().lower() in ("1", "true", "yes", "y", "on")
 
 
+_FRAME_PROGRESS_SINK = None
+_FRAME_PROGRESS_SIDE = None
+
+
+def set_frame_loading_progress_sink(sink=None, side=None):
+    global _FRAME_PROGRESS_SINK, _FRAME_PROGRESS_SIDE
+    _FRAME_PROGRESS_SINK = sink
+    _FRAME_PROGRESS_SIDE = str(side).upper() if side else None
+
+
+class _QueueProgress:
+    def __init__(self, sink, side):
+        self.sink = sink
+        self.side = side
+        self.description = f"{side} frame loading"
+        self.total = 0
+        self.completed = 0
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.sink.put({
+            "type": "done",
+            "side": self.side,
+            "description": self.description,
+            "total": self.total,
+            "completed": self.completed,
+        })
+
+    def add_task(self, description, total=0, **_kwargs):
+        self.description = str(description)
+        self.total = int(total or 0)
+        self.completed = 0
+        self.sink.put({
+            "type": "reset",
+            "side": self.side,
+            "description": self.description,
+            "total": self.total,
+            "completed": 0,
+        })
+        return 0
+
+    def update(self, _task_id, advance=0, completed=None, **_kwargs):
+        if completed is None:
+            self.completed += int(advance or 0)
+        else:
+            self.completed = int(completed)
+        self.sink.put({
+            "type": "update",
+            "side": self.side,
+            "description": self.description,
+            "total": self.total,
+            "completed": self.completed,
+        })
+
+
 def _make_progress():
+    if _FRAME_PROGRESS_SINK is not None and _FRAME_PROGRESS_SIDE is not None:
+        return _QueueProgress(_FRAME_PROGRESS_SINK, _FRAME_PROGRESS_SIDE)
     return Progress(
         TextColumn("[progress.description]{task.description}"),
         BarColumn(),
@@ -256,7 +315,7 @@ def load_video_frames_from_jpg_images(
     compute_device=torch.device("cuda"),
 ):
     """
-    Load video frames from numbered JPEG or PNG files.
+    Load video frames from numbered JPEG files.
 
     The frames are resized to image_size x image_size and are loaded to GPU if
     `offload_video_to_cpu` is `False` and to CPU if `offload_video_to_cpu` is `True`.
@@ -279,7 +338,7 @@ def load_video_frames_from_jpg_images(
     frame_names = [
         p
         for p in os.listdir(jpg_folder)
-        if os.path.splitext(p)[-1] in [".jpg", ".jpeg", ".JPG", ".JPEG", ".png", ".PNG"]
+        if os.path.splitext(p)[-1] in [".jpg", ".jpeg", ".JPG", ".JPEG"]
     ]
     frame_names.sort(key=lambda p: int(os.path.splitext(p)[0]))
     num_frames = len(frame_names)
