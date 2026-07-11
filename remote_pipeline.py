@@ -641,7 +641,7 @@ def cmd_run(args: argparse.Namespace) -> int:
 
 def cmd_status(args: argparse.Namespace) -> int:
     config = load_config()
-    manifest_path = queue_manifest_path(args.queue, allow_missing_dry_run=args.dry_run)
+    manifest_path = queue_manifest_path(args.queue)
     queue_id = queue_id_from_manifest(manifest_path)
     result = remote_check_queue(config, queue_id, args.verbose)
     if result.stdout:
@@ -692,14 +692,25 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--verbose", action="store_true", help="Print ssh/scp/tar commands before running them.")
     sub = parser.add_subparsers(dest="command", required=True)
 
+    def add_verbose_arg(p: argparse.ArgumentParser) -> None:
+        p.add_argument(
+            "--verbose",
+            action="store_true",
+            default=argparse.SUPPRESS,
+            help="Print ssh/scp/tar commands before running them.",
+        )
+
     init = sub.add_parser("init", help="Create remote_config.json and run doctor.")
+    add_verbose_arg(init)
     init.set_defaults(func=cmd_init)
 
     doctor = sub.add_parser("doctor", help="Check SSH, remote repo, Python env, GPU, and tmux.")
+    add_verbose_arg(doctor)
     doctor.set_defaults(func=cmd_doctor)
 
     def add_queue_arg(p: argparse.ArgumentParser) -> None:
         p.add_argument("--queue", help="Queue directory or queue_manifest.json. Defaults to newest work/pipeline_queue queue.")
+        add_verbose_arg(p)
 
     push = sub.add_parser("push", help="Validate and transfer a setup queue to the remote.")
     add_queue_arg(push)

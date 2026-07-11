@@ -2241,10 +2241,22 @@ def main():
     ensure_section_layout(manifest_path, manifest)
     prepare_setups(manifest_path, manifest)
     if args.setup_only:
+        missing, setup_command = process_only_missing(manifest_path, manifest)
+        if missing:
+            print("\n[QUEUE] Interactive setup is incomplete; queue is not ready for processing.")
+            print("[QUEUE] Missing:")
+            for item in missing:
+                print(f"  - {item}")
+            print("[QUEUE] Re-run setup on this machine:")
+            print(f"  {setup_command}")
+            return 1
         print("\n[QUEUE] Interactive setup is complete.")
         print(f"[QUEUE] Queue dir: {Path(manifest_path).parent}")
         print("[QUEUE] Copy this queue directory to the processing machine and run:")
         print(f'  python run_pipeline_queue.py --resume "{Path(manifest_path).parent}" --process-only')
+        print("[QUEUE] Or use the remote helper:")
+        print("  python remote_pipeline.py push")
+        print("  python remote_pipeline.py run")
         return 0
     process_jobs(manifest_path, manifest)
     return 0

@@ -228,6 +228,9 @@ experiment, and triangulate the results:
 python run_pipeline_queue.py
 ```
 
+For laptop setup plus GPU-box processing, use the split workflow in the next
+section. The plain single-machine command above still works unchanged.
+
 It asks once for the raw LEFT and RIGHT videos, then opens the Linux dual-video
 splitter using RIGHT as the cutting reference. Mark the clips in this order:
 
@@ -309,6 +312,97 @@ is recomputed instead of reusing stale files.
 The setup and objectwise scripts also accept `--corrections-json` for isolated
 correction files. Semi-auto setup accepts `--grid-cols` and `--grid-rows` to
 skip its grid-size prompts.
+
+## Split Setup and Remote Processing
+
+Use this workflow when the laptop has the raw videos and interactive display,
+but a remote GPU machine should run calibration compute, SAM2, and
+triangulation.
+
+One-time remote setup:
+
+1. Clone this repository on the GPU machine and create the Python environment
+   there using the Environment section above.
+2. On the laptop, run:
+
+```bash
+python remote_pipeline.py init
+```
+
+`init` writes `remote_config.json` with the SSH host, remote repository path,
+remote Python command, and optional SSH extra arguments. This file is local and
+git-ignored.
+
+If the raw videos live at different paths on the remote machine, create
+`machine_paths.json` in that machine's repository root:
+
+```json
+{"video_roots": ["/path/to/video/root"]}
+```
+
+The queue runner uses those roots to find matching videos by basename and
+portable video fingerprints. Check the connection and environment with:
+
+```bash
+python remote_pipeline.py doctor
+```
+
+Per-experiment cycle:
+
+1. On the laptop, run all interactive setup stages:
+
+```bash
+python run_pipeline_queue.py --setup-only
+```
+
+This opens the splitter, asks for velocity labels, confirms audio sync, and
+collects every SAM2 setup prompt. Heavy calibration stages do not run locally
+in this mode.
+
+2. Push the portable queue to the remote machine:
+
+```bash
+python remote_pipeline.py push
+```
+
+3. Start detached remote processing:
+
+```bash
+python remote_pipeline.py run
+```
+
+When `tmux` is available, the command starts a `pipeline_<queue-id>` session.
+Attach with the command printed by `run`, for example:
+
+```bash
+ssh -t <host> tmux attach -t pipeline_<queue-id>
+```
+
+The run survives SSH disconnects. If `tmux` is not installed, the helper uses a
+`nohup` fallback.
+
+4. Watch state and logs:
+
+```bash
+python remote_pipeline.py status
+python remote_pipeline.py logs -f
+```
+
+5. Pull results and the remote queue manifest back to the laptop:
+
+```bash
+python remote_pipeline.py pull
+```
+
+Queue directories are machine-portable: paths inside the queue are stored
+relative where possible, and source videos carry portable fingerprints. Pushes
+exclude SAM2/frame caches and unpack into the remote queue directory without
+deleting completed remote work. `--check-only` shows queue state on either
+machine:
+
+```bash
+python run_pipeline_queue.py --resume work/pipeline_queue/<queue-id> --check-only
+```
 
 ## Triangulation
 
