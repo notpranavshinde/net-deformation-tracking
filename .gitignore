@@ -31,6 +31,8 @@ raw videos/
 # GoPro/OpenGoPro local connection artifacts
 cohn_db.json
 machine_paths.json
+remote_config.json
+.remote-pipeline-*/
 
 # SAM/checkpoint/model weights
 *.pt
