@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Prepare multiple stereo runs interactively, then process them unattended."""
+"""Prepare portable stereo queue setup on one machine and processing on another."""
 
 import argparse
 import codecs
+import copy
 import csv
 import errno
 import hashlib
@@ -29,6 +30,9 @@ DEFAULT_SAM2_SCALE = 0.2
 SAM2_MODEL_ID = "facebook/sam2.1-hiera-large"
 QUEUE_SAM2_META = "queue_sam2_meta.json"
 QUEUE_TRIANGULATION_META = "queue_triangulation_meta.json"
+MACHINE_PATHS_FILE = REPO_ROOT / "machine_paths.json"
+QUEUE_PATH_PREFIX = "queue:"
+REPO_PATH_PREFIX = "repo:"
 
 
 def utc_now():
@@ -164,6 +168,132 @@ def stable_hash(payload) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
+def path_basename(value):
+    return re.split(r"[\\/]+", str(value).rstrip("\\/"))[-1]
+
+
+def rel_posix(path, base):
+    return Path(path).resolve().relative_to(Path(base).resolve()).as_posix()
+
+
+def path_is_absolute_string(value):
+    text = str(value)
+    return bool(re.match(r"^[A-Za-z]:[\\/]", text) or text.startswith(("/", "\\")))
+
+
+def resolve_relative_path(base, rel):
+    return (Path(base) / Path(*str(rel).split("/"))).resolve()
+
+
+def queue_rel_from_stored(value, queue_dir, queue_id=None):
+    text = str(value)
+    if text.startswith(QUEUE_PATH_PREFIX):
+        return text[len(QUEUE_PATH_PREFIX):].lstrip("/")
+    if not path_is_absolute_string(text):
+        return text.replace("\\", "/")
+    normalized = text.replace("\\", "/")
+    marker = f"/pipeline_queue/{queue_id}/" if queue_id else None
+    if marker and marker in normalized:
+        return normalized.split(marker, 1)[1]
+    if queue_id:
+        fallback = f"/{queue_id}/"
+        if fallback in normalized:
+            return normalized.split(fallback, 1)[1]
+    try:
+        return Path(text).resolve().relative_to(Path(queue_dir).resolve()).as_posix()
+    except Exception:
+        return None
+
+
+def resolve_queue_path(value, queue_dir, queue_id=None):
+    rel = queue_rel_from_stored(value, queue_dir, queue_id)
+    if rel is not None:
+        return resolve_relative_path(queue_dir, rel)
+    return Path(value).expanduser().resolve()
+
+
+def repo_rel_from_stored(value):
+    text = str(value)
+    if text.startswith(REPO_PATH_PREFIX):
+        return text[len(REPO_PATH_PREFIX):].lstrip("/")
+    if not path_is_absolute_string(text):
+        return text.replace("\\", "/")
+    normalized = text.replace("\\", "/")
+    marker = "/triangulation/results/"
+    if marker in normalized:
+        return "triangulation/results/" + normalized.split(marker, 1)[1]
+    try:
+        return Path(text).resolve().relative_to(REPO_ROOT).as_posix()
+    except Exception:
+        return None
+
+
+def resolve_repo_path(value):
+    rel = repo_rel_from_stored(value)
+    if rel is not None:
+        return resolve_relative_path(REPO_ROOT, rel)
+    return Path(value).expanduser().resolve()
+
+
+def relativize_queue_path(path, queue_dir):
+    return QUEUE_PATH_PREFIX + rel_posix(path, queue_dir)
+
+
+def relativize_repo_path(path):
+    return REPO_PATH_PREFIX + rel_posix(path, REPO_ROOT)
+
+
+def portable_file_signature(path, include_hash=False):
+    sig = file_signature(path, include_hash=include_hash)
+    portable = {
+        key: value
+        for key, value in sig.items()
+        if key not in {"path", "mtime_ns"}
+    }
+    portable["name"] = path_basename(path)
+    return portable
+
+
+def portable_video_signature(path):
+    sig = video_signature(path)
+    portable = {
+        key: value
+        for key, value in sig.items()
+        if key not in {"path", "mtime_ns"}
+    }
+    portable["name"] = path_basename(path)
+    return portable
+
+
+def signatures_match(recorded, current, require_video_meta=True):
+    if not isinstance(recorded, dict) or not isinstance(current, dict):
+        return False
+    recorded_name = path_basename(recorded.get("path") or recorded.get("name") or "")
+    current_name = path_basename(current.get("path") or current.get("name") or "")
+    if recorded_name and current_name and recorded_name != current_name:
+        return False
+    try:
+        if int(recorded.get("size_bytes", -1)) != int(current.get("size_bytes", -2)):
+            return False
+    except (TypeError, ValueError):
+        return False
+    if require_video_meta:
+        for key in ("frame_count", "width", "height"):
+            if key in recorded and int(recorded.get(key, -1)) >= 0:
+                try:
+                    if int(recorded.get(key)) != int(current.get(key, -2)):
+                        return False
+                except (TypeError, ValueError):
+                    return False
+        if "fps" in recorded and float(recorded.get("fps", -1.0)) > 0:
+            try:
+                if abs(float(recorded.get("fps")) - float(current.get("fps", -2.0))) > 1e-6:
+                    return False
+            except (TypeError, ValueError):
+                return False
+    return True
+
+
 def file_sha256(path):
     p = Path(path)
     h = hashlib.sha256()
@@ -228,9 +358,8 @@ def objectwise_video_signature(path):
         height = -1
         fps = -1.0
     return {
-        "path": str(p.resolve()),
         "size_bytes": int(stat.st_size),
-        "mtime_ns": int(stat.st_mtime_ns),
+        "name": path_basename(p),
         "frame_count": int(frame_count),
         "width": int(width),
         "height": int(height),
@@ -269,6 +398,57 @@ def same_path(a, b):
         return False
 
 
+def same_video(a, b, recorded_signature=None):
+    if recorded_signature is not None:
+        return signatures_match(recorded_signature, video_signature(b))
+    try:
+        left = a if isinstance(a, dict) else video_signature(a)
+        return signatures_match(left, video_signature(b))
+    except Exception:
+        return False
+
+
+def manifest_video_signature(manifest, path):
+    if not manifest:
+        return None
+    basename = path_basename(path)
+    for sig in manifest.get("source_videos", {}).values():
+        if isinstance(sig, dict) and path_basename(sig.get("path") or sig.get("name") or "") == basename:
+            return sig
+    return None
+
+
+def same_recorded_video(recorded_path, current_path, manifest=None):
+    if same_video(recorded_path, current_path):
+        return True
+    if path_basename(recorded_path) != path_basename(current_path):
+        return False
+    recorded_sig = manifest_video_signature(manifest, current_path)
+    if recorded_sig is None:
+        return Path(current_path).is_file()
+    return signatures_match(recorded_sig, video_signature(current_path))
+
+
+def same_points_json(recorded, expected, setup_dir):
+    if not recorded:
+        return False
+    recorded_name = path_basename(recorded)
+    expected_path = Path(expected)
+    if recorded_name != expected_path.name:
+        return False
+    try:
+        recorded_path = Path(recorded).expanduser()
+        if recorded_path.is_absolute():
+            if same_path(recorded_path, expected_path):
+                return True
+            recorded_parts = Path(str(recorded).replace("\\", "/")).parts
+            expected_parts = expected_path.parts
+            return len(recorded_parts) >= 2 and recorded_parts[-2:] == expected_parts[-2:]
+        return same_path(Path(setup_dir) / recorded_path, expected_path)
+    except Exception:
+        return recorded_name == expected_path.name
+
+
 def count_csv_rows(path):
     p = Path(path)
     if not p.is_file():
@@ -300,9 +480,225 @@ def track_grid_is_complete(path, frame_count, object_ids):
     return len(seen) == expected_rows
 
 
+def resolve_manifest_paths(manifest_path, manifest):
+    queue_dir = Path(manifest_path).parent.resolve()
+    queue_id = manifest.get("queue_id")
+    preprocessing = manifest.get("preprocessing", {})
+    splitter = preprocessing.get("splitter", {})
+    for key in ("output_root", "manifest"):
+        if key in splitter:
+            splitter[key] = str(resolve_queue_path(splitter[key], queue_dir, queue_id))
+    calibration = preprocessing.get("calibration", {})
+    for key in ("work_dir", "sync_json", "stats_dir", "mono_npz", "stereo_npz"):
+        if key in calibration:
+            if calibration.get("mode") == "generated":
+                calibration[key] = str(resolve_queue_path(calibration[key], queue_dir, queue_id))
+            elif str(calibration[key]).startswith(REPO_PATH_PREFIX):
+                calibration[key] = str(resolve_repo_path(calibration[key]))
+            else:
+                calibration[key] = str(Path(calibration[key]).expanduser().resolve())
+    for job in manifest.get("jobs", []):
+        for key in ("run_dir", "setup_dir", "setup_json", "corrections_json", "sam2_out", "logs_dir"):
+            if key in job:
+                job[key] = str(resolve_queue_path(job[key], queue_dir, queue_id))
+        if "result_dir" in job:
+            job["result_dir"] = str(resolve_repo_path(job["result_dir"]))
+
+
+def manifest_for_save(manifest_path, manifest):
+    payload = copy.deepcopy(manifest)
+    queue_dir = Path(manifest_path).parent.resolve()
+    preprocessing = payload.get("preprocessing", {})
+    splitter = preprocessing.get("splitter", {})
+    for key in ("output_root", "manifest"):
+        if key in splitter:
+            splitter[key] = relativize_queue_path(splitter[key], queue_dir)
+    calibration = preprocessing.get("calibration", {})
+    for key in ("work_dir", "sync_json", "stats_dir", "mono_npz", "stereo_npz"):
+        if key in calibration:
+            if calibration.get("mode") == "generated":
+                calibration[key] = relativize_queue_path(calibration[key], queue_dir)
+            else:
+                try:
+                    calibration[key] = relativize_repo_path(calibration[key])
+                except Exception:
+                    pass
+    for job in payload.get("jobs", []):
+        for key in ("run_dir", "setup_dir", "setup_json", "corrections_json", "sam2_out", "logs_dir"):
+            if key in job:
+                job[key] = relativize_queue_path(job[key], queue_dir)
+        if "result_dir" in job:
+            job["result_dir"] = relativize_repo_path(job["result_dir"])
+    return payload
+
+
 def save_manifest(manifest_path, manifest):
     manifest["updated_at"] = utc_now()
-    atomic_write_json(manifest_path, manifest)
+    atomic_write_json(manifest_path, manifest_for_save(manifest_path, manifest))
+
+
+def read_machine_video_roots():
+    if not MACHINE_PATHS_FILE.is_file():
+        return []
+    try:
+        payload = read_json(MACHINE_PATHS_FILE)
+    except Exception:
+        return []
+    roots = []
+    for value in payload.get("video_roots", []):
+        path = Path(value).expanduser()
+        if path.is_dir():
+            roots.append(path.resolve())
+    return roots
+
+
+def find_video_by_signature(recorded):
+    basename = path_basename(recorded.get("path") or recorded.get("name") or "")
+    if not basename:
+        return None
+    matches = []
+    for root in read_machine_video_roots():
+        try:
+            candidates = root.rglob(basename)
+        except OSError:
+            continue
+        for candidate in candidates:
+            if candidate.is_file() and signatures_match(recorded, video_signature(candidate)):
+                matches.append(candidate.resolve())
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        raise RuntimeError(
+            f"Multiple files under machine_paths.json video_roots match {basename}: "
+            + ", ".join(str(path) for path in matches[:5])
+        )
+    return None
+
+
+def collect_recorded_video_signatures(manifest, split_payload=None):
+    signatures = {}
+    for sig in manifest.get("source_videos", {}).values():
+        if isinstance(sig, dict):
+            key = sig.get("path") or sig.get("name")
+            if key:
+                signatures[path_basename(key)] = sig
+    preprocessing = manifest.get("preprocessing", {})
+    for key in ("raw_left", "raw_right"):
+        path = preprocessing.get(key)
+        if path and Path(path).is_file():
+            signatures[path_basename(path)] = video_signature(path)
+    if split_payload:
+        for key in ("left_source", "right_source"):
+            sig = split_payload.get(key)
+            if isinstance(sig, dict):
+                signatures[path_basename(sig.get("path") or sig.get("name") or "")] = sig
+    return signatures
+
+
+def resolve_source_value(value, signatures, missing):
+    path = Path(str(value)).expanduser()
+    if path.is_file():
+        return str(path.resolve()), False
+    recorded = signatures.get(path_basename(value))
+    if not recorded:
+        missing.append(str(value))
+        return str(value), False
+    resolved = find_video_by_signature(recorded)
+    if resolved is None:
+        missing.append(str(value))
+        return str(value), False
+    return str(resolved), True
+
+
+def load_split_payload(manifest):
+    splitter = manifest.get("preprocessing", {}).get("splitter", {})
+    path = Path(splitter.get("manifest", ""))
+    if not path.is_file():
+        return None
+    payload = read_json(path)
+    queue_dir = path.parent.parent
+    queue_id = manifest.get("queue_id")
+    if "output_root" in payload:
+        payload["output_root"] = str(resolve_queue_path(payload["output_root"], queue_dir, queue_id))
+    return payload
+
+
+def save_split_payload(manifest, payload):
+    splitter = manifest.get("preprocessing", {}).get("splitter", {})
+    path = Path(splitter.get("manifest", ""))
+    if path.is_file() or path.parent.exists():
+        payload_for_save = copy.deepcopy(payload)
+        if "output_root" in payload_for_save:
+            payload_for_save["output_root"] = relativize_queue_path(
+                payload_for_save["output_root"],
+                path.parent.parent,
+            )
+        atomic_write_json(path, payload_for_save)
+
+
+def resolve_source_videos(manifest_path, manifest):
+    changed = False
+    missing = []
+    split_payload = load_split_payload(manifest)
+    signatures = collect_recorded_video_signatures(manifest, split_payload)
+    preprocessing = manifest.get("preprocessing", {})
+    for key in ("raw_left", "raw_right"):
+        if key in preprocessing:
+            resolved, did_change = resolve_source_value(preprocessing[key], signatures, missing)
+            preprocessing[key] = resolved
+            changed = changed or did_change
+    calibration = preprocessing.get("calibration", {})
+    for key in ("left_video", "right_video"):
+        if key in calibration:
+            resolved, did_change = resolve_source_value(calibration[key], signatures, missing)
+            calibration[key] = resolved
+            changed = changed or did_change
+    for job in manifest.get("jobs", []):
+        for key in ("left_video", "right_video"):
+            if key in job:
+                resolved, did_change = resolve_source_value(job[key], signatures, missing)
+                job[key] = resolved
+                changed = changed or did_change
+    if split_payload:
+        split_changed = False
+        for key in ("left_source", "right_source"):
+            sig = split_payload.get(key)
+            if isinstance(sig, dict):
+                resolved, did_change = resolve_source_value(sig.get("path", ""), signatures, missing)
+                if did_change:
+                    sig["path"] = resolved
+                    split_changed = True
+        for clip in split_payload.get("clips", []):
+            for key in ("left_video", "right_video"):
+                if key in clip:
+                    resolved, did_change = resolve_source_value(clip[key], signatures, missing)
+                    clip[key] = resolved
+                    split_changed = split_changed or did_change
+        if split_changed:
+            split_payload["updated_at"] = utc_now()
+            save_split_payload(manifest, split_payload)
+            changed = True
+    if missing:
+        unique = sorted(set(missing))
+        raise FileNotFoundError(
+            "Could not resolve source video(s):\n  "
+            + "\n  ".join(unique)
+            + f"\nAdd local search roots to {MACHINE_PATHS_FILE} as "
+            '{"video_roots": ["/data/videos", "..."]}.'
+        )
+    current_sources = {}
+    for label, path in (
+        ("raw_left", preprocessing.get("raw_left")),
+        ("raw_right", preprocessing.get("raw_right")),
+    ):
+        if path and Path(path).is_file():
+            current_sources[label] = video_signature(path)
+    if current_sources and manifest.get("source_videos") != current_sources:
+        manifest["source_videos"] = current_sources
+        changed = True
+    if changed:
+        save_manifest(manifest_path, manifest)
+    return changed
 
 
 def run_logged(command, cwd, log_path, use_pty=True):
@@ -401,11 +797,11 @@ def setup_complete(job, manifest=None):
         setup_meta = read_json(setup_manifest)
     except Exception:
         return False
-    if not same_path(setup_meta.get("left_input"), job["left_video"]):
+    if not same_recorded_video(setup_meta.get("left_input"), job["left_video"], manifest):
         return False
-    if not same_path(setup_meta.get("right_input"), job["right_video"]):
+    if not same_recorded_video(setup_meta.get("right_input"), job["right_video"], manifest):
         return False
-    if not same_path(setup_meta.get("points_json"), setup_json):
+    if not same_points_json(setup_meta.get("points_json"), setup_json, job["setup_dir"]):
         return False
 
     left_points = points_payload.get("left")
@@ -552,15 +948,15 @@ def batch_fingerprint(side_name, batch_ids, setup_side, manifest, corrections):
 
 def sam2_stage_fingerprint(job, manifest):
     return stable_hash({
-        "version": 2,
+        "version": 3,
         "stage": "sam2",
         "frame_cache_image_format": "jpg",
         "setup_mode": manifest.get("setup_mode", "grid"),
-        "left_video": video_signature(job["left_video"]),
-        "right_video": video_signature(job["right_video"]),
+        "left_video": portable_video_signature(job["left_video"]),
+        "right_video": portable_video_signature(job["right_video"]),
         "frame_range": frame_range_signature(job["start_frame"], job["end_frame"]),
-        "setup_json": file_signature(job["setup_json"], include_hash=True),
-        "corrections_json": file_signature(job["corrections_json"], include_hash=True),
+        "setup_json": portable_file_signature(job["setup_json"], include_hash=True),
+        "corrections_json": portable_file_signature(job["corrections_json"], include_hash=True),
         "settings": {
             "scale": float(manifest["settings"]["scale"]),
             "gpu_mode": manifest["settings"]["gpu_mode"],
@@ -607,7 +1003,7 @@ def validate_sam2_side(job, manifest, side_name, root_summary, setup, correction
         return False
     if not frame_range_meta_matches(frame_meta.get("frame_range"), expected_range):
         return False
-    if not same_path(frame_meta.get("video", {}).get("path"), job[f"{side_name}_video"]):
+    if not same_video(frame_meta.get("video", {}), job[f"{side_name}_video"]):
         return False
     if abs(float(frame_meta.get("scale", -1.0)) - float(manifest["settings"]["scale"])) > 1e-9:
         return False
@@ -698,6 +1094,18 @@ def sam2_complete(job, manifest=None):
     return True
 
 
+def sam2_complete_readonly(job, manifest=None):
+    if manifest is None or not sam2_outputs_valid(job, manifest):
+        return False
+    meta_path = Path(job["sam2_out"]) / QUEUE_SAM2_META
+    if not meta_path.is_file():
+        return False
+    try:
+        return read_json(meta_path).get("fingerprint") == sam2_stage_fingerprint(job, manifest)
+    except Exception:
+        return False
+
+
 def write_sam2_queue_meta(job, manifest):
     payload = {
         "version": 1,
@@ -723,17 +1131,16 @@ def triangulation_data_fingerprint(job, manifest):
     return stable_hash({
         "version": 1,
         "stage": "triangulation-data",
-        "left_tracks": file_signature(sam2_out / "left" / "tracks_2d.csv", include_hash=True),
-        "right_tracks": file_signature(sam2_out / "right" / "tracks_2d.csv", include_hash=True),
-        "left_video": video_signature(job["left_video"]),
-        "right_video": video_signature(job["right_video"]),
+        "left_tracks": portable_file_signature(sam2_out / "left" / "tracks_2d.csv", include_hash=True),
+        "right_tracks": portable_file_signature(sam2_out / "right" / "tracks_2d.csv", include_hash=True),
+        "left_video": portable_video_signature(job["left_video"]),
+        "right_video": portable_video_signature(job["right_video"]),
         "frame_range": frame_range_signature(job["start_frame"], job["end_frame"]),
-        "stereo": file_signature(stereo_npz, include_hash=True),
-        "sync_json": file_signature(sync_json, include_hash=True),
+        "stereo": portable_file_signature(stereo_npz, include_hash=True),
+        "sync_json": portable_file_signature(sync_json, include_hash=True),
         "quality_min": 0.0,
         "max_reproj": 20.0,
         "sync_mode": "default",
-        "sync_json_arg": str(sync_json),
     })
 
 
@@ -838,8 +1245,9 @@ def _new_job(
     }
 
 
-def migrate_manifest(manifest):
+def migrate_manifest(manifest, manifest_path=None, refresh_fingerprints=True):
     changed = False
+    was_pre_v3 = int(manifest.get("version", 1)) < 3
     settings = manifest.setdefault("settings", {})
     if "scale" not in settings:
         settings["scale"] = DEFAULT_SAM2_SCALE
@@ -860,8 +1268,8 @@ def migrate_manifest(manifest):
             },
         }
         changed = True
-    if int(manifest.get("version", 1)) < 2:
-        manifest["version"] = 2
+    if was_pre_v3:
+        manifest["version"] = 3
         changed = True
     for job in manifest.get("jobs", []):
         if "start_frame" not in job or "end_frame" not in job:
@@ -872,6 +1280,98 @@ def migrate_manifest(manifest):
             job["start_frame"] = 0
             job["end_frame"] = min(count for count in counts if count > 0)
             changed = True
+    source_videos = manifest.setdefault("source_videos", {})
+    preprocessing = manifest.get("preprocessing", {})
+    for label, key in (("raw_left", "raw_left"), ("raw_right", "raw_right")):
+        path = preprocessing.get(key)
+        if path and Path(path).is_file():
+            sig = video_signature(path)
+            if source_videos.get(label) != sig:
+                source_videos[label] = sig
+                changed = True
+    if refresh_fingerprints and was_pre_v3 and refresh_complete_fingerprints(manifest):
+        changed = True
+    return changed
+
+
+def refresh_sam2_batch_fingerprints(job, manifest):
+    if not Path(job["setup_json"]).is_file():
+        return False
+    try:
+        setup = load_setup_payload(job)
+        corrections = load_corrections_payload(job)
+    except Exception:
+        return False
+    changed = False
+    expected_ids = expected_object_ids(manifest, job)
+    if not expected_ids:
+        return False
+    expected_batches = chunk_ids(expected_ids, int(manifest["settings"]["batch_size"]))
+    for side_name in ("left", "right"):
+        side_out = Path(job["sam2_out"]) / side_name / "objectwise"
+        for batch_ids in expected_batches:
+            batch_name = f"batch_{batch_ids[0]:03d}_{batch_ids[-1]:03d}"
+            meta_path = side_out / batch_name / "batch_meta.json"
+            if not meta_path.is_file():
+                continue
+            try:
+                meta = read_json(meta_path)
+            except Exception:
+                continue
+            expected = batch_fingerprint(side_name, batch_ids, setup[side_name], manifest, corrections)
+            if meta.get("fingerprint") != expected:
+                meta["fingerprint"] = expected
+                meta["fingerprint_version"] = 2
+                atomic_write_json(meta_path, meta)
+                changed = True
+    return changed
+
+
+def refresh_complete_fingerprints(manifest):
+    changed = False
+    calibration = manifest.get("preprocessing", {}).get("calibration", {})
+    if calibration.get("mode") == "generated":
+        for stage_name in ("sync", "stats", "mono", "stereo"):
+            stage = calibration.get("stages", {}).get(stage_name, {})
+            outputs = calibration_stage_outputs(calibration, stage_name)
+            if stage.get("status") == "complete" and all(
+                path.is_file() and path.stat().st_size > 0 for path in outputs
+            ):
+                expected = calibration_stage_fingerprint(manifest, stage_name)
+                if stage.get("fingerprint") != expected:
+                    stage["fingerprint"] = expected
+                    changed = True
+    for job in manifest.get("jobs", []):
+        if refresh_sam2_batch_fingerprints(job, manifest):
+            changed = True
+        if sam2_outputs_valid(job, manifest):
+            meta_path = Path(job["sam2_out"]) / QUEUE_SAM2_META
+            expected = sam2_stage_fingerprint(job, manifest)
+            old = read_json(meta_path).get("fingerprint") if meta_path.is_file() else None
+            if old != expected:
+                write_sam2_queue_meta(job, manifest)
+                changed = True
+            stage = job.get("stages", {}).get("sam2", {})
+            if stage.get("status") == "complete" and stage.get("fingerprint") != expected:
+                stage["fingerprint"] = expected
+                changed = True
+        result_dir = Path(job.get("result_dir", ""))
+        expected_outputs = [
+            result_dir / "triangulated_3d.csv",
+            result_dir / "summary.json",
+            *visualization_outputs(result_dir),
+        ]
+        if all(path.is_file() and path.stat().st_size > 0 for path in expected_outputs):
+            meta_path = result_dir / QUEUE_TRIANGULATION_META
+            data_fp = triangulation_data_fingerprint(job, manifest)
+            full_fp = triangulation_full_fingerprint(job, manifest)
+            try:
+                meta = read_json(meta_path) if meta_path.is_file() else {}
+            except Exception:
+                meta = {}
+            if meta.get("data_fingerprint") != data_fp or meta.get("full_fingerprint") != full_fp:
+                write_triangulation_queue_meta(job, manifest)
+                changed = True
     return changed
 
 
@@ -918,12 +1418,11 @@ def splitter_complete(manifest):
     if preprocessing.get("mode") == "legacy_existing_clips":
         return True
     splitter = preprocessing.get("splitter", {})
-    path = Path(splitter.get("manifest", ""))
-    if not path.is_file():
-        return False
     try:
-        payload = read_json(path)
+        payload = load_split_payload(manifest)
     except Exception:
+        return False
+    if not payload:
         return False
     if payload.get("status") != "complete":
         return False
@@ -934,12 +1433,7 @@ def splitter_complete(manifest):
     for side in ("left", "right"):
         source_path = preprocessing.get(f"raw_{side}")
         recorded = payload.get(f"{side}_source", {})
-        current = file_signature(source_path)
-        if (
-            not same_path(recorded.get("path"), source_path)
-            or int(recorded.get("size_bytes", -1)) != int(current.get("size_bytes", -2))
-            or int(recorded.get("mtime_ns", -1)) != int(current.get("mtime_ns", -2))
-        ):
+        if not same_video(recorded, source_path):
             return False
     clips = payload.get("clips", [])
     indices = [int(clip.get("index", -1)) for clip in clips]
@@ -995,7 +1489,9 @@ def ensure_jobs_from_split(manifest_path, manifest):
     preprocessing = manifest["preprocessing"]
     if preprocessing.get("mode") == "legacy_existing_clips":
         return True
-    split_payload = read_json(preprocessing["splitter"]["manifest"])
+    split_payload = load_split_payload(manifest)
+    if not split_payload:
+        raise RuntimeError("Split manifest is missing or unreadable.")
     clips = sorted(split_payload.get("clips", []), key=lambda clip: int(clip["index"]))
     if [int(clip["index"]) for clip in clips] != list(range(1, len(clips) + 1)):
         raise RuntimeError("Split manifest clip indices are not contiguous from 1.")
@@ -1018,7 +1514,7 @@ def ensure_jobs_from_split(manifest_path, manifest):
         raise RuntimeError("Split clip count is smaller than the labeled queue job count.")
     if existing_jobs:
         for job, clip in zip(existing_jobs, experiment_clips):
-            if not same_path(job["left_video"], clip["left_video"]) or not same_path(
+            if not same_video(job["left_video"], clip["left_video"]) or not same_video(
                 job["right_video"], clip["right_video"]
             ):
                 raise RuntimeError("Split clip paths changed after queue jobs were labeled.")
@@ -1093,7 +1589,7 @@ def create_manifest(args):
     split_dir = queue_dir / "split"
     calibration_dir = queue_dir / "calibration"
     manifest = {
-        "version": 2,
+        "version": 3,
         "queue_id": queue_id,
         "created_at": utc_now(),
         "updated_at": utc_now(),
@@ -1137,6 +1633,10 @@ def create_manifest(args):
                 },
             },
         },
+        "source_videos": {
+            "raw_left": video_signature(left_video),
+            "raw_right": video_signature(right_video),
+        },
         "settings": {
             "scale": float(args.sam2_scale if args.sam2_scale is not None else DEFAULT_SAM2_SCALE),
             "gpu_mode": "dual",
@@ -1159,7 +1659,9 @@ def load_manifest(path_value):
         path = path / "queue_manifest.json"
     if not path.is_file():
         raise FileNotFoundError(f"Queue manifest not found: {path}")
-    return path, json.loads(path.read_text())
+    manifest = json.loads(path.read_text())
+    resolve_manifest_paths(path, manifest)
+    return path, manifest
 
 
 def calibration_paths(manifest):
@@ -1187,8 +1689,8 @@ def calibration_stage_fingerprint(manifest, stage_name):
     payload = {
         "version": 1,
         "stage": stage_name,
-        "left_video": video_signature(calibration["left_video"]),
-        "right_video": video_signature(calibration["right_video"]),
+        "left_video": portable_video_signature(calibration["left_video"]),
+        "right_video": portable_video_signature(calibration["right_video"]),
         "frame_range": frame_range_signature(
             calibration["start_frame"], calibration["end_frame"]
         ),
@@ -1203,7 +1705,7 @@ def calibration_stage_fingerprint(manifest, stage_name):
     }[stage_name]
     payload["dependencies"] = {
         dependency: [
-            file_signature(path, include_hash=True)
+            portable_file_signature(path, include_hash=True)
             for path in calibration_stage_outputs(calibration, dependency)
         ]
         for dependency in dependencies
@@ -1296,8 +1798,9 @@ def calibration_command(calibration, stage_name):
     return command
 
 
-def prepare_calibration(manifest_path, manifest):
+def prepare_calibration(manifest_path, manifest, stage_names=None):
     calibration = manifest["preprocessing"]["calibration"]
+    stage_names = tuple(stage_names or ("sync", "stats", "mono", "stereo"))
     if calibration.get("mode") == "existing":
         if not calibration_complete(manifest):
             sync_json, stereo_npz = calibration_paths(manifest)
@@ -1307,9 +1810,9 @@ def prepare_calibration(manifest_path, manifest):
         print("[SKIP][CALIBRATION] Using calibration files recorded by this legacy queue.")
         return True
 
-    print("\n[CALIBRATION] Clip pair 1: sync -> stats -> mono -> stereo")
+    print("\n[CALIBRATION] Clip pair 1: " + " -> ".join(stage_names))
     logs_dir = Path(calibration["work_dir"]) / "logs"
-    for stage_name in ("sync", "stats", "mono", "stereo"):
+    for stage_name in stage_names:
         stage = calibration["stages"][stage_name]
         if calibration_stage_complete(manifest, stage_name):
             print(f"[SKIP][CALIBRATION:{stage_name.upper()}] Already complete.")
@@ -1340,7 +1843,7 @@ def prepare_calibration(manifest_path, manifest):
         })
         save_manifest(manifest_path, manifest)
         return False
-    return calibration_complete(manifest)
+    return all(calibration_stage_complete(manifest, stage_name) for stage_name in stage_names)
 
 
 def prepare_setups(manifest_path, manifest):
@@ -1548,6 +2051,95 @@ def process_jobs(manifest_path, manifest):
     print(f"[QUEUE] Manifest: {manifest_path}")
 
 
+def process_only_missing(manifest_path, manifest):
+    missing = []
+    setup_command = f'python run_pipeline_queue.py --resume "{Path(manifest_path).parent}" --setup-only'
+    preprocessing = manifest.get("preprocessing", {})
+    if not splitter_complete(manifest):
+        missing.append("splitter GUI virtual ranges are incomplete")
+    try:
+        split_payload = load_split_payload(manifest)
+        expected_jobs = max(0, len(split_payload.get("clips", [])) - 1) if split_payload else 0
+    except Exception:
+        expected_jobs = 0
+    jobs = manifest.get("jobs", [])
+    if not jobs or (expected_jobs and len(jobs) < expected_jobs):
+        missing.append(
+            f"job creation/velocity labels are incomplete ({len(jobs)}/{expected_jobs or '?'} jobs labeled)"
+        )
+    calibration = preprocessing.get("calibration", {})
+    if calibration.get("mode") == "generated" and not calibration_stage_complete(manifest, "sync"):
+        missing.append("calibration sync/audio-offset confirmation is incomplete")
+    elif calibration.get("mode") == "existing":
+        sync_json, _ = calibration_paths(manifest)
+        if not sync_json.is_file():
+            missing.append(f"existing calibration sync JSON is missing: {sync_json}")
+    if manifest.get("setup_mode", "grid") == "sectioned" and not manifest.get("section_layout"):
+        missing.append("section layout is missing")
+    for job in jobs:
+        if not setup_complete(job, manifest):
+            missing.append(f"setup is incomplete for job {job.get('index')}: {job.get('velocity')}")
+    return missing, setup_command
+
+
+def validate_process_only(manifest_path, manifest):
+    missing, setup_command = process_only_missing(manifest_path, manifest)
+    if not missing:
+        return True
+    print("[PROCESS-ONLY] Interactive setup is incomplete; refusing to run unattended processing.")
+    print("[PROCESS-ONLY] Missing:")
+    for item in missing:
+        print(f"  - {item}")
+    print("[PROCESS-ONLY] Run this on the setup machine:")
+    print(f"  {setup_command}")
+    return False
+
+
+def stage_label(status):
+    if status is True:
+        return "complete"
+    if status is False:
+        return "pending"
+    return str(status)
+
+
+def print_check_status(manifest_path, manifest):
+    rows = []
+    rows.append(("split", stage_label(splitter_complete(manifest))))
+    missing, _ = process_only_missing(manifest_path, manifest)
+    rows.append(("process-ready", "complete" if not missing else "pending"))
+    calibration = manifest.get("preprocessing", {}).get("calibration", {})
+    if calibration.get("mode") == "generated":
+        for stage_name in ("sync", "stats", "mono", "stereo"):
+            stage = calibration.get("stages", {}).get(stage_name, {})
+            status = "failed" if stage.get("status") == "failed" else stage_label(
+                calibration_stage_complete(manifest, stage_name)
+            )
+            rows.append((f"calibration:{stage_name}", status))
+    else:
+        rows.append(("calibration:existing", stage_label(calibration_complete(manifest))))
+    if manifest.get("setup_mode", "grid") == "sectioned":
+        rows.append(("section-layout", "complete" if manifest.get("section_layout") else "pending"))
+    for job in manifest.get("jobs", []):
+        prefix = f"job {job.get('index')} {job.get('velocity')}"
+        rows.append((f"{prefix}:setup", stage_label(setup_complete(job, manifest))))
+        rows.append((f"{prefix}:sam2", stage_label(sam2_complete_readonly(job, manifest))))
+        rows.append((f"{prefix}:triangulation", stage_label(triangulation_complete(job, manifest))))
+    width = max(len(name) for name, _ in rows) if rows else 5
+    print(f"[CHECK] Queue: {Path(manifest_path).parent}")
+    print("[CHECK] Stage".ljust(width + 10) + "Status")
+    for name, status in rows:
+        print(f"[CHECK] {name.ljust(width)}  {status}")
+    failed = [name for name, status in rows if status == "failed"]
+    if missing:
+        print("[CHECK] Process-only missing:")
+        for item in missing:
+            print(f"  - {item}")
+    if failed:
+        print("[CHECK] Failed stages: " + ", ".join(failed))
+    return not failed
+
+
 def parse_args():
     parser = argparse.ArgumentParser(
         description=(
@@ -1559,6 +2151,22 @@ def parse_args():
         "--resume",
         default=None,
         help="Resume an existing queue_manifest.json or its containing directory.",
+    )
+    phase = parser.add_mutually_exclusive_group()
+    phase.add_argument(
+        "--setup-only",
+        action="store_true",
+        help="Run only interactive setup stages, then print the processing handoff.",
+    )
+    phase.add_argument(
+        "--process-only",
+        action="store_true",
+        help="Run only non-interactive calibration compute, SAM2, and triangulation.",
+    )
+    phase.add_argument(
+        "--check-only",
+        action="store_true",
+        help="Validate queue paths and stage state without opening GUIs or prompts.",
     )
     parser.add_argument(
         "--sam2-scale",
@@ -1578,29 +2186,69 @@ def parse_args():
     return parser.parse_args()
 
 
+def load_existing_queue(args):
+    manifest_path, manifest = load_manifest(args.resume)
+    changed = resolve_source_videos(manifest_path, manifest)
+    changed = migrate_manifest(
+        manifest,
+        manifest_path,
+        refresh_fingerprints=not args.check_only,
+    ) or changed
+    if not args.check_only:
+        changed = apply_cli_overrides(manifest, args) or changed
+    if changed:
+        save_manifest(manifest_path, manifest)
+    return manifest_path, manifest
+
+
 def main():
     args = parse_args()
+    if (args.process_only or args.check_only) and not args.resume:
+        print("[QUEUE] --process-only and --check-only require --resume.")
+        return 2
     if args.resume:
-        manifest_path, manifest = load_manifest(args.resume)
-        changed = migrate_manifest(manifest)
-        changed = apply_cli_overrides(manifest, args) or changed
-        if changed:
-            save_manifest(manifest_path, manifest)
+        try:
+            manifest_path, manifest = load_existing_queue(args)
+        except (FileNotFoundError, RuntimeError) as exc:
+            print(f"[QUEUE] {exc}")
+            return 1
         print(f"[QUEUE] Resuming: {manifest_path}")
     else:
         manifest_path, manifest = create_manifest(args)
     print_queue_settings(manifest)
+    if args.check_only:
+        return 0 if print_check_status(manifest_path, manifest) else 1
+    if args.process_only:
+        if not validate_process_only(manifest_path, manifest):
+            return 1
+        if bool(manifest.setdefault("settings", {}).get("preview", False)):
+            print("[PROCESS-ONLY] Disabling SAM2 preview for non-interactive processing.")
+            manifest["settings"]["preview"] = False
+            save_manifest(manifest_path, manifest)
+        if not prepare_calibration(manifest_path, manifest, ("stats", "mono", "stereo")):
+            print("[QUEUE] Calibration compute is incomplete. Resume this manifest to try again.")
+            return 1
+        process_jobs(manifest_path, manifest)
+        return 0
     if not prepare_splitter(manifest_path, manifest):
         print("[QUEUE] Splitter is incomplete. Resume this manifest to try again.")
-        return
+        return 1
     ensure_jobs_from_split(manifest_path, manifest)
-    if not prepare_calibration(manifest_path, manifest):
+    calibration_stages = ("sync",) if args.setup_only else ("sync", "stats", "mono", "stereo")
+    if not prepare_calibration(manifest_path, manifest, calibration_stages):
         print("[QUEUE] Calibration is incomplete. Resume this manifest to try again.")
-        return
+        return 1
     ensure_section_layout(manifest_path, manifest)
     prepare_setups(manifest_path, manifest)
+    if args.setup_only:
+        print("\n[QUEUE] Interactive setup is complete.")
+        print(f"[QUEUE] Queue dir: {Path(manifest_path).parent}")
+        print("[QUEUE] Copy this queue directory to the processing machine and run:")
+        print(f'  python run_pipeline_queue.py --resume "{Path(manifest_path).parent}" --process-only')
+        return 0
     process_jobs(manifest_path, manifest)
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

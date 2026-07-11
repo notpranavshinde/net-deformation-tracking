@@ -115,9 +115,8 @@ def video_signature(video_path):
     fps = float(cap.get(sam2run.cv2.CAP_PROP_FPS)) if cap.isOpened() else -1.0
     cap.release()
     return {
-        "path": str(path.resolve()),
+        "name": path.name,
         "size_bytes": int(stat.st_size),
-        "mtime_ns": int(stat.st_mtime_ns),
         "frame_count": int(frame_count),
         "width": int(width),
         "height": int(height),

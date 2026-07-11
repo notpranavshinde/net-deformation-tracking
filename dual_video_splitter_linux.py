@@ -26,10 +26,29 @@ def _utc_now():
 def _file_signature(path):
     resolved = Path(path).expanduser().resolve()
     stat = resolved.stat()
-    return {
+    sig = {
         "path": str(resolved),
         "size_bytes": int(stat.st_size),
         "mtime_ns": int(stat.st_mtime_ns),
+    }
+    try:
+        cap = cv2.VideoCapture(str(resolved))
+        sig.update({
+            "frame_count": int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) if cap.isOpened() else -1,
+            "width": int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) if cap.isOpened() else -1,
+            "height": int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) if cap.isOpened() else -1,
+            "fps": float(cap.get(cv2.CAP_PROP_FPS)) if cap.isOpened() else -1.0,
+        })
+        cap.release()
+    except Exception:
+        sig.update({"frame_count": -1, "width": -1, "height": -1, "fps": -1.0})
+    return sig
+
+
+def _portable_signature(sig):
+    return {
+        key: value for key, value in sig.items()
+        if key not in {"path", "mtime_ns"}
     }
 
 
@@ -509,8 +528,10 @@ def _manifest_matches_sources(payload, left_video, right_video, output_root):
     try:
         return (
             payload.get("version") == 1
-            and payload.get("left_source") == _file_signature(left_video)
-            and payload.get("right_source") == _file_signature(right_video)
+            and _portable_signature(payload.get("left_source", {}))
+            == _portable_signature(_file_signature(left_video))
+            and _portable_signature(payload.get("right_source", {}))
+            == _portable_signature(_file_signature(right_video))
             and Path(payload.get("output_root", "")).resolve()
             == Path(output_root).resolve()
         )
@@ -566,7 +587,7 @@ def parse_args():
 
 def main():
     args = parse_args()
-    if shutil.which("ffmpeg") is None:
+    if not args.select_only and shutil.which("ffmpeg") is None:
         print("Error: ffmpeg not found in PATH.")
         print("Install FFmpeg and make sure 'ffmpeg' works in your terminal.")
         return 2
