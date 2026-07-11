@@ -1657,49 +1657,64 @@ def collect_stereo_pairs_parallel(args, paired_indices: List[Tuple[int, int]], p
     pair_list = [(int(a), int(b)) for a, b in paired_indices]
     if args.max_scan > 0:
         pair_list = pair_list[:int(args.max_scan)]
-    if progress_queue is not None:
-        progress_queue.put(("total", len(pair_list)))
+    target_pairs = int(args.max_pairs)
     if pbar is not None:
-        pbar.write(f"[STEREO] detecting {len(pair_list)} reused stats pairs with {workers} workers")
+        pbar.write(
+            f"[STEREO] detecting up to {len(pair_list)} reused stats pairs "
+            f"with {workers} workers (target={target_pairs})"
+        )
 
     usedL = []
     usedR = []
     scanned = 0
     with ProcessPoolExecutor(max_workers=max(1, int(workers))) as executor:
-        futures = []
-        for chunk in chunk_indices(pair_list, workers):
-            futures.append(executor.submit(collect_stereo_pair_chunk_worker, {
-                "left_video": args.left,
-                "right_video": args.right,
-                "pair_list": chunk,
-                "pattern": pattern,
-                "square_m": square_m,
-                "scale": args.scale,
-                "debug_every": args.debug_every,
-                "out_dir": out_dir,
-                "progress_queue": progress_queue,
-            }))
+        start = 0
+        while start < len(pair_list) and len(usedL) < target_pairs:
+            remaining_pairs = target_pairs - len(usedL)
+            batch_size = min(remaining_pairs, len(pair_list) - start)
+            batch = pair_list[start:start + batch_size]
+            start += batch_size
 
-        pending = set(futures)
-        while pending:
-            done = [future for future in pending if future.done()]
-            if not done:
+            if progress_queue is not None:
+                progress_queue.put(("total", len(batch)))
+
+            futures = []
+            for chunk in chunk_indices(batch, workers):
+                futures.append(executor.submit(collect_stereo_pair_chunk_worker, {
+                    "left_video": args.left,
+                    "right_video": args.right,
+                    "pair_list": chunk,
+                    "pattern": pattern,
+                    "square_m": square_m,
+                    "scale": args.scale,
+                    "debug_every": args.debug_every,
+                    "out_dir": out_dir,
+                    "progress_queue": progress_queue,
+                }))
+
+            pending = set(futures)
+            while pending:
+                done = [future for future in pending if future.done()]
+                if not done:
+                    if progress_queue is not None and pbar is not None:
+                        drain_progress_queue(progress_queue, pbar)
+                    time.sleep(0.1)
+                    continue
+                for future in done:
+                    pending.remove(future)
+                    result = future.result()
+                    scanned += int(result["scanned"])
+                    usedL.extend(result["usedL"])
+                    usedR.extend(result["usedR"])
                 if progress_queue is not None and pbar is not None:
                     drain_progress_queue(progress_queue, pbar)
-                time.sleep(0.1)
-                continue
-            for future in done:
-                pending.remove(future)
-                result = future.result()
-                scanned += int(result["scanned"])
-                usedL.extend(result["usedL"])
-                usedR.extend(result["usedR"])
-            if progress_queue is not None and pbar is not None:
-                drain_progress_queue(progress_queue, pbar)
 
     pairs = sorted(zip(usedL, usedR), key=lambda pair: int(pair[0].frame_idx))
     usedL = [pair[0] for pair in pairs]
     usedR = [pair[1] for pair in pairs]
+    if len(usedL) > target_pairs:
+        usedL = usedL[:target_pairs]
+        usedR = usedR[:target_pairs]
     return usedL, usedR, scanned
 
 

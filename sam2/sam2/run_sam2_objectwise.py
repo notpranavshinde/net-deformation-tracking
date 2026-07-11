@@ -131,7 +131,9 @@ def parse_args():
     parser.add_argument("--right-input", default=str(Path("in") / "right.mp4"))
     parser.add_argument("--start-frame", type=int, default=0, help="Inclusive source frame for a virtual clip")
     parser.add_argument("--end-frame", type=int, default=None, help="Exclusive source frame for a virtual clip")
+    parser.add_argument("--frame-step", type=int, default=1, help="Testing speed-up: extract every Nth source frame")
     parser.add_argument("--out", default=str(sam2run.DEFAULT_OUT_DIR))
+    parser.add_argument("--model-id", default=sam2run.MODEL_ID, help="Hugging Face SAM2/SAM2.1 model id")
     parser.add_argument("--setup-json", default=str(sam2run.DEFAULT_LOCAL_SETUP_DIR / "prompts" / "points_left_right.json"))
     parser.add_argument(
         "--corrections-json",
@@ -309,6 +311,7 @@ def prepare_frames(side_name, video_path, crop, args, side_out: Path):
         label=side_name.upper(),
         start_frame=args.start_frame,
         end_frame=args.end_frame,
+        frame_step=args.frame_step,
     )
     return frames_dir, cached_count
 
@@ -326,12 +329,13 @@ def object_fingerprint(side_name, obj_id, point, crop, video_path, args, correct
         "frame_range": {
             "start_frame": int(args.start_frame),
             "end_frame": int(args.end_frame),
+            "frame_step": int(args.frame_step),
         },
         "crop": list(crop) if crop is not None else None,
         "scale": float(args.scale),
         "point": point,
         "corrections": obj_corrections,
-        "model_id": sam2run.MODEL_ID,
+        "model_id": str(args.model_id),
     })
 
 
@@ -350,12 +354,13 @@ def batch_fingerprint(side_name, batch_ids, side_data, args, corrections):
         "frame_range": {
             "start_frame": int(side_data["start_frame"]),
             "end_frame": int(side_data["end_frame"]),
+            "frame_step": int(args.frame_step),
         },
         "crop": list(side_data["crop"]) if side_data["crop"] is not None else None,
         "scale": float(args.scale),
         "points": [side_data["points"][obj_id] for obj_id in batch_ids],
         "corrections": batch_corrections,
-        "model_id": sam2run.MODEL_ID,
+        "model_id": str(args.model_id),
         "batch_size": int(args.batch_size),
     })
 
@@ -423,7 +428,7 @@ def run_side(
 
         sam2_misc.set_frame_loading_progress_sink(progress_event_q, side_name)
 
-    predictor = SAM2VideoPredictor.from_pretrained(sam2run.MODEL_ID).to(device)
+    predictor = SAM2VideoPredictor.from_pretrained(args.model_id).to(device)
     shared_state = predictor.init_state(
         video_path=str(frames_dir),
         offload_video_to_cpu=args.offload_video_to_cpu,
@@ -733,6 +738,9 @@ def main():
     args = parse_args()
     if args.scale <= 0:
         raise RuntimeError("--scale must be > 0")
+    if int(args.frame_step) < 1:
+        raise RuntimeError("--frame-step must be >= 1")
+    sam2run.MODEL_ID = str(args.model_id)
     args.left_input = sam2run.resolve_video_path(args.left_input)
     args.right_input = sam2run.resolve_video_path(args.right_input)
     source_counts = [

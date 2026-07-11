@@ -25,7 +25,8 @@ SPLITTER_SCRIPT = REPO_ROOT / "dual_video_splitter_linux.py"
 CALIBRATION_SCRIPT = REPO_ROOT / "calibration" / "stereo_checker_debug.py"
 QUEUE_ROOT = REPO_ROOT / "work" / "pipeline_queue"
 RESULTS_ROOT = REPO_ROOT / "triangulation" / "results"
-SAM2_MODEL_ID = "facebook/sam2-hiera-large"
+DEFAULT_SAM2_SCALE = 0.2
+SAM2_MODEL_ID = "facebook/sam2.1-hiera-large"
 QUEUE_SAM2_META = "queue_sam2_meta.json"
 QUEUE_TRIANGULATION_META = "queue_triangulation_meta.json"
 
@@ -45,6 +46,16 @@ def prompt_positive_int(label):
         if value > 0:
             return value
         print("Enter a number greater than zero.")
+
+
+def parse_positive_float(value):
+    try:
+        parsed = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a number") from exc
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be greater than zero")
+    return parsed
 
 
 def prompt_video_path(label):
@@ -96,6 +107,45 @@ def prompt_velocity(index, total, used_velocities):
             continue
         used_velocities.add(slug)
         return velocity, slug
+
+
+def prompt_setup_mode():
+    while True:
+        raw = input(
+            "SAM2 setup mode: [g]rid rectangular or [s]ectioned local grids [g]: "
+        ).strip().lower()
+        if raw == "" or raw in {"g", "grid", "rect", "rectangular"}:
+            return "grid"
+        if raw in {"s", "section", "sections", "sectioned"}:
+            return "sectioned"
+        print("Enter g for one rectangular grid, or s for sectioned local grids.")
+
+
+def prompt_section_layout():
+    section_count = prompt_positive_int("Number of sections per experiment clip")
+    sections = []
+    for idx in range(1, section_count + 1):
+        print(f"Section {idx}/{section_count}")
+        cols = prompt_positive_int("  columns")
+        rows = prompt_positive_int("  rows")
+        if cols < 2 or rows < 2:
+            raise RuntimeError("Section columns and rows must both be at least 2.")
+        sections.append({"index": idx, "cols": cols, "rows": rows})
+    return sections
+
+
+def section_layout_arg(section_layout):
+    return ",".join(f"{int(item['cols'])}x{int(item['rows'])}" for item in section_layout or [])
+
+
+def derive_visualization_grid_from_sections(section_layout):
+    if not section_layout:
+        raise RuntimeError("Cannot derive visualization grid without at least one section.")
+    cols = max(int(item["cols"]) for item in section_layout)
+    rows = sum(int(item["rows"]) for item in section_layout)
+    if cols < 2 or rows < 2:
+        raise RuntimeError("Derived visualization grid must have columns and rows >= 2.")
+    return cols, rows
 
 
 def atomic_write_json(path, payload):
@@ -198,6 +248,18 @@ def frame_range_signature(start_frame, end_frame):
         "end_frame": end,
         "frame_count": end - start,
     }
+
+
+def frame_range_meta_matches(actual, expected):
+    if not isinstance(actual, dict):
+        return False
+    for key, value in expected.items():
+        try:
+            if int(actual.get(key, -1)) != int(value):
+                return False
+        except (TypeError, ValueError):
+            return False
+    return True
 
 
 def same_path(a, b):
@@ -350,8 +412,10 @@ def setup_complete(job, manifest=None):
     right_points = points_payload.get("right")
     if not isinstance(left_points, list) or not isinstance(right_points, list):
         return False
+    if len(left_points) <= 0 or len(left_points) != len(right_points):
+        return False
     expected = None
-    if manifest is not None:
+    if manifest is not None and manifest.get("setup_mode", "grid") != "sectioned":
         expected = int(manifest["grid_cols"]) * int(manifest["grid_rows"])
     if expected is not None and (len(left_points) != expected or len(right_points) != expected):
         return False
@@ -435,9 +499,29 @@ def chunk_ids(ids, batch_size):
     return [ids[i:i + batch_size] for i in range(0, len(ids), batch_size)]
 
 
-def expected_object_ids(manifest):
-    total = int(manifest["grid_cols"]) * int(manifest["grid_rows"])
+def expected_object_ids(manifest, job=None):
+    total = None
+    if manifest.get("setup_mode", "grid") == "sectioned" and job is not None:
+        try:
+            points_payload = read_json(job["setup_json"])
+            left_count = len(points_payload.get("left", []))
+            right_count = len(points_payload.get("right", []))
+            if left_count != right_count or left_count <= 0:
+                return []
+            total = left_count
+        except Exception:
+            return []
+    if total is None:
+        total = int(manifest["grid_cols"]) * int(manifest["grid_rows"])
     return list(range(total))
+
+
+def sam2_model_id(manifest):
+    return manifest.get("settings", {}).get("model_id", SAM2_MODEL_ID)
+
+
+def sam2_frame_step(manifest):
+    return int(manifest.get("settings", {}).get("frame_step", 1))
 
 
 def batch_fingerprint(side_name, batch_ids, setup_side, manifest, corrections):
@@ -455,12 +539,13 @@ def batch_fingerprint(side_name, batch_ids, setup_side, manifest, corrections):
         "frame_range": {
             "start_frame": int(setup_side["start_frame"]),
             "end_frame": int(setup_side["end_frame"]),
+            "frame_step": sam2_frame_step(manifest),
         },
         "crop": list(setup_side["crop"]) if setup_side["crop"] is not None else None,
         "scale": float(manifest["settings"]["scale"]),
         "points": [setup_side["points"][obj_id] for obj_id in batch_ids],
         "corrections": batch_corrections,
-        "model_id": SAM2_MODEL_ID,
+        "model_id": sam2_model_id(manifest),
         "batch_size": int(manifest["settings"]["batch_size"]),
     })
 
@@ -470,6 +555,7 @@ def sam2_stage_fingerprint(job, manifest):
         "version": 2,
         "stage": "sam2",
         "frame_cache_image_format": "jpg",
+        "setup_mode": manifest.get("setup_mode", "grid"),
         "left_video": video_signature(job["left_video"]),
         "right_video": video_signature(job["right_video"]),
         "frame_range": frame_range_signature(job["start_frame"], job["end_frame"]),
@@ -482,7 +568,8 @@ def sam2_stage_fingerprint(job, manifest):
             "preview": bool(manifest["settings"]["preview"]),
             "grid_cols": int(manifest["grid_cols"]),
             "grid_rows": int(manifest["grid_rows"]),
-            "model_id": SAM2_MODEL_ID,
+            "model_id": sam2_model_id(manifest),
+            "frame_step": sam2_frame_step(manifest),
         },
     })
 
@@ -507,7 +594,9 @@ def validate_sam2_side(job, manifest, side_name, root_summary, setup, correction
     if side_summary.get("side") != side_name:
         return False
 
-    expected_ids = expected_object_ids(manifest)
+    expected_ids = expected_object_ids(manifest, job)
+    if not expected_ids:
+        return False
     object_ids = [int(v) for v in side_summary.get("object_ids", [])]
     if object_ids != expected_ids:
         return False
@@ -516,7 +605,7 @@ def validate_sam2_side(job, manifest, side_name, root_summary, setup, correction
     expected_range = frame_range_signature(job["start_frame"], job["end_frame"])
     if frames != expected_range["frame_count"]:
         return False
-    if frame_meta.get("frame_range") != expected_range:
+    if not frame_range_meta_matches(frame_meta.get("frame_range"), expected_range):
         return False
     if not same_path(frame_meta.get("video", {}).get("path"), job[f"{side_name}_video"]):
         return False
@@ -574,9 +663,7 @@ def validate_sam2_side(job, manifest, side_name, root_summary, setup, correction
     return True
 
 
-def sam2_complete(job, manifest=None):
-    if manifest is None:
-        return False
+def sam2_outputs_valid(job, manifest):
     if not setup_complete(job, manifest):
         return False
     summary_path = Path(job["sam2_out"]) / "objectwise_summary.json"
@@ -591,14 +678,23 @@ def sam2_complete(job, manifest=None):
     for side in ("left", "right"):
         if not validate_sam2_side(job, manifest, side, root_summary, setup, corrections):
             return False
+    return True
 
+
+def sam2_complete(job, manifest=None):
+    if manifest is None:
+        return False
+    if not sam2_outputs_valid(job, manifest):
+        return False
     expected_fp = sam2_stage_fingerprint(job, manifest)
     meta_path = Path(job["sam2_out"]) / QUEUE_SAM2_META
     if meta_path.is_file():
         try:
-            return read_json(meta_path).get("fingerprint") == expected_fp
+            if read_json(meta_path).get("fingerprint") == expected_fp:
+                return True
         except Exception:
             return False
+    write_sam2_queue_meta(job, manifest)
     return True
 
 
@@ -744,6 +840,16 @@ def _new_job(
 
 def migrate_manifest(manifest):
     changed = False
+    settings = manifest.setdefault("settings", {})
+    if "scale" not in settings:
+        settings["scale"] = DEFAULT_SAM2_SCALE
+        changed = True
+    if "model_id" not in settings:
+        settings["model_id"] = SAM2_MODEL_ID
+        changed = True
+    if "frame_step" not in settings:
+        settings["frame_step"] = 1
+        changed = True
     if "preprocessing" not in manifest:
         manifest["preprocessing"] = {
             "mode": "legacy_existing_clips",
@@ -767,6 +873,44 @@ def migrate_manifest(manifest):
             job["end_frame"] = min(count for count in counts if count > 0)
             changed = True
     return changed
+
+
+def apply_cli_overrides(manifest, args):
+    changed = False
+    if args.sam2_scale is not None:
+        current = float(manifest.setdefault("settings", {}).get("scale", DEFAULT_SAM2_SCALE))
+        if abs(current - float(args.sam2_scale)) > 1e-12:
+            manifest["settings"]["scale"] = float(args.sam2_scale)
+            changed = True
+    if args.sam2_model_id is not None:
+        current = str(manifest.setdefault("settings", {}).get("model_id", SAM2_MODEL_ID))
+        if current != str(args.sam2_model_id):
+            manifest["settings"]["model_id"] = str(args.sam2_model_id)
+            changed = True
+    return changed
+
+
+def print_queue_settings(manifest):
+    settings = manifest.get("settings", {})
+    print(
+        "[QUEUE] SAM2 settings: "
+        f"scale={float(settings.get('scale', DEFAULT_SAM2_SCALE))}, "
+        f"gpu_mode={settings.get('gpu_mode', 'dual')}, "
+        f"batch_size={int(settings.get('batch_size', 36))}, "
+        f"model_id={sam2_model_id(manifest)}"
+    )
+
+
+def ensure_section_layout(manifest_path, manifest):
+    if manifest.get("setup_mode", "grid") != "sectioned":
+        return
+    layout = manifest.get("section_layout")
+    if isinstance(layout, list) and layout:
+        return
+    print("\n[QUEUE] Sectioned setup layout is missing from this queue.")
+    print("[QUEUE] Enter it once; the same section count and dimensions will be reused for every experiment clip.")
+    manifest["section_layout"] = prompt_section_layout()
+    save_manifest(manifest_path, manifest)
 
 
 def splitter_complete(manifest):
@@ -921,14 +1065,26 @@ def ensure_jobs_from_split(manifest_path, manifest):
     return True
 
 
-def create_manifest():
+def create_manifest(args):
     print("Enter the raw stereo videos that contain calibration first, then experiment runs.")
     left_video = prompt_video_path("Raw LEFT video path")
     right_video = prompt_video_path("Raw RIGHT video path")
 
-    print("\nMarker grid used by every experiment run")
-    grid_cols = prompt_positive_int("Grid columns")
-    grid_rows = prompt_positive_int("Grid rows")
+    print("\nSAM2 marker setup")
+    setup_mode = prompt_setup_mode()
+    section_layout = None
+    if setup_mode == "sectioned":
+        print("\nSection layout used by every experiment clip")
+        section_layout = prompt_section_layout()
+        grid_cols, grid_rows = derive_visualization_grid_from_sections(section_layout)
+        print(
+            f"[INFO] Derived full visualization grid as {grid_cols} columns x {grid_rows} rows "
+            "from stacked sections."
+        )
+    else:
+        print("Marker grid used by every experiment run")
+        grid_cols = prompt_positive_int("Grid columns")
+        grid_rows = prompt_positive_int("Grid rows")
     if grid_cols < 2 or grid_rows < 2:
         raise RuntimeError("Grid columns and rows must both be at least 2.")
 
@@ -941,8 +1097,10 @@ def create_manifest():
         "queue_id": queue_id,
         "created_at": utc_now(),
         "updated_at": utc_now(),
+        "setup_mode": setup_mode,
         "grid_cols": grid_cols,
         "grid_rows": grid_rows,
+        "section_layout": section_layout,
         "preprocessing": {
             "mode": "split_raw_pair",
             "raw_left": str(left_video),
@@ -980,11 +1138,12 @@ def create_manifest():
             },
         },
         "settings": {
-            "scale": 0.25,
+            "scale": float(args.sam2_scale if args.sam2_scale is not None else DEFAULT_SAM2_SCALE),
             "gpu_mode": "dual",
             "batch_size": 36,
             "preview": False,
             "visualize": True,
+            "model_id": str(args.sam2_model_id if args.sam2_model_id is not None else SAM2_MODEL_ID),
         },
         "jobs": [],
     }
@@ -1202,6 +1361,11 @@ def prepare_setups(manifest_path, manifest):
         )
         stage.update({"status": "running", "started_at": utc_now(), "error": None})
         save_manifest(manifest_path, manifest)
+        setup_flag = (
+            "--semi-auto-setup-sections"
+            if manifest.get("setup_mode", "grid") == "sectioned"
+            else "--semi-auto-setup"
+        )
         command = [
             sys.executable,
             str(MARKERS_SCRIPT),
@@ -1211,10 +1375,15 @@ def prepare_setups(manifest_path, manifest):
             "--end-frame", str(job["end_frame"]),
             "--out", job["setup_dir"],
             "--corrections-json", job["corrections_json"],
-            "--semi-auto-setup",
+            setup_flag,
             "--grid-cols", str(manifest["grid_cols"]),
             "--grid-rows", str(manifest["grid_rows"]),
         ]
+        if manifest.get("setup_mode", "grid") == "sectioned":
+            layout_arg = section_layout_arg(manifest.get("section_layout"))
+            if not layout_arg:
+                raise RuntimeError("Sectioned setup requires section_layout in the queue manifest.")
+            command.extend(["--section-layout", layout_arg])
         return_code = run_logged(
             command,
             SAM2_DIR,
@@ -1255,6 +1424,7 @@ def run_objectwise(manifest_path, manifest, job):
         "--corrections-json", job["corrections_json"],
         "--out", job["sam2_out"],
         "--scale", str(manifest["settings"]["scale"]),
+        "--model-id", str(sam2_model_id(manifest)),
         "--gpu-mode", str(manifest["settings"]["gpu_mode"]),
         "--batch-size", str(manifest["settings"]["batch_size"]),
         "--preview", str(bool(manifest["settings"]["preview"])).lower(),
@@ -1263,7 +1433,6 @@ def run_objectwise(manifest_path, manifest, job):
         command,
         SAM2_DIR,
         Path(job["logs_dir"]) / "objectwise.log",
-        use_pty=False,
     )
     if return_code == 0:
         write_sam2_queue_meta(job, manifest)
@@ -1391,6 +1560,21 @@ def parse_args():
         default=None,
         help="Resume an existing queue_manifest.json or its containing directory.",
     )
+    parser.add_argument(
+        "--sam2-scale",
+        type=parse_positive_float,
+        default=None,
+        help=(
+            "SAM2 processing scale for a new queue. Default is 0.2. On "
+            "--resume, passing this flag updates the queue scale and "
+            "invalidates stale SAM2/3D outputs."
+        ),
+    )
+    parser.add_argument(
+        "--sam2-model-id",
+        default=None,
+        help="Hugging Face SAM2/SAM2.1 model id used by queued objectwise runs.",
+    )
     return parser.parse_args()
 
 
@@ -1398,11 +1582,14 @@ def main():
     args = parse_args()
     if args.resume:
         manifest_path, manifest = load_manifest(args.resume)
-        if migrate_manifest(manifest):
+        changed = migrate_manifest(manifest)
+        changed = apply_cli_overrides(manifest, args) or changed
+        if changed:
             save_manifest(manifest_path, manifest)
         print(f"[QUEUE] Resuming: {manifest_path}")
     else:
-        manifest_path, manifest = create_manifest()
+        manifest_path, manifest = create_manifest(args)
+    print_queue_settings(manifest)
     if not prepare_splitter(manifest_path, manifest):
         print("[QUEUE] Splitter is incomplete. Resume this manifest to try again.")
         return
@@ -1410,6 +1597,7 @@ def main():
     if not prepare_calibration(manifest_path, manifest):
         print("[QUEUE] Calibration is incomplete. Resume this manifest to try again.")
         return
+    ensure_section_layout(manifest_path, manifest)
     prepare_setups(manifest_path, manifest)
     process_jobs(manifest_path, manifest)
 

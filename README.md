@@ -167,6 +167,7 @@ From `sam2\sam2`:
 ```powershell
 python .\run_sam2_markers.py --setup
 python .\run_sam2_markers.py --semi-auto-setup
+python .\run_sam2_markers.py --semi-auto-setup-sections
 python .\run_sam2_markers.py --modify-setup
 python .\run_sam2_markers.py --reuse-setup --scale 0.5 --gpu-mode single --single-gpu-index 0
 ```
@@ -176,6 +177,15 @@ outer marker-grid corners on LEFT and RIGHT in this order: top-left, top-right,
 bottom-left, bottom-right. It detects the painted marker centroids, fills any
 misses from the grid estimate, and opens an editable review window before
 saving the normal setup package.
+
+`--semi-auto-setup-sections` is for irregular nets that can be covered by
+multiple local grid patches. For each section, the four local marker-grid
+corners are ordered top-left, top-right, bottom-left, bottom-right. When a
+fixed `--section-layout` is provided, all section corners are clicked in one
+pass: for two sections, points `0-3` are section 1 and points `4-7` are section
+2. Review/edit the generated prompts, then add another section or finish.
+Sections are appended into one matched setup package; overlapping points that
+land on the same marker in both cameras are skipped.
 
 In `--modify-setup`, existing prompts use the same two-click move workflow:
 left-click a prompt to select it, left-click the corrected marker center to
@@ -236,15 +246,34 @@ you to confirm the proposed LEFT-minus-RIGHT offset before continuing.
 The splitter does not create or reencode clip videos for queued runs. It stores
 the original stereo paths plus inclusive start and exclusive end frame indices
 in `split_manifest.json`. Calibration and SAM2 read those ranges directly from
-the originals. SAM2's 0.25-scale working cache uses lossless PNG frames, so the
-only image reduction is the explicitly requested processing scale.
+the originals. SAM2's working frame cache uses high-quality JPEG frames, so the
+only geometric reduction is the explicitly requested processing scale.
 
 After calibration, the runner opens semi-auto setup for every experiment so
-all manual marker adjustments can be finished in one pass. It then processes
-each prepared run unattended with:
+all manual marker adjustments can be finished in one pass. Queue creation asks
+whether setup should use one rectangular grid or sectioned local grids. In
+sectioned mode, it asks once for the number of sections and each section's
+columns/rows, then derives the full visualization grid from those stacked
+sections. That physical layout is reused for every experiment clip, so setup
+collects all section corners in one pass before prompt review. It then processes each
+prepared run unattended with the queue's SAM2 settings. The default queue
+settings are:
 
 ```text
---scale 0.25 --gpu-mode dual --batch-size 36 --preview false
+--scale 0.2 --gpu-mode dual --batch-size 36 --preview false
+```
+
+To test a non-default SAM2 scale, create the queue with an explicit override:
+
+```bash
+python run_pipeline_queue.py --sam2-scale 0.25
+```
+
+If you explicitly resume a queue with a different scale, stale SAM2/3D outputs
+are invalidated by the queue fingerprints and recomputed:
+
+```bash
+python run_pipeline_queue.py --resume work/pipeline_queue/<queue-id> --sam2-scale 0.25
 ```
 
 LEFT runs on CUDA 0 and RIGHT runs on CUDA 1. After each objectwise run,

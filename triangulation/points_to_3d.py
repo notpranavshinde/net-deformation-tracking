@@ -1751,6 +1751,7 @@ def main():
     ap.add_argument("--right-video", default="sam2/sam2/in/right.mp4", help="Right video path for per-run sync detection")
     ap.add_argument("--start-frame", type=int, default=0, help="Inclusive source frame for the virtual clip")
     ap.add_argument("--end-frame", type=int, default=None, help="Exclusive source frame for the virtual clip")
+    ap.add_argument("--frame-step", type=int, default=1, help="Source-frame stride used when SAM2 tracks were generated")
     ap.add_argument("--sync-mode", choices=["flash", "audio", "hybrid"], default=None,
                     help="Sync detection mode: audio peak, flash, or hybrid(visual)")
     ap.add_argument("--sync-scale", type=float, default=0.25, help="Downscale for sync detection")
@@ -1951,8 +1952,8 @@ def main():
             "gframe": gframe,
             "frame_L": lframe,
             "frame_R": rframe,
-            "source_frame_L": int(args.start_frame) + int(lframe),
-            "source_frame_R": int(args.start_frame) + int(rframe),
+            "source_frame_L": int(args.start_frame) + int(lframe) * int(args.frame_step),
+            "source_frame_R": int(args.start_frame) + int(rframe) * int(args.frame_step),
             "obj_id": obj_id,
             "uL": float(u1),
             "vL": float(v1),
@@ -1995,6 +1996,7 @@ def main():
         "stereo_image_size": list(image_size) if image_size else None,
         "input_track_coordinate_space": "original_full_frame_pixels",
         "reprojection_error_coordinate_space": "original_full_frame_pixels",
+        "frame_step": int(args.frame_step),
         "reproj_err_px": {
             "mean": float(reproj_errs.mean()) if reproj_errs.size else None,
             "median": float(np.median(reproj_errs)) if reproj_errs.size else None,

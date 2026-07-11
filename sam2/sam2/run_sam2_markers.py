@@ -5,6 +5,7 @@ Paste-ready commands from this directory:
 
     python run_sam2_markers.py --setup
     python run_sam2_markers.py --semi-auto-setup
+    python run_sam2_markers.py --semi-auto-setup-sections
     python run_sam2_markers.py --modify-setup
     python run_sam2_markers.py --reuse-setup
 
@@ -15,6 +16,7 @@ Defaults expect:
 Use --setup on the local Windows machine for manual clicking.
 Use --semi-auto-setup to generate grid prompts from detected painted markers
 after clicking the four outer grid corners.
+Use --semi-auto-setup-sections for irregular nets made from several local grids.
 Default crop is full-frame. Add --select-crop only when you want to crop.
 Use --modify-setup to load the saved setup and add more points without
 re-clicking everything.
@@ -37,6 +39,7 @@ import subprocess
 import gc
 import hashlib
 import math
+import re
 from pathlib import Path
 import argparse
 import sys
@@ -71,11 +74,12 @@ DEFAULT_OUT_DIR = Path("out")
 DEFAULT_LOCAL_SETUP_DIR = Path("work") / "manual_sam2_setup"
 DEFAULT_CORRECTIONS_PATH = DEFAULT_LOCAL_SETUP_DIR / "prompts" / "corrections.json"
 NO_CROP_CORRECTIONS_PATH = DEFAULT_LOCAL_SETUP_DIR / "prompts" / "corrections_no_crop.json"
-MODEL_ID = "facebook/sam2-hiera-large"  # or base-plus for speed
-# MODEL_ID = "facebook/sam2-hiera-base-plus"
+MODEL_ID = "facebook/sam2.1-hiera-large"  # or base-plus for speed
+# MODEL_ID = "facebook/sam2.1-hiera-base-plus"
 FRAME_CACHE_IMAGE_FORMAT = "jpg"
 FRAME_CACHE_EXT = ".jpg"
 FRAME_CACHE_GLOB = "*.jpg"
+INTERACTIVE_ZOOM_STEP = 1.5
 
 DOT_AREA_MIN = 10
 DOT_AREA_MAX = 1_000_000
@@ -490,6 +494,56 @@ def _prompt_int(prompt: str, default: int = None, minimum: int = 1) -> int:
         print(f"Enter an integer >= {minimum}.")
 
 
+def _prompt_yes_no(prompt: str, default: bool = False) -> bool:
+    default_text = "Y/n" if default else "y/N"
+    while True:
+        raw = input(f"{prompt} [{default_text}]: ").strip().lower()
+        if raw == "":
+            return bool(default)
+        if raw in {"y", "yes"}:
+            return True
+        if raw in {"n", "no"}:
+            return False
+        print("Enter y or n.")
+
+
+def _parse_section_layout(raw: str):
+    if raw is None:
+        return None
+    text = str(raw).strip()
+    if not text:
+        return None
+    sections = []
+    for idx, token in enumerate(re.split(r"[,;]+", text), start=1):
+        token = token.strip().lower()
+        if not token:
+            continue
+        match = re.fullmatch(r"(\d+)\s*(?:x|\*)\s*(\d+)", token)
+        if not match:
+            raise ValueError(
+                f"Invalid section layout item {idx}: {token!r}. Use forms like '6x6,8x4'."
+            )
+        cols = int(match.group(1))
+        rows = int(match.group(2))
+        if cols < 2 or rows < 2:
+            raise ValueError(f"Section layout item {idx} must have cols and rows >= 2.")
+        sections.append({"cols": cols, "rows": rows})
+    if not sections:
+        return None
+    return sections
+
+
+def _open_cv_window(name: str, width: int = None, height: int = None):
+    cv2.namedWindow(name, cv2.WINDOW_NORMAL)
+    try:
+        if width is not None and height is not None:
+            cv2.resizeWindow(name, int(width), int(height))
+        else:
+            cv2.setWindowProperty(name, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_NORMAL)
+    except Exception:
+        pass
+
+
 def _bilinear_grid_point(corners, col: int, row: int, cols: int, rows: int):
     tl, tr, bl, br = [np.asarray(pt, dtype=np.float32) for pt in corners]
     u = 0.0 if cols <= 1 else float(col) / float(cols - 1)
@@ -871,9 +925,18 @@ def _extract_orange_components(frame_bgr: np.ndarray,
     return components
 
 
-def _estimate_grid_corners_from_detection(side: str, frame_bgr: np.ndarray, cols: int, rows: int):
+def _estimate_grid_corners_from_detection(
+    side: str,
+    frame_bgr: np.ndarray,
+    cols: int,
+    rows: int,
+    allow_fragmented: bool = False,
+):
     """Estimate TL/TR/BL/BR marker centers from the dominant orange lattice."""
     expected = int(cols * rows)
+    min_component_count = min(expected, max(4, int(round(expected * 0.45))))
+    min_kept_count = min(expected, max(4, int(round(expected * 0.40))))
+    min_group_count = min(expected, max(4, int(round(expected * 0.55))))
     h_img, w_img = frame_bgr.shape[:2]
     rough_step = max(
         24.0,
@@ -883,7 +946,7 @@ def _estimate_grid_corners_from_detection(side: str, frame_bgr: np.ndarray, cols
         ),
     )
     components = _extract_orange_components(frame_bgr, grid_step=rough_step)
-    if len(components) < max(12, int(round(expected * 0.45))):
+    if len(components) < min_component_count:
         raise RuntimeError(f"Only {len(components)} orange bodies were found.")
 
     areas = np.asarray([float(component["area"]) for component in components], dtype=np.float64)
@@ -897,7 +960,7 @@ def _estimate_grid_corners_from_detection(side: str, frame_bgr: np.ndarray, cols
         for idx, component in enumerate(components)
         if min_area <= float(component["area"]) <= max_area
     ]
-    if len(kept_indices) < max(12, int(round(expected * 0.40))):
+    if len(kept_indices) < min_kept_count:
         raise RuntimeError("Too few consistently sized orange bodies remained after filtering.")
 
     xy = np.asarray(
@@ -915,7 +978,7 @@ def _estimate_grid_corners_from_detection(side: str, frame_bgr: np.ndarray, cols
     nearest = np.min(distances, axis=1)
     max_reasonable_step = max(80.0, float(min(h_img, w_img)) * 0.12)
     valid_nearest = nearest[(nearest >= 12.0) & (nearest <= max_reasonable_step)]
-    if len(valid_nearest) < 8:
+    if len(valid_nearest) < min(8, max(3, len(xy) - 1)):
         raise RuntimeError("Could not estimate consistent marker spacing.")
     typical_step = float(np.median(valid_nearest))
     connection_radius = max(
@@ -942,21 +1005,31 @@ def _estimate_grid_corners_from_detection(side: str, frame_bgr: np.ndarray, cols
         groups.append(group)
 
     group = max(groups, key=len)
-    if len(group) < max(10, int(round(expected * 0.55))):
-        raise RuntimeError(
-            f"The largest regular marker group contains only {len(group)}/{expected} bodies."
-        )
+    fragmented_group_fallback = False
+    if len(group) < min_group_count:
+        if not allow_fragmented:
+            raise RuntimeError(
+                f"The largest regular marker group contains only {len(group)}/{expected} bodies."
+            )
+        group = list(range(len(xy)))
+        fragmented_group_fallback = True
     group_xy = xy[group]
     group_component_indices = np.asarray(kept_indices, dtype=np.int32)[group]
 
-    top_limit = float(np.percentile(group_xy[:, 1], 15.0))
+    top_limit = float(np.percentile(group_xy[:, 1], 25.0))
     top_pool = np.flatnonzero(group_xy[:, 1] <= top_limit)
+    if len(top_pool) < 2:
+        top_limit = float(np.percentile(group_xy[:, 1], 40.0))
+        top_pool = np.flatnonzero(group_xy[:, 1] <= top_limit)
     hull_indices = cv2.convexHull(
         group_xy.astype(np.float32),
         returnPoints=False,
     ).reshape(-1)
-    lower_limit = float(np.percentile(group_xy[:, 1], 55.0))
+    lower_limit = float(np.percentile(group_xy[:, 1], 50.0))
     lower_hull = hull_indices[group_xy[hull_indices, 1] >= lower_limit]
+    if len(lower_hull) < 2:
+        lower_limit = float(np.percentile(group_xy[:, 1], 35.0))
+        lower_hull = hull_indices[group_xy[hull_indices, 1] >= lower_limit]
     if len(top_pool) < 2 or len(lower_hull) < 2:
         raise RuntimeError("Could not identify both upper and lower lattice boundaries.")
 
@@ -1035,6 +1108,7 @@ def _estimate_grid_corners_from_detection(side: str, frame_bgr: np.ndarray, cols
     print(
         f"[INFO][{side.upper()}] auto corners: components={len(components)} "
         f"regular_group={len(group)} spacing={typical_step:.1f}px "
+        f"fragmented_fallback={int(fragmented_group_fallback)} "
         f"top_extrapolated={int(top_left_extrapolated) + int(top_right_extrapolated)}/2"
     )
     meta = [
@@ -1051,7 +1125,12 @@ def _estimate_grid_corners_from_detection(side: str, frame_bgr: np.ndarray, cols
     return [_make_prompt_point(x, y, 1) for x, y in corners], meta
 
 
-def _assign_orange_components_globally(cell_states, components, search_radius: int):
+def _assign_orange_components_globally(
+    cell_states,
+    components,
+    search_radius: int,
+    to_grid=None,
+):
     """Match cells to dominant orange bodies one-to-one."""
     if not cell_states or not components:
         return {}
@@ -1059,6 +1138,23 @@ def _assign_orange_components_globally(cell_states, components, search_radius: i
     radius = float(max(18, search_radius))
     invalid_cost = 1_000_000.0
     dummy_cost = 1.12
+    component_grid_xy = None
+    if to_grid is not None:
+        try:
+            component_xy = np.asarray(
+                [
+                    [
+                        float(component.get("centroid_x", component["x"])),
+                        float(component.get("centroid_y", component["y"])),
+                    ]
+                    for component in components
+                ],
+                dtype=np.float32,
+            )
+            component_grid_xy = _apply_homography(component_xy, to_grid)
+        except Exception:
+            component_grid_xy = None
+
     costs = np.full(
         (len(cell_states), len(components) + len(cell_states)),
         invalid_cost,
@@ -1075,15 +1171,34 @@ def _assign_orange_components_globally(cell_states, components, search_radius: i
             center_y = float(component.get("centroid_y", component["y"]))
             dist_to_pred = math.hypot(center_x - px, center_y - py)
             dist_to_current = math.hypot(center_x - cx, center_y - cy)
+            grid_dist = None
+            grid_col_err = None
+            grid_row_err = None
+            if component_grid_xy is not None:
+                gx, gy = component_grid_xy[comp_idx]
+                grid_col_err = abs(float(gx) - float(state["col"]))
+                grid_row_err = abs(float(gy) - float(state["row"]))
+                grid_dist = math.hypot(grid_col_err, grid_row_err)
             area = float(component["area"])
-            if dist_to_pred > radius or dist_to_current > radius * 1.45:
-                continue
-            nearby.append((comp_idx, component, dist_to_pred, dist_to_current))
+            if component_grid_xy is None:
+                if dist_to_pred > radius or dist_to_current > radius * 1.45:
+                    continue
+            else:
+                near_grid_cell = (
+                    grid_dist is not None
+                    and grid_col_err <= 0.92
+                    and grid_row_err <= 0.74
+                    and grid_dist <= 1.02
+                )
+                near_lattice = dist_to_pred <= radius and dist_to_current <= radius * 1.70
+                if not near_grid_cell and not near_lattice:
+                    continue
+            nearby.append((comp_idx, component, dist_to_pred, dist_to_current, grid_dist))
 
         if not nearby:
             continue
         dominant_area = max(float(item[1]["area"]) for item in nearby)
-        for comp_idx, component, dist_to_pred, dist_to_current in nearby:
+        for comp_idx, component, dist_to_pred, dist_to_current, grid_dist in nearby:
             area = float(component["area"])
             if area < max(18.0, dominant_area * 0.18):
                 continue
@@ -1095,12 +1210,34 @@ def _assign_orange_components_globally(cell_states, components, search_radius: i
                 float(component.get("interior_radius", 0.0))
                 / max(equivalent_radius, 1.0),
             )
-            costs[cell_idx, comp_idx] = (
-                0.56 * (dist_to_pred / radius)
-                + 0.08 * (dist_to_current / (radius * 1.45))
-                + 0.62 * area_penalty
-                + 0.08 * (1.0 - interior_ratio)
-            )
+            if component_grid_xy is None:
+                costs[cell_idx, comp_idx] = (
+                    0.56 * (dist_to_pred / radius)
+                    + 0.08 * (dist_to_current / (radius * 1.45))
+                    + 0.62 * area_penalty
+                    + 0.08 * (1.0 - interior_ratio)
+                )
+            else:
+                grid_term = 1.0
+                grid_term = min(1.0, float(grid_dist) / 0.88)
+                lattice_term = min(1.0, float(dist_to_pred) / radius)
+                current_term = min(1.0, float(dist_to_current) / (radius * 1.70))
+                if grid_dist is not None and grid_dist <= 0.62:
+                    costs[cell_idx, comp_idx] = (
+                        0.54 * grid_term
+                        + 0.18 * lattice_term
+                        + 0.04 * current_term
+                        + 0.34 * area_penalty
+                        + 0.05 * (1.0 - interior_ratio)
+                    )
+                else:
+                    costs[cell_idx, comp_idx] = (
+                        0.50 * lattice_term
+                        + 0.10 * current_term
+                        + 0.18 * grid_term
+                        + 0.48 * area_penalty
+                        + 0.06 * (1.0 - interior_ratio)
+                    )
 
     if linear_sum_assignment is not None:
         row_indices, col_indices = linear_sum_assignment(costs)
@@ -1129,7 +1266,311 @@ def _assign_orange_components_globally(cell_states, components, search_radius: i
         state = cell_states[row]
         component = dict(components[col])
         component["cost"] = float(costs[row, col])
+        if component_grid_xy is not None:
+            gx, gy = component_grid_xy[col]
+            component["grid_x"] = float(gx)
+            component["grid_y"] = float(gy)
+            component["grid_dist"] = math.hypot(float(gx) - float(state["col"]), float(gy) - float(state["row"]))
         assignments[state["cell"]] = component
+    return assignments
+
+
+def _assign_orange_components_by_rows(cell_states, components, cols: int, rows: int, to_grid, search_radius: int):
+    """Row-local assignment using grid coordinates and left-to-right order."""
+    if not cell_states or not components or to_grid is None or cols < 2 or rows < 2:
+        return {}
+    try:
+        component_xy = np.asarray(
+            [
+                [
+                    float(component.get("centroid_x", component["x"])),
+                    float(component.get("centroid_y", component["y"])),
+                ]
+                for component in components
+            ],
+            dtype=np.float32,
+        )
+        component_grid_xy = _apply_homography(component_xy, to_grid)
+    except Exception:
+        return {}
+
+    state_by_cell = {tuple(state["cell"]): state for state in cell_states}
+    assignments = {}
+    used_components = set()
+    radius = float(max(18, search_radius))
+    dummy_cost = 1.05
+    invalid_cost = 1_000_000.0
+
+    for row in range(rows):
+        row_states = [state_by_cell.get((row, col)) for col in range(cols)]
+        if any(state is None for state in row_states):
+            continue
+        row_components = []
+        for comp_idx, (component, (gx, gy)) in enumerate(zip(components, component_grid_xy)):
+            if comp_idx in used_components:
+                continue
+            gx = float(gx)
+            gy = float(gy)
+            row_err = abs(gy - float(row))
+            if row_err > 0.78:
+                continue
+            if gx < -0.88 or gx > float(cols - 1) + 0.88:
+                continue
+            nearest_col = int(round(gx))
+            if nearest_col < 0 or nearest_col >= cols:
+                continue
+            state = state_by_cell[(row, nearest_col)]
+            center_x = float(component.get("centroid_x", component["x"]))
+            center_y = float(component.get("centroid_y", component["y"]))
+            pred_x, pred_y = state["pred_xy"]
+            if math.hypot(center_x - pred_x, center_y - pred_y) > radius * 2.05 and row_err > 0.46:
+                continue
+            row_components.append((comp_idx, component, gx, gy))
+
+        if len(row_components) < max(2, min(cols, int(math.ceil(cols * 0.55)))):
+            continue
+
+        costs = np.full((cols, len(row_components) + cols), invalid_cost, dtype=np.float64)
+        costs[:, len(row_components):] = dummy_cost
+        dominant_area = max(float(item[1]["area"]) for item in row_components)
+        for col in range(cols):
+            state = state_by_cell[(row, col)]
+            pred_x, pred_y = state["pred_xy"]
+            for local_idx, (_comp_idx, component, gx, gy) in enumerate(row_components):
+                col_err = abs(float(gx) - float(col))
+                row_err = abs(float(gy) - float(row))
+                if col_err > 0.90 or row_err > 0.78:
+                    continue
+                center_x = float(component.get("centroid_x", component["x"]))
+                center_y = float(component.get("centroid_y", component["y"]))
+                pred_dist = math.hypot(center_x - pred_x, center_y - pred_y)
+                area = float(component["area"])
+                if area < max(18.0, dominant_area * 0.12):
+                    continue
+                area_ratio = max(min(area / max(dominant_area, 1.0), 1.0), 1e-6)
+                area_penalty = min(1.0, -math.log(area_ratio) / math.log(8.0))
+                costs[col, local_idx] = (
+                    0.62 * min(1.0, col_err / 0.90)
+                    + 0.40 * min(1.0, row_err / 0.78)
+                    + 0.10 * min(1.0, pred_dist / max(radius, 1.0))
+                    + 0.22 * area_penalty
+                )
+
+        if linear_sum_assignment is not None:
+            row_indices, col_indices = linear_sum_assignment(costs)
+            pairs = zip(row_indices.tolist(), col_indices.tolist())
+        else:
+            candidates = []
+            for cost_row in range(cols):
+                for cost_col in range(len(row_components)):
+                    if costs[cost_row, cost_col] < dummy_cost:
+                        candidates.append((float(costs[cost_row, cost_col]), cost_row, cost_col))
+            seen_rows = set()
+            seen_cols = set()
+            greedy = []
+            for _cost, cost_row, cost_col in sorted(candidates):
+                if cost_row in seen_rows or cost_col in seen_cols:
+                    continue
+                seen_rows.add(cost_row)
+                seen_cols.add(cost_col)
+                greedy.append((cost_row, cost_col))
+            pairs = greedy
+
+        row_assignments = {}
+        for col, local_idx in pairs:
+            if local_idx >= len(row_components) or costs[col, local_idx] >= dummy_cost:
+                continue
+            comp_idx, component, gx, gy = row_components[local_idx]
+            component = dict(component)
+            component["cost"] = float(costs[col, local_idx])
+            component["grid_x"] = float(gx)
+            component["grid_y"] = float(gy)
+            component["grid_dist"] = math.hypot(float(gx) - float(col), float(gy) - float(row))
+            component["row_ordered"] = True
+            row_assignments[(row, col)] = (comp_idx, component)
+
+        if len(row_assignments) < max(2, min(cols, int(math.ceil(cols * 0.50)))):
+            continue
+        for cell, (comp_idx, component) in row_assignments.items():
+            assignments[cell] = component
+            used_components.add(comp_idx)
+
+    return assignments
+
+
+def _assign_orange_components_by_elastic_rows(cell_states, components, cols: int, rows: int, to_grid, search_radius: int):
+    """Assign orange bodies by fitting each row as a curved chain.
+
+    This handles slack/curved net rows better than a straight homography band.
+    Grid coordinates provide the rough row/column order; fitted image-space row
+    curves handle the visible sag between anchors.
+    """
+    if not cell_states or not components or to_grid is None or cols < 2 or rows < 2:
+        return {}
+    try:
+        component_xy = np.asarray(
+            [
+                [
+                    float(component.get("centroid_x", component["x"])),
+                    float(component.get("centroid_y", component["y"])),
+                ]
+                for component in components
+            ],
+            dtype=np.float32,
+        )
+        component_grid_xy = _apply_homography(component_xy, to_grid)
+    except Exception:
+        return {}
+
+    state_by_cell = {tuple(state["cell"]): state for state in cell_states}
+    component_records = []
+    for comp_idx, (component, (gx, gy)) in enumerate(zip(components, component_grid_xy)):
+        gx = float(gx)
+        gy = float(gy)
+        if gx < -1.10 or gx > float(cols - 1) + 1.10 or gy < -1.10 or gy > float(rows - 1) + 1.10:
+            continue
+        component_records.append(
+            {
+                "idx": int(comp_idx),
+                "component": component,
+                "gx": gx,
+                "gy": gy,
+                "x": float(component.get("centroid_x", component["x"])),
+                "y": float(component.get("centroid_y", component["y"])),
+            }
+        )
+    if not component_records:
+        return {}
+
+    row_models = {}
+    for row in range(rows):
+        row_records = [
+            rec for rec in component_records
+            if abs(float(rec["gy"]) - float(row)) <= 1.55
+        ]
+        if len(row_records) < 2:
+            continue
+        # Prefer the bodies closest to this row, but keep enough for a curve.
+        row_records = sorted(
+            row_records,
+            key=lambda rec: (
+                0.70 * abs(float(rec["gy"]) - float(row))
+                + 0.30 * abs(float(rec["gx"]) - round(float(rec["gx"]))),
+                abs(float(rec["gx"]) - round(float(rec["gx"]))),
+            ),
+        )[:max(cols + 5, min(len(row_records), cols * 3))]
+        samples = [(float(rec["gx"]), float(rec["x"]), float(rec["y"])) for rec in row_records]
+        model = _fit_poly_predictor(samples, max_degree=2)
+        if model is not None:
+            row_models[row] = model
+
+    radius = float(max(18, search_radius))
+    dummy_cost = 1.08
+    invalid_cost = 1_000_000.0
+    candidate_assignments = {}
+    median_area = float(np.median([float(component["area"]) for component in components])) if components else 1.0
+
+    for row in range(rows):
+        row_states = [state_by_cell.get((row, col)) for col in range(cols)]
+        if any(state is None for state in row_states):
+            continue
+        model = row_models.get(row)
+        row_candidates = []
+        for rec in component_records:
+            gx = float(rec["gx"])
+            gy = float(rec["gy"])
+            row_err = abs(gy - float(row))
+            nearest_col = int(round(gx))
+            if nearest_col < -1 or nearest_col > cols:
+                continue
+            col_proximity = min(abs(gx - float(col)) for col in range(cols))
+            if row_err > 1.65 or col_proximity > 1.15:
+                continue
+            curve_dist = None
+            if model is not None:
+                curve_xy = model(float(gx))
+                curve_dist = math.hypot(float(rec["x"]) - float(curve_xy[0]), float(rec["y"]) - float(curve_xy[1]))
+                if curve_dist > radius * 1.70 and row_err > 0.96:
+                    continue
+            row_candidates.append((rec, curve_dist))
+
+        if len(row_candidates) < 2:
+            continue
+
+        costs = np.full((cols, len(row_candidates) + cols), invalid_cost, dtype=np.float64)
+        costs[:, len(row_candidates):] = dummy_cost
+        for col in range(cols):
+            state = state_by_cell[(row, col)]
+            pred_x, pred_y = state["pred_xy"]
+            curve_xy_at_col = model(float(col)) if model is not None else np.asarray([pred_x, pred_y], dtype=np.float64)
+            for local_idx, (rec, curve_dist) in enumerate(row_candidates):
+                component = rec["component"]
+                gx = float(rec["gx"])
+                gy = float(rec["gy"])
+                col_err = abs(gx - float(col))
+                row_err = abs(gy - float(row))
+                if col_err > 1.12 or row_err > 1.65:
+                    continue
+                center_x = float(rec["x"])
+                center_y = float(rec["y"])
+                pred_dist = math.hypot(center_x - pred_x, center_y - pred_y)
+                col_curve_dist = math.hypot(center_x - float(curve_xy_at_col[0]), center_y - float(curve_xy_at_col[1]))
+                curve_term_dist = curve_dist if curve_dist is not None else col_curve_dist
+                area = max(float(component["area"]), 1.0)
+                area_ratio = max(min(area / max(median_area, 1.0), 2.0), 1e-6)
+                small_area_penalty = max(0.0, -math.log(min(area_ratio, 1.0)) / math.log(6.0))
+                costs[col, local_idx] = (
+                    0.34 * min(1.0, col_err / 1.12)
+                    + 0.12 * min(1.0, row_err / 1.65)
+                    + 0.42 * min(1.0, col_curve_dist / max(radius * 0.92, 1.0))
+                    + 0.03 * min(1.0, pred_dist / max(radius * 2.25, 1.0))
+                    + 0.34 * min(1.0, curve_term_dist / max(radius * 1.25, 1.0))
+                    + 0.24 * small_area_penalty
+                )
+
+        if linear_sum_assignment is not None:
+            row_indices, col_indices = linear_sum_assignment(costs)
+            pairs = zip(row_indices.tolist(), col_indices.tolist())
+        else:
+            candidates = []
+            for cost_row in range(cols):
+                for cost_col in range(len(row_candidates)):
+                    if costs[cost_row, cost_col] < dummy_cost:
+                        candidates.append((float(costs[cost_row, cost_col]), cost_row, cost_col))
+            used_rows = set()
+            used_cols = set()
+            greedy = []
+            for _cost, cost_row, cost_col in sorted(candidates):
+                if cost_row in used_rows or cost_col in used_cols:
+                    continue
+                used_rows.add(cost_row)
+                used_cols.add(cost_col)
+                greedy.append((cost_row, cost_col))
+            pairs = greedy
+
+        for col, local_idx in pairs:
+            if local_idx >= len(row_candidates) or costs[col, local_idx] >= dummy_cost:
+                continue
+            rec, _curve_dist = row_candidates[local_idx]
+            component = dict(rec["component"])
+            component["cost"] = float(costs[col, local_idx])
+            component["grid_x"] = float(rec["gx"])
+            component["grid_y"] = float(rec["gy"])
+            component["grid_dist"] = math.hypot(float(rec["gx"]) - float(col), float(rec["gy"]) - float(row))
+            component["row_ordered"] = True
+            component["elastic_row"] = True
+            candidate_assignments[(row, col)] = (int(rec["idx"]), component)
+
+    # Resolve conflicts where one orange body was plausible for adjacent rows.
+    best_by_component = {}
+    for cell, (comp_idx, component) in candidate_assignments.items():
+        previous = best_by_component.get(comp_idx)
+        if previous is None or float(component["cost"]) < float(previous[1]["cost"]):
+            best_by_component[comp_idx] = (cell, component)
+
+    assignments = {}
+    for _comp_idx, (cell, component) in best_by_component.items():
+        assignments[cell] = component
     return assignments
 
 
@@ -1144,7 +1585,14 @@ def _anchor_cells_from_corners(corners, cols: int, rows: int):
     }
 
 
-def _generate_grid_prompts_from_detection(side: str, frame_bgr: np.ndarray, corners, cols: int, rows: int):
+def _generate_grid_prompts_from_detection(
+    side: str,
+    frame_bgr: np.ndarray,
+    corners,
+    cols: int,
+    rows: int,
+    hole_net_mode: bool = False,
+):
     expected = int(cols * rows)
     to_grid, _to_image = _grid_homographies(corners, cols, rows)
     candidates, detector_meta = _detect_marker_candidates(side, frame_bgr, expected)
@@ -1256,7 +1704,92 @@ def _generate_grid_prompts_from_detection(side: str, frame_bgr: np.ndarray, corn
         refinable_states,
         orange_components,
         orange_search_radius,
+        to_grid=to_grid if hole_net_mode else None,
     )
+    row_ordered_assignments = {}
+    if hole_net_mode:
+        row_ordered_assignments = _assign_orange_components_by_rows(
+            refinable_states,
+            orange_components,
+            cols,
+            rows,
+            to_grid,
+            orange_search_radius,
+        )
+        elastic_row_assignments = _assign_orange_components_by_elastic_rows(
+            refinable_states,
+            orange_components,
+            cols,
+            rows,
+            to_grid,
+            orange_search_radius,
+        )
+        for cell, elastic_refine in elastic_row_assignments.items():
+            current_refine = row_ordered_assignments.get(cell)
+            use_elastic = current_refine is None
+            if current_refine is not None:
+                elastic_grid_dist = float(elastic_refine.get("grid_dist", 99.0))
+                current_grid_dist = float(current_refine.get("grid_dist", 99.0))
+                elastic_cost = float(elastic_refine.get("cost", 99.0))
+                current_cost = float(current_refine.get("cost", 99.0))
+                if elastic_grid_dist <= current_grid_dist + 0.34 and elastic_cost <= current_cost + 0.30:
+                    use_elastic = True
+                elif elastic_grid_dist <= 0.72 and current_grid_dist > 0.72:
+                    use_elastic = True
+                elif elastic_grid_dist <= 0.58 and elastic_cost <= current_cost + 0.42:
+                    use_elastic = True
+            if use_elastic:
+                row_ordered_assignments[cell] = elastic_refine
+
+        best_row_assignment_by_component = {}
+        componentless_row_assignments = {}
+        for cell, refine in row_ordered_assignments.items():
+            component_id = int(refine.get("component_id", -1))
+            if component_id < 0:
+                componentless_row_assignments[cell] = refine
+                continue
+            score = (
+                0 if bool(refine.get("elastic_row", False)) else 1,
+                float(refine.get("cost", 99.0)),
+                float(refine.get("grid_dist", 99.0)),
+            )
+            previous = best_row_assignment_by_component.get(component_id)
+            if previous is None or score < previous[0]:
+                best_row_assignment_by_component[component_id] = (score, cell, refine)
+        row_ordered_assignments = {
+            cell: refine
+            for _component_id, (_score, cell, refine) in best_row_assignment_by_component.items()
+        }
+        row_ordered_assignments.update(componentless_row_assignments)
+
+    row_ordered_used = 0
+    elastic_row_used = 0
+    for cell, row_refine in row_ordered_assignments.items():
+        current_refine = orange_assignments.get(cell)
+        use_row_refine = current_refine is None
+        if current_refine is not None:
+            current_grid_dist = float(current_refine.get("grid_dist", 99.0))
+            row_grid_dist = float(row_refine.get("grid_dist", 99.0))
+            current_cost = float(current_refine.get("cost", 99.0))
+            row_cost = float(row_refine.get("cost", 99.0))
+            if row_grid_dist <= 0.72 and current_grid_dist > row_grid_dist + 0.12:
+                use_row_refine = True
+            elif row_grid_dist <= 0.58 and row_cost <= current_cost + 0.34:
+                use_row_refine = True
+            elif bool(row_refine.get("elastic_row", False)) and row_grid_dist <= 0.76 and row_cost <= current_cost + 0.46:
+                use_row_refine = True
+        if use_row_refine:
+            row_component_id = int(row_refine.get("component_id", -1))
+            if row_component_id >= 0:
+                for other_cell, other_refine in list(orange_assignments.items()):
+                    if other_cell == cell:
+                        continue
+                    if int(other_refine.get("component_id", -2)) == row_component_id:
+                        del orange_assignments[other_cell]
+            orange_assignments[cell] = row_refine
+            row_ordered_used += 1
+            if bool(row_refine.get("elastic_row", False)):
+                elastic_row_used += 1
 
     prompts = []
     meta_points = []
@@ -1286,16 +1819,23 @@ def _generate_grid_prompts_from_detection(side: str, frame_bgr: np.ndarray, corn
                 "orange_body_area": float(orange_refine["area"]) if orange_refine is not None else None,
                 "orange_component_id": int(orange_refine["component_id"]) if orange_refine is not None else None,
                 "orange_assignment_cost": float(orange_refine["cost"]) if orange_refine is not None else None,
+                "orange_grid_x": float(orange_refine["grid_x"]) if orange_refine is not None and "grid_x" in orange_refine else None,
+                "orange_grid_y": float(orange_refine["grid_y"]) if orange_refine is not None and "grid_y" in orange_refine else None,
+                "orange_grid_dist": float(orange_refine["grid_dist"]) if orange_refine is not None and "grid_dist" in orange_refine else None,
+                "orange_row_ordered": bool(orange_refine.get("row_ordered", False)) if orange_refine is not None else False,
+                "orange_elastic_row": bool(orange_refine.get("elastic_row", False)) if orange_refine is not None else False,
                 "anchor_locked": state["anchor_locked"],
             }
         )
 
     print(
-        f"[INFO][{side.upper()}] semi-auto lattice assigned {detected_count}/{expected} from detected centroids; "
+        f"[INFO][{side.upper()}] semi-auto mode={'hole-net' if hole_net_mode else 'full-grid'}; "
+        f"lattice assigned {detected_count}/{expected} from detected centroids; "
         f"{lattice_count} lattice fallback; {anchor_count} locked anchors; "
         f"{expected - detected_count - lattice_count - anchor_count} corner fallback; "
         f"large-blob swaps={large_blob_replacements}; "
-        f"orange components={len(orange_components)}; one-to-one refinements={len(orange_assignments)}."
+        f"orange components={len(orange_components)}; one-to-one refinements={len(orange_assignments)}; "
+        f"row-ordered fixes={row_ordered_used}; elastic-row fixes={elastic_row_used}."
     )
     meta = {
         "side": side,
@@ -1303,11 +1843,14 @@ def _generate_grid_prompts_from_detection(side: str, frame_bgr: np.ndarray, corn
         "rows": int(rows),
         "detector": detector_meta,
         "assignment": {
+            "hole_net_mode": bool(hole_net_mode),
             "candidate_records": int(len(records)),
             "lattice_px_threshold": float(max_px_dist),
             "large_blob_replacements": int(large_blob_replacements),
             "orange_components": int(len(orange_components)),
             "orange_body_replacements": int(len(orange_assignments)),
+            "orange_row_ordered_replacements": int(row_ordered_used),
+            "orange_elastic_row_replacements": int(elastic_row_used),
             "orange_search_radius_px": int(orange_search_radius),
             "orange_assignment_method": (
                 "hungarian" if linear_sum_assignment is not None else "greedy_unique"
@@ -1322,25 +1865,263 @@ def _generate_grid_prompts_from_detection(side: str, frame_bgr: np.ndarray, corn
     return prompts, meta
 
 
+def _sync_meta_positions_for_points(points, meta):
+    synced = json.loads(json.dumps(meta or {}))
+    meta_points = synced.get("points", [])
+    for idx, point in enumerate(points):
+        if idx >= len(meta_points):
+            continue
+        x, y, _label = _coerce_prompt_point(point, prefer_local=False)
+        if (
+            abs(float(meta_points[idx].get("x", x)) - x) > 1e-3
+            or abs(float(meta_points[idx].get("y", y)) - y) > 1e-3
+        ):
+            meta_points[idx]["source"] = "edited"
+        meta_points[idx]["obj_id"] = int(idx)
+        meta_points[idx]["x"] = float(x)
+        meta_points[idx]["y"] = float(y)
+    return synced
+
+
+def _offset_section_meta(meta, section_index: int, obj_offset: int):
+    adjusted = json.loads(json.dumps(meta or {}))
+    adjusted["section_index"] = int(section_index)
+    for point in adjusted.get("points", []):
+        local_obj_id = int(point.get("obj_id", 0))
+        point["section_index"] = int(section_index)
+        point["section_local_obj_id"] = local_obj_id
+        point["obj_id"] = int(obj_offset) + local_obj_id
+    return adjusted
+
+
+def _append_section_with_overlap_dedupe(
+    left_points,
+    right_points,
+    left_meta_points,
+    right_meta_points,
+    section_left_points,
+    section_right_points,
+    section_left_meta,
+    section_right_meta,
+    threshold_px: float = 12.0,
+):
+    kept_left = []
+    kept_right = []
+    kept_left_meta = []
+    kept_right_meta = []
+    skipped = 0
+    threshold2 = float(threshold_px) ** 2
+
+    existing_pairs = []
+    for left_point, right_point in zip(left_points, right_points):
+        lx, ly, _ = _coerce_prompt_point(left_point, prefer_local=False)
+        rx, ry, _ = _coerce_prompt_point(right_point, prefer_local=False)
+        existing_pairs.append((float(lx), float(ly), float(rx), float(ry)))
+
+    for local_idx, (left_point, right_point) in enumerate(zip(section_left_points, section_right_points)):
+        lx, ly, _ = _coerce_prompt_point(left_point, prefer_local=False)
+        rx, ry, _ = _coerce_prompt_point(right_point, prefer_local=False)
+        duplicate = False
+        for ex_lx, ex_ly, ex_rx, ex_ry in existing_pairs:
+            left_d2 = (float(lx) - ex_lx) ** 2 + (float(ly) - ex_ly) ** 2
+            right_d2 = (float(rx) - ex_rx) ** 2 + (float(ry) - ex_ry) ** 2
+            if left_d2 <= threshold2 and right_d2 <= threshold2:
+                duplicate = True
+                break
+        if duplicate:
+            skipped += 1
+            continue
+        kept_left.append(left_point)
+        kept_right.append(right_point)
+        kept_left_meta.append(section_left_meta[local_idx])
+        kept_right_meta.append(section_right_meta[local_idx])
+        existing_pairs.append((float(lx), float(ly), float(rx), float(ry)))
+
+    obj_offset = len(left_points)
+    for local_idx, (left_point, right_point) in enumerate(zip(kept_left, kept_right)):
+        global_idx = obj_offset + local_idx
+        left_points.append(left_point)
+        right_points.append(right_point)
+        left_meta = dict(kept_left_meta[local_idx])
+        right_meta = dict(kept_right_meta[local_idx])
+        left_meta["obj_id"] = int(global_idx)
+        right_meta["obj_id"] = int(global_idx)
+        left_meta_points.append(left_meta)
+        right_meta_points.append(right_meta)
+
+    return len(kept_left), skipped
+
+
+def _run_sectioned_grid_setup(left_first, right_first, default_cols=None, default_rows=None, section_layout=None):
+    left_points = []
+    right_points = []
+    left_meta = {
+        "side": "left",
+        "mode": "sectioned_grid",
+        "sections": [],
+        "points": [],
+    }
+    right_meta = {
+        "side": "right",
+        "mode": "sectioned_grid",
+        "sections": [],
+        "points": [],
+    }
+    last_cols = default_cols
+    last_rows = default_rows
+    section_index = 0
+    fixed_layout = list(section_layout or [])
+    precollected_left_corners = None
+    precollected_right_corners = None
+    if fixed_layout:
+        total_corners = 4 * len(fixed_layout)
+        print("")
+        print(
+            f"[INFO] Click all section corner anchors once: {total_corners} points per side."
+        )
+        print(
+            "[INFO] Order is 4 points per section: top-left, top-right, bottom-left, bottom-right. "
+            "For two sections, points 0-3 are section 1 and 4-7 are section 2."
+        )
+        precollected_left_corners, precollected_right_corners = click_points_dual(
+            left_first,
+            right_first,
+            corner_collection=True,
+            required_count=total_corners,
+        )
+
+    while True:
+        section_index += 1
+        print("")
+        print(f"[SECTION {section_index}] Define one locally rectangular net patch.")
+        if fixed_layout:
+            if section_index > len(fixed_layout):
+                break
+            layout_item = fixed_layout[section_index - 1]
+            cols = int(layout_item["cols"])
+            rows = int(layout_item["rows"])
+            print(f"[INFO] Section layout from command: {cols} columns x {rows} rows")
+        else:
+            cols = _prompt_int("Section grid columns", default=last_cols, minimum=2)
+            rows = _prompt_int("Section grid rows", default=last_rows, minimum=2)
+        last_cols = cols
+        last_rows = rows
+        expected_points = int(cols) * int(rows)
+        corner_source = "manual"
+        if precollected_left_corners is not None and precollected_right_corners is not None:
+            corner_source = "manual_batch"
+            start = 4 * (section_index - 1)
+            end = start + 4
+            left_corners = precollected_left_corners[start:end]
+            right_corners = precollected_right_corners[start:end]
+            print(
+                f"[INFO] Section {section_index}: using pre-clicked anchors "
+                f"{start}-{end - 1}."
+            )
+        else:
+            print(
+                "[INFO] Click exactly 4 anchors for this section in each window, in order: "
+                "top-left, top-right, bottom-left, bottom-right. Press q when done."
+            )
+            left_corners, right_corners = click_points_dual(left_first, right_first)
+        if len(left_corners) != 4 or len(right_corners) != 4:
+            raise RuntimeError(
+                f"Section {section_index} needs exactly 4 anchors per side; "
+                f"got LEFT={len(left_corners)}, RIGHT={len(right_corners)}."
+            )
+
+        left_corner_xy = [_coerce_point_pair(p, prefer_local=False) for p in left_corners]
+        right_corner_xy = [_coerce_point_pair(p, prefer_local=False) for p in right_corners]
+        section_left_points, section_left_meta = _generate_grid_prompts_from_detection(
+            "left",
+            left_first,
+            left_corner_xy,
+            cols,
+            rows,
+            hole_net_mode=True,
+        )
+        section_right_points, section_right_meta = _generate_grid_prompts_from_detection(
+            "right",
+            right_first,
+            right_corner_xy,
+            cols,
+            rows,
+            hole_net_mode=True,
+        )
+
+        section_left_meta = _offset_section_meta(section_left_meta, section_index, len(left_points))
+        section_right_meta = _offset_section_meta(section_right_meta, section_index, len(right_points))
+
+        kept, skipped = _append_section_with_overlap_dedupe(
+            left_points,
+            right_points,
+            left_meta["points"],
+            right_meta["points"],
+            section_left_points,
+            section_right_points,
+            section_left_meta.get("points", []),
+            section_right_meta.get("points", []),
+        )
+        section_record = {
+            "section_index": int(section_index),
+            "cols": int(cols),
+            "rows": int(rows),
+            "expected_points": int(expected_points),
+            "accepted_points": int(kept),
+            "deduped_overlap_points": int(skipped),
+            "first_obj_id": int(len(left_points) - kept) if kept else None,
+            "last_obj_id": int(len(left_points) - 1) if kept else None,
+            "corner_source": corner_source,
+            "left_corners": [[float(x), float(y)] for x, y in left_corner_xy],
+            "right_corners": [[float(x), float(y)] for x, y in right_corner_xy],
+            "left_assignment": section_left_meta.get("assignment", {}),
+            "right_assignment": section_right_meta.get("assignment", {}),
+        }
+        left_meta["sections"].append(dict(section_record))
+        right_meta["sections"].append(dict(section_record))
+
+        print(
+            f"[INFO] Section {section_index}: generated {expected_points}, "
+            f"kept {kept}, skipped {skipped} overlap duplicate(s)."
+        )
+        print(
+            f"[INFO] Review all accepted prompts so far ({len(left_points)} per side). "
+            "Use two-click move for corrections, then press q to accept this section."
+        )
+        left_points, right_points = click_points_dual(
+            left_first,
+            right_first,
+            initial_left_points=left_points,
+            initial_right_points=right_points,
+            fixed_count_review=True,
+            initial_left_meta=left_meta["points"],
+            initial_right_meta=right_meta["points"],
+        )
+        if len(left_points) != len(right_points):
+            raise RuntimeError(
+                f"Sectioned setup count mismatch after review: LEFT={len(left_points)}, RIGHT={len(right_points)}"
+            )
+        left_meta = _sync_meta_positions_for_points(left_points, left_meta)
+        right_meta = _sync_meta_positions_for_points(right_points, right_meta)
+
+        if fixed_layout:
+            if section_index >= len(fixed_layout):
+                break
+            continue
+        if not _prompt_yes_no("Add another section?", default=True):
+            break
+
+    if not left_points:
+        raise RuntimeError("No sectioned setup points were accepted.")
+    return left_points, right_points, left_meta, right_meta
+
+
 def _save_semi_auto_debug(out_root: Path, left_img, right_img, left_points, right_points, left_meta, right_meta):
     debug_dir = out_root / "prompts" / "semi_auto_debug"
     debug_dir.mkdir(parents=True, exist_ok=True)
 
-    def sync_meta_positions(points, meta):
-        synced = json.loads(json.dumps(meta))
-        meta_points = synced.get("points", [])
-        for idx, point in enumerate(points):
-            if idx >= len(meta_points):
-                continue
-            x, y, _label = _coerce_prompt_point(point, prefer_local=False)
-            if abs(float(meta_points[idx].get("x", x)) - x) > 1e-3 or abs(float(meta_points[idx].get("y", y)) - y) > 1e-3:
-                meta_points[idx]["source"] = "edited"
-            meta_points[idx]["x"] = float(x)
-            meta_points[idx]["y"] = float(y)
-        return synced
-
-    left_meta = sync_meta_positions(left_points, left_meta)
-    right_meta = sync_meta_positions(right_points, right_meta)
+    left_meta = _sync_meta_positions_for_points(left_points, left_meta)
+    right_meta = _sync_meta_positions_for_points(right_points, right_meta)
 
     def draw_preview(img, points, meta, path):
         disp = img.copy()
@@ -1390,7 +2171,7 @@ def select_crop_roi(video_path: str):
     )
 
     win = "Select Crop ROI (Enter/Space confirm, c cancel)"
-    cv2.namedWindow(win, cv2.WINDOW_NORMAL)
+    _open_cv_window(win, disp.shape[1], disp.shape[0])
     roi = cv2.selectROI(win, disp, showCrosshair=True, fromCenter=False)
     cv2.destroyWindow(win)
 
@@ -1418,18 +2199,21 @@ def _draw_crop_hud(display, frame_idx, total_frames, fps, crop, g_mode, digit_bu
     x, y, w, h = crop
     cv2.rectangle(display, (x, y), (x + w, y + h), (0, 200, 255), 2)
 
-    cv2.putText(display, f"Frame: {frame_idx}/{max(0, total_frames - 1)}", (20, 30),
+    hud_h = 150
+    hud = np.zeros((hud_h, display.shape[1], 3), dtype=np.uint8)
+    cv2.putText(hud, f"Frame: {frame_idx}/{max(0, total_frames - 1)}", (20, 30),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 255, 255), 2)
-    cv2.putText(display, f"Time: {frame_idx / max(fps, 1e-6):.2f}s", (20, 58),
+    cv2.putText(hud, f"Time: {frame_idx / max(fps, 1e-6):.2f}s", (20, 58),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 255, 255), 2)
-    cv2.putText(display, "a/d frame  A/D ~1s  Ctrl+A/Ctrl+D ~10s  g goto", (20, 86),
+    cv2.putText(hud, "a/d frame  A/D ~1s  Ctrl+A/Ctrl+D ~10s  g goto", (20, 92),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-    cv2.putText(display, "q accept crop  r reselect crop  Esc cancel", (20, 112),
+    cv2.putText(hud, "q accept crop  r reselect crop  Esc cancel", (20, 122),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
 
     if g_mode:
-        cv2.putText(display, f"Go to frame: {digit_buf}_", (20, 140),
+        cv2.putText(hud, f"Go to frame: {digit_buf}_", (650, 122),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 200, 0), 2)
+    return np.vstack([hud, display])
 
 
 def review_crop_over_video(video_path: str, crop, label: str):
@@ -1449,7 +2233,7 @@ def review_crop_over_video(video_path: str, crop, label: str):
     jump_large = max(10, int(round(10 * fps)))
 
     window = f"Crop Review [{label}]"
-    cv2.namedWindow(window, cv2.WINDOW_NORMAL)
+    _open_cv_window(window, 1600, 1050)
     cv2.createTrackbar("Frame", window, 0, max(1, total_frames - 1), lambda _: None)
 
     current_frame = 0
@@ -1474,8 +2258,7 @@ def review_crop_over_video(video_path: str, crop, label: str):
             current_frame += 1
             continue
 
-        disp = frame.copy()
-        _draw_crop_hud(disp, current_frame, total_frames, fps, crop, g_mode, digit_buf)
+        disp = _draw_crop_hud(frame.copy(), current_frame, total_frames, fps, crop, g_mode, digit_buf)
         cv2.imshow(window, disp)
 
         key = cv2.waitKeyEx(30)
@@ -1567,6 +2350,8 @@ def click_points_dual(
     fixed_count_review: bool = False,
     move_existing_points: bool = False,
     anchor_review: bool = False,
+    corner_collection: bool = False,
+    required_count: int = None,
     initial_left_meta=None,
     initial_right_meta=None,
 ):
@@ -1575,10 +2360,11 @@ def click_points_dual(
     left_meta = json.loads(json.dumps(initial_left_meta or []))
     right_meta = json.loads(json.dumps(initial_right_meta or []))
     active_view_name = "left"
+    hud_h = 150
 
     def setup_view(img):
         h, w = img.shape[:2]
-        max_w, max_h = 1400, 900
+        max_w, max_h = 1800, 1000
         base_scale = min(max_w / float(w), max_h / float(h), 1.0)
         disp_w = max(1, int(round(w * base_scale)))
         disp_h = max(1, int(round(h * base_scale)))
@@ -1594,9 +2380,9 @@ def click_points_dual(
             "max_zoom": 8.0,
             "center_x": w / 2.0,
             "center_y": h / 2.0,
-            "last_mouse": (disp_w // 2, disp_h // 2),
+            "last_mouse": (disp_w // 2, hud_h + disp_h // 2),
             "dragging": False,
-            "last_drag": (disp_w // 2, disp_h // 2),
+            "last_drag": (disp_w // 2, hud_h + disp_h // 2),
             "moving_idx": None,
             "selected_idx": None,
             "add_next": False,
@@ -1608,7 +2394,10 @@ def click_points_dual(
     count_locked_review = fixed_count_review or anchor_review
     move_mode = count_locked_review or move_existing_points
 
-    if anchor_review:
+    if corner_collection:
+        left_win = "LEFT section corner anchors"
+        right_win = "RIGHT section corner anchors"
+    elif anchor_review:
         left_win = "LEFT auto corner guesses (0=TL 1=TR 2=BL 3=BR)"
         right_win = "RIGHT auto corner guesses (0=TL 1=TR 2=BL 3=BR)"
     elif fixed_count_review:
@@ -1648,11 +2437,13 @@ def click_points_dual(
         return x0, y0, x1, y1
 
     def map_disp_to_orig(view, x, y):
+        img_x = max(0, min(view["disp_w"] - 1, int(round(x))))
+        img_y = max(0, min(view["disp_h"] - 1, int(round(y)) - hud_h))
         x0, y0, x1, y1 = get_view_rect(view)
         view_w = x1 - x0
         view_h = y1 - y0
-        ox = x0 + (x / max(view["disp_w"] - 1, 1)) * view_w
-        oy = y0 + (y / max(view["disp_h"] - 1, 1)) * view_h
+        ox = x0 + (img_x / max(view["disp_w"] - 1, 1)) * view_w
+        oy = y0 + (img_y / max(view["disp_h"] - 1, 1)) * view_h
         ox = int(round(ox))
         oy = int(round(oy))
         ox = max(0, min(view["w"] - 1, ox))
@@ -1668,19 +2459,21 @@ def click_points_dual(
         return ox, oy
 
     def zoom_at_disp_point(view, x, y, new_zoom):
+        img_x = max(0, min(view["disp_w"] - 1, int(round(x))))
+        img_y = max(0, min(view["disp_h"] - 1, int(round(y)) - hud_h))
         new_zoom = max(view["min_zoom"], min(view["max_zoom"], new_zoom))
         if new_zoom == view["zoom"]:
             return
-        ox, oy = map_disp_to_orig(view, x, y)
-        fx = max(0.0, min(1.0, x / max(view["disp_w"] - 1, 1)))
-        fy = max(0.0, min(1.0, y / max(view["disp_h"] - 1, 1)))
+        ox, oy = map_disp_to_orig(view, img_x, hud_h + img_y)
+        fx = max(0.0, min(1.0, img_x / max(view["disp_w"] - 1, 1)))
+        fy = max(0.0, min(1.0, img_y / max(view["disp_h"] - 1, 1)))
         view["zoom"] = new_zoom
         new_view_w = view["w"] / view["zoom"]
         new_view_h = view["h"] / view["zoom"]
         cx = ox + (0.5 - fx) * new_view_w
         cy = oy + (0.5 - fy) * new_view_h
         view["center_x"], view["center_y"] = clamp_center(view, cx, cy)
-        view["last_mouse"] = (x, y)
+        view["last_mouse"] = (img_x, hud_h + img_y)
 
     def pan_view_with_key(view, key):
         step = max(10.0, 60.0 / float(view["zoom"]))
@@ -1759,32 +2552,37 @@ def click_points_dual(
                         2,
                     )
 
-        cv2.putText(disp, title, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
-        cv2.putText(disp, f"count={len(points)}  other={other_count}", (10, 58),
+        hud = np.zeros((hud_h, view["disp_w"], 3), dtype=np.uint8)
+        cv2.putText(hud, title, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+        cv2.putText(hud, f"count={len(points)}  other={other_count}  zoom={view['zoom']:.1f}x", (10, 62),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
-        cv2.putText(disp, f"zoom={view['zoom']:.1f}x", (10, 86),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 255), 2)
-        if anchor_review:
-            cv2.putText(disp, "Review corners: 0=TL  1=TR  2=BL  3=BR  two-click move  q accept", (10, 114),
+        if corner_collection:
+            count_text = f"{required_count} total" if required_count is not None else "4 per section"
+            cv2.putText(hud, f"Click section corners in groups of 4: TL TR BL BR  ({count_text})", (10, 100),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.56, (255, 255, 255), 2)
-            cv2.putText(disp, "MMB drag/WASD pan  c clear selection  Esc cancel  1/2 focus", (10, 140),
+            cv2.putText(hud, "For two sections: 0-3 section 1, 4-7 section 2. x undo pair  q accept  Esc cancel", (10, 128),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.54, (255, 255, 255), 2)
+        elif anchor_review:
+            cv2.putText(hud, "Review corners: 0=TL  1=TR  2=BL  3=BR  two-click move  q accept", (10, 100),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.56, (255, 255, 255), 2)
+            cv2.putText(hud, "MMB drag/WASD pan  c clear selection  Esc cancel  1/2 focus", (10, 128),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
         elif fixed_count_review:
-            cv2.putText(disp, "LMB select point, LMB again places it  RMB negative  green=verified orange=unverified magenta=anchor", (10, 114),
+            cv2.putText(hud, "LMB select point, LMB again places it  RMB negative  green=verified orange=unverified magenta=anchor", (10, 100),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.52, (255, 255, 255), 2)
-            cv2.putText(disp, "MMB drag/WASD pan  c clear selection  z undo neg  q accept  Esc cancel  1/2 focus", (10, 140),
+            cv2.putText(hud, "MMB drag/WASD pan  c clear selection  z undo neg  q accept  Esc cancel  1/2 focus", (10, 128),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
         elif move_existing_points:
-            cv2.putText(disp, "LMB select point, LMB again places it  n add next click  RMB negative", (10, 114),
+            cv2.putText(hud, "LMB select point, LMB again places it  n add next click  RMB negative", (10, 100),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.52, (255, 255, 255), 2)
-            cv2.putText(disp, "MMB drag/WASD pan  c clear selection  z undo neg  x undo object pair  q done  Esc cancel", (10, 140),
+            cv2.putText(hud, "MMB drag/WASD pan  c clear selection  z undo neg  x undo object pair  q done  Esc cancel", (10, 128),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.56, (255, 255, 255), 2)
         else:
-            cv2.putText(disp, "LMB add object  RMB add negative to nearest object  wheel/+/- zoom", (10, 114),
+            cv2.putText(hud, "LMB add object  RMB add negative to nearest object  wheel/+/- zoom", (10, 100),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2)
-            cv2.putText(disp, "MMB drag/WASD pan  z undo neg  x undo object pair  q done  Esc cancel  1/2 focus", (10, 140),
+            cv2.putText(hud, "MMB drag/WASD pan  z undo neg  x undo object pair  q done  Esc cancel  1/2 focus", (10, 128),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-        return disp
+        return np.vstack([hud, disp])
 
     def add_negative_to_nearest(points, px, py):
         if not points:
@@ -1837,7 +2635,7 @@ def click_points_dual(
         nonlocal active_view_name
         active_view_name = which_name
         if event == cv2.EVENT_MOUSEMOVE:
-            view["last_mouse"] = (x, y)
+            view["last_mouse"] = (x, max(y, hud_h))
             if view["dragging"]:
                 ddx = x - view["last_drag"][0]
                 ddy = y - view["last_drag"][1]
@@ -1846,6 +2644,8 @@ def click_points_dual(
                 view["center_y"] -= oy
                 view["last_drag"] = (x, y)
         elif event in (cv2.EVENT_LBUTTONDOWN, cv2.EVENT_RBUTTONDOWN):
+            if y < hud_h:
+                return
             px, py = map_disp_to_orig(view, x, y)
             if event == cv2.EVENT_LBUTTONDOWN:
                 if move_mode:
@@ -1867,12 +2667,16 @@ def click_points_dual(
             else:
                 add_negative_to_nearest(points, px, py)
         elif event == cv2.EVENT_MBUTTONDOWN:
+            if y < hud_h:
+                return
             view["dragging"] = True
             view["last_drag"] = (x, y)
         elif event == cv2.EVENT_MBUTTONUP:
             view["dragging"] = False
         elif event == cv2.EVENT_MOUSEWHEEL:
-            delta = 1.1 if flags > 0 else (1 / 1.1)
+            if y < hud_h:
+                return
+            delta = INTERACTIVE_ZOOM_STEP if flags > 0 else (1 / INTERACTIVE_ZOOM_STEP)
             zoom_at_disp_point(view, x, y, view["zoom"] * delta)
 
     def on_left(event, x, y, flags, param):
@@ -1881,8 +2685,8 @@ def click_points_dual(
     def on_right(event, x, y, flags, param):
         _mouse_common(event, x, y, flags, right_view, right_points, "right", right_meta)
 
-    cv2.namedWindow(left_win, cv2.WINDOW_NORMAL)
-    cv2.namedWindow(right_win, cv2.WINDOW_NORMAL)
+    _open_cv_window(left_win, left_view["disp_w"], left_view["disp_h"] + hud_h)
+    _open_cv_window(right_win, right_view["disp_w"], right_view["disp_h"] + hud_h)
     cv2.setMouseCallback(left_win, on_left)
     cv2.setMouseCallback(right_win, on_right)
 
@@ -1928,9 +2732,9 @@ def click_points_dual(
         if key in (ord("+"), ord("="), ord("-"), ord("_")):
             target = left_view if active_view_name == "left" else right_view
             if key in (ord("+"), ord("=")):
-                zoom_at_disp_point(target, *target["last_mouse"], target["zoom"] * 1.1)
+                zoom_at_disp_point(target, *target["last_mouse"], target["zoom"] * INTERACTIVE_ZOOM_STEP)
             else:
-                zoom_at_disp_point(target, *target["last_mouse"], target["zoom"] / 1.1)
+                zoom_at_disp_point(target, *target["last_mouse"], target["zoom"] / INTERACTIVE_ZOOM_STEP)
 
         if key in (ord("w"), ord("a"), ord("s"), ord("d")):
             target = left_view if active_view_name == "left" else right_view
@@ -1942,6 +2746,14 @@ def click_points_dual(
                 continue
             if len(left_points) != len(right_points):
                 print(f"Point count mismatch: LEFT={len(left_points)}, RIGHT={len(right_points)}")
+                continue
+            if required_count is not None and (
+                len(left_points) != int(required_count) or len(right_points) != int(required_count)
+            ):
+                print(
+                    f"Expected exactly {int(required_count)} points per side; "
+                    f"LEFT={len(left_points)}, RIGHT={len(right_points)}"
+                )
                 continue
             if count_locked_review and len(left_points) != len(initial_left_points or []):
                 print("Fixed-count review point count changed unexpectedly; cancel and regenerate.")
@@ -2023,15 +2835,20 @@ def _frame_cache_meta(
     frame_extractor: str,
     start_frame: int = 0,
     end_frame: int = None,
+    frame_step: int = 1,
 ):
     video = _video_signature(video_path)
     end = int(end_frame) if end_frame is not None else int(video["frame_count"])
+    step = max(1, int(frame_step))
+    source_frame_count = end - int(start_frame)
     return {
         "video": video,
         "frame_range": {
             "start_frame": int(start_frame),
             "end_frame": end,
-            "frame_count": end - int(start_frame),
+            "frame_step": step,
+            "source_frame_count": source_frame_count,
+            "frame_count": int(math.ceil(source_frame_count / float(step))),
         },
         "crop": list(crop) if crop is not None else None,
         "scale": float(scale),
@@ -2048,7 +2865,8 @@ def prepare_frame_cache(video_path: str,
                         meta_name: str = "frames_meta.json",
                         label: str = "",
                         start_frame: int = 0,
-                        end_frame: int = None):
+                        end_frame: int = None,
+                        frame_step: int = 1):
     frames_dir = Path(frames_dir)
     meta_path = frames_dir.parent / meta_name
     frame_meta = _frame_cache_meta(
@@ -2058,6 +2876,7 @@ def prepare_frame_cache(video_path: str,
         frame_extractor,
         start_frame=start_frame,
         end_frame=end_frame,
+        frame_step=frame_step,
     )
     frame_hash = _stable_hash(frame_meta)
     old_hash = None
@@ -2085,6 +2904,7 @@ def prepare_frame_cache(video_path: str,
             frame_extractor=frame_extractor,
             start_frame=start_frame,
             end_frame=end_frame,
+            frame_step=frame_step,
         )
         cache_complete, cached_count, cache_reason = _frame_cache_status(frames_dir, expected_count)
         if not cache_complete:
@@ -2183,6 +3003,7 @@ def extract_frames_opencv(
     scale: float = 1.0,
     start_frame: int = 0,
     end_frame: int = None,
+    frame_step: int = 1,
 ):
     frames_dir.mkdir(parents=True, exist_ok=True)
     cap = cv2.VideoCapture(video_path)
@@ -2192,16 +3013,21 @@ def extract_frames_opencv(
     source_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     start_frame = int(start_frame)
     end_frame = int(end_frame) if end_frame is not None else source_count
+    frame_step = max(1, int(frame_step))
     if start_frame < 0 or end_frame <= start_frame or end_frame > source_count:
         cap.release()
         raise ValueError(f"Invalid frame range [{start_frame}, {end_frame}) for {video_path}")
     cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
     crop_roi = None
-    i = 0
-    while i < end_frame - start_frame:
+    source_i = 0
+    written_i = 0
+    while source_i < end_frame - start_frame:
         ok, frame = cap.read()
         if not ok:
             break
+        if source_i % frame_step != 0:
+            source_i += 1
+            continue
 
         if crop is not None:
             if crop_roi is None:
@@ -2218,13 +3044,14 @@ def extract_frames_opencv(
             frame = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
 
         cv2.imwrite(
-            str(frames_dir / f"{i:06d}{FRAME_CACHE_EXT}"),
+            str(frames_dir / f"{written_i:06d}{FRAME_CACHE_EXT}"),
             frame,
             [cv2.IMWRITE_JPEG_QUALITY, 95],
         )
-        i += 1
+        written_i += 1
+        source_i += 1
     cap.release()
-    print(f"[OK] Extracted {i} frames to {frames_dir}")
+    print(f"[OK] Extracted {written_i} frames to {frames_dir}")
 
 
 def extract_frames(video_path: str,
@@ -2233,8 +3060,10 @@ def extract_frames(video_path: str,
                    scale: float = 1.0,
                    frame_extractor: str = "auto",
                    start_frame: int = 0,
-                   end_frame: int = None):
+                   end_frame: int = None,
+                   frame_step: int = 1):
     print(f"[INFO] Extracting frames from {video_path} to {frames_dir}")
+    frame_step = max(1, int(frame_step))
     if scale <= 0:
         raise ValueError("--scale must be > 0")
     if scale != 1.0:
@@ -2246,6 +3075,18 @@ def extract_frames(video_path: str,
 
     if frames_dir.exists():
         shutil.rmtree(frames_dir)
+
+    if frame_step > 1:
+        print(f"[INFO] Using frame_step={frame_step}; extracting every {frame_step}th source frame with OpenCV")
+        return extract_frames_opencv(
+            video_path,
+            frames_dir,
+            crop=crop,
+            scale=scale,
+            start_frame=start_frame,
+            end_frame=end_frame,
+            frame_step=frame_step,
+        )
 
     if method in ("auto", "ffmpeg"):
         try:
@@ -2272,6 +3113,7 @@ def extract_frames(video_path: str,
         scale=scale,
         start_frame=start_frame,
         end_frame=end_frame,
+        frame_step=frame_step,
     )
 
 def load_first_frame(frames_dir: Path):
@@ -2291,6 +3133,7 @@ def click_points(image_bgr, n_points):
     Press 'q' to quit (after selecting enough points).
     """
     points = []
+    hud_h = 90
 
     # Scale display to fit screen (if needed) while preserving aspect ratio
     h, w = image_bgr.shape[:2]
@@ -2303,7 +3146,7 @@ def click_points(image_bgr, n_points):
         screen_h = root.winfo_screenheight()
         root.destroy()
         max_w = int(screen_w * 0.95)
-        max_h = int(screen_h * 0.90)
+        max_h = max(1, int(screen_h * 0.90) - hud_h)
         base_scale = min(max_w / w, max_h / h, 1.0)
     except Exception:
         base_scale = 1.0
@@ -2318,9 +3161,9 @@ def click_points(image_bgr, n_points):
     max_zoom = 8.0
     center_x = w / 2.0
     center_y = h / 2.0
-    last_mouse = (display_w // 2, display_h // 2)
+    last_mouse = (display_w // 2, hud_h + display_h // 2)
     dragging = False
-    last_drag = (display_w // 2, display_h // 2)
+    last_drag = (display_w // 2, hud_h + display_h // 2)
 
     def clamp_center(cx, cy, view_w, view_h):
         half_w = view_w / 2.0
@@ -2344,11 +3187,13 @@ def click_points(image_bgr, n_points):
         return x0, y0, x1, y1
 
     def map_display_to_original(dx, dy):
+        img_x = max(0, min(display_w - 1, int(round(dx))))
+        img_y = max(0, min(display_h - 1, int(round(dy)) - hud_h))
         x0, y0, x1, y1 = get_view_rect()
         view_w = x1 - x0
         view_h = y1 - y0
-        ox = x0 + (dx / max(display_w - 1, 1)) * view_w
-        oy = y0 + (dy / max(display_h - 1, 1)) * view_h
+        ox = x0 + (img_x / max(display_w - 1, 1)) * view_w
+        oy = y0 + (img_y / max(display_h - 1, 1)) * view_h
         return int(round(ox)), int(round(oy))
 
     def map_display_delta_to_original(ddx, ddy):
@@ -2361,12 +3206,14 @@ def click_points(image_bgr, n_points):
 
     def zoom_at_display_point(dx, dy, new_zoom):
         nonlocal zoom, center_x, center_y, last_mouse
+        img_x = max(0, min(display_w - 1, int(round(dx))))
+        img_y = max(0, min(display_h - 1, int(round(dy)) - hud_h))
         new_zoom = max(min_zoom, min(max_zoom, new_zoom))
         if new_zoom == zoom:
             return
-        ox, oy = map_display_to_original(dx, dy)
-        fx = max(0.0, min(1.0, dx / max(display_w - 1, 1)))
-        fy = max(0.0, min(1.0, dy / max(display_h - 1, 1)))
+        ox, oy = map_display_to_original(img_x, hud_h + img_y)
+        fx = max(0.0, min(1.0, img_x / max(display_w - 1, 1)))
+        fy = max(0.0, min(1.0, img_y / max(display_h - 1, 1)))
         zoom = new_zoom
         view_w = w / zoom
         view_h = h / zoom
@@ -2376,7 +3223,7 @@ def click_points(image_bgr, n_points):
             view_w,
             view_h,
         )
-        last_mouse = (dx, dy)
+        last_mouse = (img_x, hud_h + img_y)
 
     def pan_display_with_key(key):
         nonlocal center_x, center_y
@@ -2404,11 +3251,12 @@ def click_points(image_bgr, n_points):
                 cv2.circle(img, (sx, sy), 6, (0, 255, 255), -1)
                 cv2.putText(img, str(idx), (sx + 8, sy - 8),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
-        cv2.putText(img, f"Zoom: {zoom:.1f}x", (10, 28),
+        hud = np.zeros((hud_h, display_w, 3), dtype=np.uint8)
+        cv2.putText(hud, f"count={len(points)}/{n_points}  zoom={zoom:.1f}x", (10, 30),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
-        cv2.putText(img, "wheel/+/- zoom  MMB drag/WASD pan",
-                    (10, 56), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-        return img
+        cv2.putText(hud, "LMB add  RMB undo  wheel/+/- zoom  MMB drag/WASD pan  q done",
+                    (10, 62), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        return np.vstack([hud, img])
 
     img = None
 
@@ -2420,7 +3268,7 @@ def click_points(image_bgr, n_points):
         nonlocal points
         nonlocal zoom, center_x, center_y, last_mouse, dragging, last_drag
         if event == cv2.EVENT_MOUSEMOVE:
-            last_mouse = (x, y)
+            last_mouse = (x, max(y, hud_h))
             if dragging:
                 ddx = x - last_drag[0]
                 ddy = y - last_drag[1]
@@ -2430,38 +3278,46 @@ def click_points(image_bgr, n_points):
                 last_drag = (x, y)
                 redraw()
         if event == cv2.EVENT_LBUTTONDOWN:
+            if y < hud_h:
+                return
             if len(points) < n_points:
                 ox, oy = map_display_to_original(x, y)
                 points.append((ox, oy))
                 redraw()
         elif event == cv2.EVENT_RBUTTONDOWN:
+            if y < hud_h:
+                return
             if points:
                 points.pop()
                 redraw()
         elif event == cv2.EVENT_MBUTTONDOWN:
+            if y < hud_h:
+                return
             dragging = True
             last_drag = (x, y)
         elif event == cv2.EVENT_MBUTTONUP:
             dragging = False
         elif event == cv2.EVENT_MOUSEWHEEL:
-            delta = 1.1 if flags > 0 else 1 / 1.1
+            if y < hud_h:
+                return
+            delta = INTERACTIVE_ZOOM_STEP if flags > 0 else 1 / INTERACTIVE_ZOOM_STEP
             old_zoom = zoom
             zoom_at_display_point(x, y, zoom * delta)
             if zoom != old_zoom:
                 redraw()
 
     redraw()
-    cv2.namedWindow("Click markers (LMB add, RMB undo, q when done)", cv2.WINDOW_NORMAL)
+    _open_cv_window("Click markers (LMB add, RMB undo, q when done)", display_w, display_h + hud_h)
     cv2.setMouseCallback("Click markers (LMB add, RMB undo, q when done)", on_mouse)
 
     while True:
         cv2.imshow("Click markers (LMB add, RMB undo, q when done)", img)
         k = cv2.waitKey(20) & 0xFF
         if k in (ord("+"), ord("=")):
-            zoom_at_display_point(*last_mouse, zoom * 1.1)
+            zoom_at_display_point(*last_mouse, zoom * INTERACTIVE_ZOOM_STEP)
             redraw()
         elif k in (ord("-"), ord("_")):
-            zoom_at_display_point(*last_mouse, zoom / 1.1)
+            zoom_at_display_point(*last_mouse, zoom / INTERACTIVE_ZOOM_STEP)
             redraw()
         elif k in (ord("w"), ord("a"), ord("s"), ord("d")):
             pan_display_with_key(k)
@@ -2647,9 +3503,9 @@ def collect_correction_clicks(frame_bgr, obj_id: int, frame_idx: int, preview_ma
         view["last_mouse"] = (x, y)
         if event == cv2.EVENT_MOUSEWHEEL:
             if flags > 0:
-                _zoom_at_disp_point(view, x, y, view["zoom"] * 1.2)
+                _zoom_at_disp_point(view, x, y, view["zoom"] * INTERACTIVE_ZOOM_STEP)
             else:
-                _zoom_at_disp_point(view, x, y, view["zoom"] / 1.2)
+                _zoom_at_disp_point(view, x, y, view["zoom"] / INTERACTIVE_ZOOM_STEP)
             return
         if mode == "box":
             if event == cv2.EVENT_LBUTTONDOWN:
@@ -2673,7 +3529,7 @@ def collect_correction_clicks(frame_bgr, obj_id: int, frame_idx: int, preview_ma
                 "label": 1 if mode == "positive" else 0,
             })
 
-    cv2.namedWindow(win, cv2.WINDOW_NORMAL)
+    _open_cv_window(win, view["disp_w"], view["disp_h"])
     cv2.setMouseCallback(win, on_mouse)
     accepted = False
     try:
@@ -2740,9 +3596,9 @@ def collect_correction_clicks(frame_bgr, obj_id: int, frame_idx: int, preview_ma
                 box_current = None
             elif key in (ord("+"), ord("="), ord("-"), ord("_")):
                 if key in (ord("+"), ord("=")):
-                    _zoom_at_disp_point(view, *view["last_mouse"], view["zoom"] * 1.2)
+                    _zoom_at_disp_point(view, *view["last_mouse"], view["zoom"] * INTERACTIVE_ZOOM_STEP)
                 else:
-                    _zoom_at_disp_point(view, *view["last_mouse"], view["zoom"] / 1.2)
+                    _zoom_at_disp_point(view, *view["last_mouse"], view["zoom"] / INTERACTIVE_ZOOM_STEP)
             elif key in (ord("w"), ord("a"), ord("s"), ord("d")):
                 step = max(10.0, 60.0 / float(view["zoom"]))
                 if key == ord("a"):
@@ -2884,8 +3740,18 @@ def parse_args():
         action="store_true",
         help="Generate a row/column prompt grid from detected painted markers, review/edit it, save setup, then exit before SAM2 compute.",
     )
+    parser.add_argument(
+        "--semi-auto-setup-sections",
+        action="store_true",
+        help="Build one setup from multiple locally rectangular semi-auto grid sections, then exit before SAM2 compute.",
+    )
     parser.add_argument("--grid-cols", type=int, default=None, help="Semi-auto grid columns; prompts when omitted.")
     parser.add_argument("--grid-rows", type=int, default=None, help="Semi-auto grid rows; prompts when omitted.")
+    parser.add_argument(
+        "--section-layout",
+        default=None,
+        help="Sectioned semi-auto layout as 'colsxrows,colsxrows' (example: 6x6,8x4). Prompts when omitted.",
+    )
     parser.add_argument(
         "--left-crop",
         default=None,
@@ -3817,7 +4683,7 @@ def run_single_video_tracking(side_name: str,
         controller_preview = preview_controller is not None
         local_preview = bool(preview and not controller_preview)
         if local_preview:
-            cv2.namedWindow(preview_win, cv2.WINDOW_NORMAL)
+            _open_cv_window(preview_win, preview_max_width, 900)
 
         stop_requested = False
         frames_seen = 0
@@ -4224,10 +5090,10 @@ def run_single_video_tracking(side_name: str,
                                             pause_center = None
                                     continue
                                 if pause_key in (ord("+"), ord("=")):
-                                    pause_zoom = min(12.0, pause_zoom * 1.25)
+                                    pause_zoom = min(12.0, pause_zoom * INTERACTIVE_ZOOM_STEP)
                                     continue
                                 if pause_key in (ord("-"), ord("_")):
-                                    pause_zoom = max(1.0, pause_zoom / 1.25)
+                                    pause_zoom = max(1.0, pause_zoom / INTERACTIVE_ZOOM_STEP)
                                     continue
                                 step = max(10.0, 60.0 / pause_zoom)
                                 cx, cy = pause_center
@@ -4693,7 +5559,7 @@ def run_dual_gpu_with_parent_preview(left_video,
         "RIGHT": "SAM2 Preview [RIGHT] (q or Esc to stop)",
     }
     for win in preview_windows.values():
-        cv2.namedWindow(win, cv2.WINDOW_NORMAL)
+        _open_cv_window(win, preview_max_width, 900)
 
     hidden_by_side = {"LEFT": set(), "RIGHT": set()}
     history_by_side = {"LEFT": {}, "RIGHT": {}}
@@ -5046,10 +5912,10 @@ def run_dual_gpu_with_parent_preview(left_video,
                                 pause_center = None
                         continue
                     if pause_key in (ord("+"), ord("=")):
-                        pause_zoom = min(12.0, pause_zoom * 1.25)
+                        pause_zoom = min(12.0, pause_zoom * INTERACTIVE_ZOOM_STEP)
                         continue
                     if pause_key in (ord("-"), ord("_")):
-                        pause_zoom = max(1.0, pause_zoom / 1.25)
+                        pause_zoom = max(1.0, pause_zoom / INTERACTIVE_ZOOM_STEP)
                         continue
                     if pause_center is None:
                         pause_center = (paused_frame.shape[1] / 2.0, paused_frame.shape[0] / 2.0)
@@ -5110,11 +5976,28 @@ def run_dual_gpu_with_parent_preview(left_video,
 def main():
     args = parse_args()
 
-    selected_setup_modes = sum(bool(v) for v in (args.setup, args.reuse_setup, args.modify_setup, args.semi_auto_setup))
+    selected_setup_modes = sum(
+        bool(v)
+        for v in (
+            args.setup,
+            args.reuse_setup,
+            args.modify_setup,
+            args.semi_auto_setup,
+            args.semi_auto_setup_sections,
+        )
+    )
     if selected_setup_modes > 1:
-        raise RuntimeError("Use only one of --setup, --semi-auto-setup, --reuse-setup, or --modify-setup.")
+        raise RuntimeError(
+            "Use only one of --setup, --semi-auto-setup, --semi-auto-setup-sections, "
+            "--reuse-setup, or --modify-setup."
+        )
 
-    if (args.setup or args.semi_auto_setup or args.modify_setup) and Path(args.out) == DEFAULT_OUT_DIR:
+    if (
+        args.setup
+        or args.semi_auto_setup
+        or args.semi_auto_setup_sections
+        or args.modify_setup
+    ) and Path(args.out) == DEFAULT_OUT_DIR:
         args.out = str(DEFAULT_LOCAL_SETUP_DIR)
 
     left_video = resolve_video_path(args.left_input)
@@ -5279,7 +6162,16 @@ def main():
         left_first = load_first_frame_from_video(left_video, crop=crop_left, frame_idx=start_frame)
         right_first = load_first_frame_from_video(right_video, crop=crop_right, frame_idx=start_frame)
 
-        if args.semi_auto_setup:
+        if args.semi_auto_setup_sections:
+            left_points, right_points, left_meta, right_meta = _run_sectioned_grid_setup(
+                left_first,
+                right_first,
+                default_cols=args.grid_cols,
+                default_rows=args.grid_rows,
+                section_layout=_parse_section_layout(args.section_layout),
+            )
+            semi_auto_debug_payload = (left_first, right_first, left_meta, right_meta)
+        elif args.semi_auto_setup:
             cols = args.grid_cols
             rows = args.grid_rows
             if cols is None:
@@ -5415,15 +6307,17 @@ def main():
         _save_semi_auto_debug(out_root, left_first, right_first, left_points, right_points, left_meta, right_meta)
         print(f"[OK] Saved semi-auto setup debug previews: {out_root / 'prompts' / 'semi_auto_debug'}")
 
-    if args.setup or args.semi_auto_setup or args.modify_setup:
+    if args.setup or args.semi_auto_setup or args.semi_auto_setup_sections or args.modify_setup:
         if corrections_path.exists():
-            if args.setup or args.semi_auto_setup:
+            if args.setup or args.semi_auto_setup or args.semi_auto_setup_sections:
                 corrections_path.unlink()
                 print(f"[OK] Cleared old corrections for fresh setup: {corrections_path}")
             else:
                 print(f"[INFO] Kept existing corrections for modified setup: {corrections_path}")
         if args.modify_setup:
             done_flag = "--modify-setup"
+        elif args.semi_auto_setup_sections:
+            done_flag = "--semi-auto-setup-sections"
         elif args.semi_auto_setup:
             done_flag = "--semi-auto-setup"
         else:
