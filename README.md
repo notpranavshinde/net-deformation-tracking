@@ -329,15 +329,15 @@ One-time remote setup:
 python remote_pipeline.py init
 ```
 
-`init` writes `remote_config.json` with the SSH host, remote repository path,
-remote Python command, and optional SSH extra arguments. This file is local and
-git-ignored.
+`init` writes the local, git-ignored `remote_config.json`, checks the remote
+environment, and asks for directories the remote machine should search for raw
+videos. It validates those directories and writes the git-ignored
+`machine_paths.json` in the remote repository automatically.
 
-If the raw videos live at different paths on the remote machine, create
-`machine_paths.json` in that machine's repository root:
+To add or replace the remote search directories later, run:
 
-```json
-{"video_roots": ["/path/to/video/root"]}
+```bash
+python remote_pipeline.py configure-paths /path/to/videos /another/video/root
 ```
 
 The queue runner uses those roots to find matching videos by basename and

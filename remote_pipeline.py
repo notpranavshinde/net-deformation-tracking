@@ -190,6 +190,52 @@ def remote_shell(config: dict, command: str) -> str:
     return f"cd {shell_quote(config['remote_repo'])} && {command}"
 
 
+def prompt_remote_video_roots() -> list[str]:
+    print_line("[INIT] Enter directories the remote machine should search for source videos.")
+    print_line("[INIT] Press Enter immediately if the videos use the same absolute paths on both machines.")
+    roots: list[str] = []
+    while True:
+        value = input(f"remote video root {len(roots) + 1} [blank to finish]: ").strip()
+        if not value:
+            return roots
+        roots.append(value)
+
+
+def configure_remote_video_roots(
+    config: dict,
+    roots: list[str],
+    *,
+    verbose: bool = False,
+    dry_run: bool = False,
+) -> None:
+    cleaned = list(dict.fromkeys(str(root).strip() for root in roots if str(root).strip()))
+    if not cleaned:
+        raise RemotePipelineError("At least one remote video root is required.")
+    payload = json.dumps({"video_roots": cleaned}, indent=2) + "\n"
+    script = (
+        "import json, os, pathlib, sys; "
+        "payload=json.load(sys.stdin); "
+        "missing=[p for p in payload['video_roots'] if not pathlib.Path(p).expanduser().is_dir()]; "
+        "missing and (print('Missing remote video root(s): ' + ', '.join(missing), file=sys.stderr) or sys.exit(2)); "
+        "target=pathlib.Path('machine_paths.json'); temp=pathlib.Path('machine_paths.json.tmp'); "
+        "temp.write_text(json.dumps(payload, indent=2) + '\\n', encoding='utf-8'); "
+        "os.replace(temp, target); print(target.resolve())"
+    )
+    command = f"{config['remote_python']} -c {shell_quote(script)}"
+    result = run_command(
+        ssh_command(config, remote_shell(config, command)),
+        verbose=verbose,
+        dry_run=dry_run,
+        input_text=payload,
+    )
+    if result.code != 0:
+        raise RemotePipelineError(translate_ssh_failure(result, config))
+    if dry_run:
+        print_line(f"[DRY-RUN] Would configure remote video roots: {', '.join(cleaned)}")
+    else:
+        print_line(f"[PATHS] Wrote remote machine_paths.json with {len(cleaned)} video root(s).")
+
+
 def translate_ssh_failure(result: CommandResult, config: dict) -> str:
     text = (result.stderr or result.stdout or "").strip()
     low = text.lower()
@@ -562,11 +608,33 @@ def cmd_init(args: argparse.Namespace) -> int:
     }
     write_json(CONFIG_PATH, config)
     print_line(f"[INIT] Wrote {CONFIG_PATH.name}")
-    return run_doctor(config, args.verbose)
+    doctor_status = run_doctor(config, args.verbose)
+    if doctor_status != 0:
+        return doctor_status
+    roots = prompt_remote_video_roots()
+    if roots:
+        configure_remote_video_roots(config, roots, verbose=args.verbose)
+    else:
+        print_line("[INIT] Remote video-root configuration skipped.")
+        print_line("[INIT] Configure it later with `python remote_pipeline.py configure-paths <directory>`.")
+    return 0
 
 
 def cmd_doctor(args: argparse.Namespace) -> int:
     return run_doctor(load_config(), args.verbose)
+
+
+def cmd_configure_paths(args: argparse.Namespace) -> int:
+    roots = args.video_roots or prompt_remote_video_roots()
+    if not roots:
+        raise RemotePipelineError("No remote video roots were provided; nothing was changed.")
+    configure_remote_video_roots(
+        load_config(),
+        roots,
+        verbose=args.verbose,
+        dry_run=args.dry_run,
+    )
+    return 0
 
 
 def cmd_push(args: argparse.Namespace) -> int:
@@ -602,8 +670,8 @@ def cmd_push(args: argparse.Namespace) -> int:
         print_line(result.stderr.rstrip())
     if result.code != 0:
         raise RemotePipelineError(
-            "Remote --check-only failed. If video resolution failed, create or fix "
-            "machine_paths.json at the remote repo root."
+            "Remote --check-only failed. If video resolution failed, run "
+            "`python remote_pipeline.py configure-paths <remote-video-directory>`."
         )
     print_line(f"[PUSH] Remote queue ready: work/pipeline_queue/{queue_id}")
     return 0
@@ -707,6 +775,20 @@ def build_parser() -> argparse.ArgumentParser:
     doctor = sub.add_parser("doctor", help="Check SSH, remote repo, Python env, GPU, and tmux.")
     add_verbose_arg(doctor)
     doctor.set_defaults(func=cmd_doctor)
+
+    paths = sub.add_parser(
+        "configure-paths",
+        help="Validate remote video directories and write remote machine_paths.json.",
+    )
+    paths.add_argument(
+        "video_roots",
+        nargs="*",
+        metavar="DIRECTORY",
+        help="One or more directories to search recursively for source videos.",
+    )
+    paths.add_argument("--dry-run", action="store_true", help="Validate command construction without changing remote files.")
+    add_verbose_arg(paths)
+    paths.set_defaults(func=cmd_configure_paths)
 
     def add_queue_arg(p: argparse.ArgumentParser) -> None:
         p.add_argument("--queue", help="Queue directory or queue_manifest.json. Defaults to newest work/pipeline_queue queue.")
