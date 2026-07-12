@@ -165,6 +165,16 @@ def validate_args(args):
         raise ValueError("--max-pairs must be >= 1")
     if hasattr(args, "workers") and args.workers < 1:
         raise ValueError("--workers must be >= 1")
+    if hasattr(args, "offset_sweep") and args.offset_sweep < 0:
+        raise ValueError("--offset-sweep must be >= 0")
+    if hasattr(args, "sweep_pairs") and args.sweep_pairs < 3:
+        raise ValueError("--sweep-pairs must be >= 3")
+    if hasattr(args, "sweep_scale") and args.sweep_scale <= 0:
+        raise ValueError("--sweep-scale must be > 0")
+    if hasattr(args, "max_stereo_rms") and args.max_stereo_rms <= 0:
+        raise ValueError("--max-stereo-rms must be > 0")
+    if hasattr(args, "min_sync_margin") and args.min_sync_margin < 0:
+        raise ValueError("--min-sync-margin must be >= 0")
 
 def downscale(frame, scale: float):
     if scale == 1.0:
@@ -1120,6 +1130,7 @@ def cmd_sync(args):
             raise RuntimeError("[SYNC] No audio peak candidates found. Try increasing --max-frames.")
         correlation = estimate_audio_frame_offset(left_audio, right_audio)
         correlation_offset = int(correlation["offset_left_minus_right"])
+        low_confidence = correlation["score_margin"] < args.min_sync_margin
 
         audio_preview_png = str(Path(args.out).with_suffix("")) + "_audio_peaks.png"
         try:
@@ -1153,6 +1164,13 @@ def cmd_sync(args):
             f"[SYNC] Audio correlation guess: LEFT-RIGHT offset={correlation_offset} frame(s), "
             f"score={correlation['score']:.3f}, margin={correlation['score_margin']:.3f}"
         )
+        if low_confidence:
+            print(
+                "\n[SYNC] *** LOW-CONFIDENCE AUDIO SYNC ***\n"
+                f"[SYNC] Correlation margin {correlation['score_margin']:.3f} is below "
+                f"--min-sync-margin {args.min_sync_margin:.3f}. Verify the offset; "
+                "run stereo with --offset-sweep before trusting this calibration.\n"
+            )
         accept_guess = bool(args.accept_sync) or prompt_yes_no(
             "[SYNC] Accept this audio correlation sync guess?", default_yes=True
         )
@@ -1182,6 +1200,7 @@ def cmd_sync(args):
         fL = pick_flash_frame(idxL, meanL)
         fR = pick_flash_frame(idxR, meanR)
         reasonL, reasonR = "flash", "flash"
+        low_confidence = False
 
     offset = fL - fR
     if offset > 0:
@@ -1214,12 +1233,17 @@ def cmd_sync(args):
         "source_start_frame": int(args.start_frame),
         "source_end_frame": int(args.end_frame) if args.end_frame is not None else None,
         "audio_correlation": correlation,
+        "low_confidence": bool(low_confidence),
     })
     print(f"[SYNC] Wrote: {args.out}")
 
-def load_sync(path: str):
+def load_sync_json(path: str) -> dict:
     with open(path, "r") as f:
-        d = json.load(f)
+        return json.load(f)
+
+
+def load_sync(path: str):
+    d = load_sync_json(path)
     return int(d["trim_left"]), int(d["trim_right"])
 
 def load_positive_indices(stats_json_path: str) -> List[int]:
@@ -1253,6 +1277,40 @@ def build_paired_indices_from_stats(trimL: int,
 
     common_g = sorted(set(left_g.keys()) & set(right_g.keys()))
     return [(left_g[g], right_g[g]) for g in common_g]
+
+
+def shifted_trims_for_stereo_offset(trimL: int, trimR: int, offset_delta: int) -> Tuple[int, int]:
+    """Return canonical non-negative trims after a LEFT-minus-RIGHT offset change.
+
+    Pairing uses global_time = source_frame - trim.  Therefore increasing the
+    LEFT-minus-RIGHT offset by one must increase trim_left - trim_right by one.
+    Canonicalizing that difference (rather than allowing a negative trim) keeps
+    this compatible with triangulation, where frame drop is derived as -trim.
+    """
+    offset_left_minus_right = int(trimL) - int(trimR) + int(offset_delta)
+    return max(offset_left_minus_right, 0), max(-offset_left_minus_right, 0)
+
+
+def update_sync_after_stereo_sweep(sync_path: str,
+                                  offset_delta: int,
+                                  rms_by_offset: dict,
+                                  usable_pairs_by_offset: dict) -> Tuple[int, int]:
+    """Persist an accepted sweep using the same trim convention as pairing."""
+    sync = load_sync_json(sync_path)
+    trimL, trimR = shifted_trims_for_stereo_offset(
+        sync["trim_left"], sync["trim_right"], offset_delta
+    )
+    sync["trim_left"] = int(trimL)
+    sync["trim_right"] = int(trimR)
+    sync["stereo_sweep"] = {
+        # This is the final LEFT-minus-RIGHT offset, not a raw frame-pair delta.
+        "applied_offset": int(trimL - trimR),
+        "offset_delta": int(offset_delta),
+        "rms_by_offset": rms_by_offset,
+        "usable_pairs_by_offset": usable_pairs_by_offset,
+    }
+    write_json(sync_path, sync)
+    return int(trimL), int(trimR)
 
 
 def collect_stats_worker(params: dict):
@@ -1718,6 +1776,146 @@ def collect_stereo_pairs_parallel(args, paired_indices: List[Tuple[int, int]], p
     return usedL, usedR, scanned
 
 
+def evenly_spaced_pairs(pairs: List[Tuple[int, int]], count: int) -> List[Tuple[int, int]]:
+    """Choose at most count source pairs while retaining coverage across the clip."""
+    if len(pairs) <= count:
+        return list(pairs)
+    positions = np.linspace(0, len(pairs) - 1, num=count, dtype=np.int64)
+    return [pairs[int(i)] for i in positions]
+
+
+def scale_camera_matrix(K: np.ndarray, scale_factor: float) -> np.ndarray:
+    """Scale camera intrinsics to match corners detected at another image scale."""
+    scaled = np.array(K, dtype=np.float64, copy=True)
+    scaled[0, :] *= float(scale_factor)
+    scaled[1, :] *= float(scale_factor)
+    scaled[2, :] = K[2, :]
+    return scaled
+
+
+def filtered_stats_pairs(trimL: int, trimR: int,
+                         left_pos: List[int], right_pos: List[int],
+                         start_frame: int, end_frame: Optional[int],
+                         totalL: int, totalR: int,
+                         max_scan: Optional[int] = None) -> List[Tuple[int, int]]:
+    """Build detected pairs and keep only source frames valid for this run."""
+    pairs = build_paired_indices_from_stats(trimL, trimR, left_pos, right_pos)
+    range_end = min(totalL, totalR, int(end_frame) if end_frame is not None else min(totalL, totalR))
+    pairs = [
+        (idxL, idxR)
+        for idxL, idxR in pairs
+        if idxL >= int(start_frame) + trimL
+        and idxR >= int(start_frame) + trimR
+        and idxL < range_end
+        and idxR < range_end
+    ]
+    if max_scan is not None and max_scan > 0:
+        pairs = pairs[:int(max_scan)]
+    return pairs
+
+
+def run_stereo_offset_sweep(args, trimL: int, trimR: int,
+                            left_pos: List[int], right_pos: List[int],
+                            totalL: int, totalR: int, raw_image_size: Tuple[int, int],
+                            pattern: Tuple[int, int], square_m: float,
+                            K1: np.ndarray, D1: np.ndarray, K2: np.ndarray, D2: np.ndarray):
+    """Score local trim offsets with a small, reduced-scale stereo calibration."""
+    sweep_scale = min(float(args.sweep_scale), float(args.scale))
+    intrinsic_scale = sweep_scale / float(args.scale)
+    sweep_size = (int(raw_image_size[0] * sweep_scale), int(raw_image_size[1] * sweep_scale))
+    K1_sweep = scale_camera_matrix(K1, intrinsic_scale)
+    K2_sweep = scale_camera_matrix(K2, intrinsic_scale)
+    sweep_debug_dir = os.path.join(os.path.dirname(args.out) or ".", "stereo_sweep_debug")
+    ensure_dir(sweep_debug_dir)
+
+    candidate_pairs_by_offset = {}
+    left_indices = set()
+    right_indices = set()
+    for offset_delta in range(-int(args.offset_sweep), int(args.offset_sweep) + 1):
+        candidate_trimL, candidate_trimR = shifted_trims_for_stereo_offset(
+            trimL, trimR, offset_delta
+        )
+        pairs = filtered_stats_pairs(
+            candidate_trimL, candidate_trimR, left_pos, right_pos,
+            args.start_frame, args.end_frame, totalL, totalR,
+        )
+        sample_pairs = evenly_spaced_pairs(pairs, int(args.sweep_pairs))
+        candidate_pairs_by_offset[offset_delta] = sample_pairs
+        left_indices.update(idxL for idxL, _idxR in sample_pairs)
+        right_indices.update(idxR for _idxL, idxR in sample_pairs)
+
+    print(
+        f"\n[STEREO] Offset sweep: deltas -{args.offset_sweep}..+{args.offset_sweep}, "
+        f"up to {args.sweep_pairs} evenly spaced pairs each at scale={sweep_scale:g}"
+    )
+    print(
+        f"[STEREO] Sweep corner cache: LEFT={len(left_indices)} frames, "
+        f"RIGHT={len(right_indices)} frames"
+    )
+    # Detect every source frame once, then reuse those samples for every offset.
+    # This keeps the sweep near the cost of a reduced stats pass rather than N full passes.
+    left_result = collect_sample_chunk_worker({
+        "video_path": args.left,
+        "idx_list": sorted(left_indices),
+        "pattern": pattern,
+        "square_m": square_m,
+        "scale": sweep_scale,
+        "label": "SWEEP_LEFT",
+        "debug_every": 0,
+        "out_dir": sweep_debug_dir,
+        "progress_queue": None,
+    })
+    right_result = collect_sample_chunk_worker({
+        "video_path": args.right,
+        "idx_list": sorted(right_indices),
+        "pattern": pattern,
+        "square_m": square_m,
+        "scale": sweep_scale,
+        "label": "SWEEP_RIGHT",
+        "debug_every": 0,
+        "out_dir": sweep_debug_dir,
+        "progress_queue": None,
+    })
+    left_samples = {int(sample.frame_idx): sample for sample in left_result["samples"]}
+    right_samples = {int(sample.frame_idx): sample for sample in right_result["samples"]}
+
+    rms_by_offset = {}
+    usable_pairs_by_offset = {}
+    print("[STEREO] Sweep table (delta is LEFT-minus-RIGHT trim adjustment):")
+    print("  delta   usable_pairs   RMS (px)")
+    for offset_delta, sample_pairs in candidate_pairs_by_offset.items():
+        usedL = [left_samples[idxL] for idxL, idxR in sample_pairs
+                 if idxL in left_samples and idxR in right_samples]
+        usedR = [right_samples[idxR] for idxL, idxR in sample_pairs
+                 if idxL in left_samples and idxR in right_samples]
+        usable = len(usedL)
+        rms = float("inf")
+        if usable >= 3:
+            try:
+                rms, _R, _T, _E, _F = stereo_calibrate(
+                    usedL, usedR, sweep_size,
+                    K1_sweep, D1, K2_sweep, D2,
+                )
+            except cv2.error as exc:
+                print(f"[STEREO] Sweep delta {offset_delta:+d}: stereoCalibrate failed ({exc}).")
+        rms_by_offset[str(offset_delta)] = None if not np.isfinite(rms) else float(rms)
+        usable_pairs_by_offset[str(offset_delta)] = int(usable)
+        rms_text = "inf" if not np.isfinite(rms) else f"{rms:.3f}"
+        print(f"  {offset_delta:+5d}   {usable:12d}   {rms_text:>8}")
+
+    finite = [
+        (float(rms), int(offset))
+        for offset, rms in rms_by_offset.items()
+        if rms is not None
+    ]
+    if not finite:
+        print("[STEREO] WARNING: no sweep candidate had enough joint detections.")
+        return None, rms_by_offset, usable_pairs_by_offset
+    best_rms, best_delta = min(finite)
+    print(f"[STEREO] Sweep best: delta {best_delta:+d}, RMS={best_rms:.3f}px")
+    return best_delta, rms_by_offset, usable_pairs_by_offset
+
+
 def compact_stats_for_print(stats: dict) -> dict:
     compact = dict(stats)
     indices = compact.get("detected_frame_indices")
@@ -1980,7 +2178,13 @@ def cmd_mono(args):
 
 def cmd_stereo(args):
     ensure_dir(os.path.dirname(args.out) or ".")
-    trimL, trimR = load_sync(args.sync)
+    sync_data = load_sync_json(args.sync)
+    trimL, trimR = int(sync_data["trim_left"]), int(sync_data["trim_right"])
+    if sync_data.get("low_confidence") and args.offset_sweep == 0:
+        print(
+            "\n[STEREO] WARNING: sync JSON is marked low_confidence. "
+            "Run again with --offset-sweep to check the temporal pairing.\n"
+        )
     pattern = (args.cols, args.rows)
     square_m = args.square_mm / 1000.0
 
@@ -1994,8 +2198,8 @@ def cmd_stereo(args):
 
     capL = open_video(args.left)
     capR = open_video(args.right)
-    totalL, _, _ = get_video_info(capL)
-    totalR, _, _ = get_video_info(capR)
+    totalL, _, raw_image_sizeL = get_video_info(capL)
+    totalR, _, _raw_image_sizeR = get_video_info(capR)
     capL.release(); capR.release()
 
     obj_template = make_object_points(pattern, square_m)
@@ -2011,18 +2215,33 @@ def cmd_stereo(args):
         right_stats_path = os.path.join(stats_dir, "stats_right.json")
         left_pos = load_positive_indices(left_stats_path)
         right_pos = load_positive_indices(right_stats_path)
-        paired_indices = build_paired_indices_from_stats(trimL, trimR, left_pos, right_pos)
-        range_end = min(totalL, totalR, int(args.end_frame) if args.end_frame is not None else min(totalL, totalR))
-        paired_indices = [
-            (idxL, idxR)
-            for idxL, idxR in paired_indices
-            if idxL >= int(args.start_frame) + trimL
-            and idxR >= int(args.start_frame) + trimR
-            and idxL < range_end
-            and idxR < range_end
-        ]
-        if args.max_scan > 0:
-            paired_indices = paired_indices[:args.max_scan]
+        if args.offset_sweep > 0:
+            best_delta, rms_by_offset, usable_pairs_by_offset = run_stereo_offset_sweep(
+                args, trimL, trimR, left_pos, right_pos, totalL, totalR, raw_image_sizeL,
+                pattern, square_m, K1, D1, K2, D2,
+            )
+            if best_delta is not None and abs(best_delta) == int(args.offset_sweep):
+                print(
+                    "[STEREO] WARNING: the minimum is at the sweep boundary; "
+                    "the range may be too small. Keeping the existing sync trims."
+                )
+            elif best_delta not in (None, 0):
+                old_trimL, old_trimR = trimL, trimR
+                trimL, trimR = update_sync_after_stereo_sweep(
+                    args.sync, best_delta, rms_by_offset, usable_pairs_by_offset
+                )
+                print(
+                    "\n[STEREO] *** APPLYING SWEEP OFFSET ***\n"
+                    f"[STEREO] delta={best_delta:+d}; trims LEFT/RIGHT "
+                    f"{old_trimL}/{old_trimR} -> {trimL}/{trimR}\n"
+                )
+            elif best_delta == 0:
+                print("[STEREO] Sweep confirms the existing sync trim; no sync JSON changes made.")
+
+        paired_indices = filtered_stats_pairs(
+            trimL, trimR, left_pos, right_pos,
+            args.start_frame, args.end_frame, totalL, totalR, args.max_scan,
+        )
         print(
             f"[STEREO] Reusing stats indices from {stats_dir}: "
             f"left_pos={len(left_pos)}, right_pos={len(right_pos)}, paired={len(paired_indices)}"
@@ -2204,6 +2423,22 @@ def cmd_stereo(args):
     print(f"[STEREO] Saved: {args.out}")
     print(f"[STEREO] Report: {os.path.splitext(args.out)[0] + '_report.json'}")
 
+    if rmsS > args.max_stereo_rms:
+        print(
+            "\n[STEREO] *** QUALITY GATE FAILED ***\n"
+            f"[STEREO] Final stereo RMS {rmsS:.3f}px exceeds --max-stereo-rms "
+            f"{args.max_stereo_rms:.3f}px. Likely causes are a bad sync offset or "
+            "temporally mismatched checkerboard pairs. Recheck sync and run --offset-sweep.\n"
+        )
+        raise RuntimeError("[STEREO] Final stereo RMS failed the quality gate.")
+    if rmsS > args.warn_stereo_rms:
+        print(
+            f"\n[STEREO] WARNING: final stereo RMS {rmsS:.3f}px exceeds "
+            f"{args.warn_stereo_rms:.3f}px. Usable, but check sync (--offset-sweep) "
+            "and consider recalibrating; sub-frame camera offset inflates this on "
+            "free-running cameras.\n"
+        )
+
 def cmd_rectify(args):
     ensure_dir(args.out)
     trimL, trimR = load_sync(args.sync)
@@ -2270,6 +2505,8 @@ def main():
                     help="Sync mode: flash (brightness) or audio peak")
     sp.add_argument("--audio-sample-rate", type=int, default=16000,
                     help="Audio sample rate used for --sync-mode audio")
+    sp.add_argument("--min-sync-margin", type=float, default=0.05,
+                    help="Mark audio sync low-confidence when correlation margin is below this value")
     sp.add_argument("--use-cuda", action="store_true", help="Use OpenCV CUDA ops when available; auto-fallback to CPU")
     sp.add_argument("--show-preview", action="store_true",
                     help="Open sync preview windows. By default previews are saved without being displayed.")
@@ -2346,6 +2583,17 @@ def main():
                     help="Reuse synchronized positive detection frame indices from stats output instead of rescanning. Default: true.")
     sp.add_argument("--stats-dir", default=DEFAULT_STATS_DIR,
                     help="Directory containing stats_left.json and stats_right.json")
+    sp.add_argument("--offset-sweep", type=int, default=0,
+                    help="Test LEFT-minus-RIGHT sync adjustments in [-N, +N]; 0 disables the sweep")
+    sp.add_argument("--sweep-pairs", type=int, default=12,
+                    help="Maximum evenly spaced pairs to calibrate per sweep offset")
+    sp.add_argument("--sweep-scale", type=float, default=0.25,
+                    help="Detection scale used only while scoring offset-sweep candidates")
+    sp.add_argument("--max-stereo-rms", type=float, default=10.0,
+                    help="Fail stereo calibration when final RMS exceeds this many pixels "
+                         "(free-running GoPros with sub-frame offset rarely beat ~5px)")
+    sp.add_argument("--warn-stereo-rms", type=float, default=5.0,
+                    help="Warn (but continue) when final RMS exceeds this many pixels")
     sp.add_argument("--use-cuda", action="store_true", help="Use OpenCV CUDA ops when available; auto-fallback to CPU")
     sp.set_defaults(func=cmd_stereo)
 
