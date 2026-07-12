@@ -10,6 +10,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+from .bootstrap import bootstrap_mesh
 from .geometry import load_stereo_calibration
 from .topology import NetTopology
 from .tracker import MeshTracker, MeshTrackResult
@@ -192,6 +193,45 @@ def write_outputs(result: MeshTrackResult, out_dir: str | Path, crops: dict | No
     )
 
 
+def print_bootstrap_audit(report: dict) -> None:
+    """Print a compact setup-QA table with one row per physical grid node."""
+    summary = report["summary"]
+    print(
+        "[BOOTSTRAP] "
+        f"confirmed={summary['confirmed']} repaired={summary['repaired']} absent={summary['absent']} "
+        f"detections={summary['detections_left']}/{summary['detections_right']} "
+        f"ordering_flags={summary['monotonic_violations']}"
+    )
+    print("  row col  obj_id  status     views        distance_px (L/R)  reason")
+    for node in report["nodes"]:
+        distance = node["repair_distance_px"]
+        values = "/".join("-" if distance[side] is None else f"{distance[side]:.1f}" for side in ("left", "right"))
+        views = ",".join(node["repaired_views"]) or "-"
+        reason = node["reason"] or ("ordering_violation" if node["monotonic_violation"] else "-")
+        print(
+            f"  {node['row']:3d} {node['col']:3d} {node['obj_id']:7d}  "
+            f"{node['status']:<10} {views:<12} {values:<18} {reason}"
+        )
+
+
+def write_bootstrap_overlay(image: np.ndarray, report: dict, path: str | Path) -> None:
+    """Write the requested human-review overlay of established left identities."""
+    overlay = image.copy()
+    colors = {"confirmed": (40, 210, 40), "repaired": (0, 180, 255), "absent": (40, 40, 230)}
+    for node in report["nodes"]:
+        point = node["left"]
+        if point is None:
+            continue
+        center = tuple(int(round(value)) for value in point)
+        color = colors[node["status"]]
+        cv2.circle(overlay, center, 5, color, 2, cv2.LINE_AA)
+        cv2.putText(overlay, str(node["obj_id"]), (center[0] + 5, center[1] - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.38, color, 1, cv2.LINE_AA)
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not cv2.imwrite(str(path), overlay):
+        raise RuntimeError(f"Could not write bootstrap overlay: {path}")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Topology-constrained stereo mesh tracker")
     parser.add_argument("--left-input", required=True)
@@ -205,6 +245,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--out", required=True)
     parser.add_argument("--grid-cols", type=int, required=True)
     parser.add_argument("--grid-rows", type=int, required=True)
+    parser.add_argument("--audit-only", action="store_true", help="Audit and repair first-frame identities without tracking")
     return parser
 
 
@@ -222,7 +263,22 @@ def main(argv=None) -> int:
     left_frames, right_frames, indices = paired_video_inputs(
         args.left_input, args.right_input, args.start_frame, args.end_frame, left_drop, right_drop
     )
-    tracker = MeshTracker(load_stereo_calibration(args.stereo), topology)
+    calibration = load_stereo_calibration(args.stereo)
+    tracker = MeshTracker(calibration, topology)
+    first_left_image = next(iter(left_frames))
+    first_right_image = next(iter(right_frames))
+    if args.audit_only:
+        audit = bootstrap_mesh(
+            first_left_image, first_right_image, np.asarray(left_points), np.asarray(right_points),
+            topology, calibration, left_roi=crops.get("left"), right_roi=crops.get("right"),
+        )
+        print_bootstrap_audit(audit.report)
+        out = Path(args.out)
+        out.mkdir(parents=True, exist_ok=True)
+        (out / "setup_audit.json").write_text(json.dumps(audit.report, indent=2) + "\n", encoding="utf-8")
+        write_bootstrap_overlay(first_left_image, audit.report, out / "bootstrap_overlay_left.png")
+        print(f"[OK] Wrote setup audit and overlay: {out}")
+        return 0
 
     def progress(done, metrics):
         if done == 1 or done % 10 == 0 or done == len(indices):
@@ -236,6 +292,7 @@ def main(argv=None) -> int:
     result = tracker.track(
         left_frames, right_frames, left_points, right_points,
         frame_indices=indices, left_roi=crops.get("left"), right_roi=crops.get("right"), progress=progress,
+        bootstrap_callback=print_bootstrap_audit,
     )
     result.report["sync"] = sync_info
     result.report["inputs"] = {
@@ -243,6 +300,7 @@ def main(argv=None) -> int:
         "start_frame": args.start_frame, "end_frame": args.end_frame,
     }
     write_outputs(result, args.out, crops)
+    write_bootstrap_overlay(first_left_image, result.report["bootstrap"], Path(args.out) / "bootstrap_overlay_left.png")
     print(f"[OK] Wrote mesh tracks and report: {Path(args.out)}")
     return 0
 

@@ -11,7 +11,7 @@ import numpy as np
 from scipy.optimize import least_squares, linear_sum_assignment
 from scipy.sparse import lil_matrix
 
-from .colormodel import MarkerColorModel
+from .bootstrap import bootstrap_mesh
 from .detect import Detection, detect_markers
 from .geometry import StereoCalibration, project_points, triangulate_point
 from .topology import NetTopology
@@ -90,6 +90,7 @@ class MeshTracker:
         self.config = config or MeshTrackerConfig()
         self._detect = detection_function
         self._edge_indices = topology.edge_indices
+        self._expected_detection_count = len(topology)
 
     @staticmethod
     def _points(points: Sequence) -> np.ndarray:
@@ -127,17 +128,6 @@ class MeshTracker:
             if distance[row, col] <= gate_px:
                 assigned[int(row)] = detections[int(col)]
         return assigned
-
-    def _snap(
-        self, points: np.ndarray, detections: Sequence[Detection], model: MarkerColorModel
-    ) -> tuple[np.ndarray, list[Detection | None]]:
-        gate = max(self.config.min_gate_px, 2.5 * max(model.patch_radius, 1))
-        assignments = self._assign(points, detections, gate)
-        snapped = points.copy()
-        for index, detection in enumerate(assignments):
-            if detection is not None:
-                snapped[index] = detection.u, detection.v
-        return snapped, assignments
 
     def _sparsity(
         self, left: Sequence[Detection | None], right: Sequence[Detection | None]
@@ -244,6 +234,7 @@ class MeshTracker:
         left_roi=None,
         right_roi=None,
         progress: Callable[[int, dict], None] | None = None,
+        bootstrap_callback: Callable[[dict], None] | None = None,
     ) -> MeshTrackResult:
         """Track paired frames; setup arrays are aligned with topology node order."""
         left_iter, right_iter = iter(left_frames), iter(right_frames)
@@ -256,25 +247,20 @@ class MeshTracker:
             raise ValueError("Setup point counts must equal topology node count")
 
         init_started = time.perf_counter()
-        tick = time.perf_counter()
-        model_l = MarkerColorModel().fit(first_left, setup_l)
-        model_r = MarkerColorModel().fit(first_right, setup_r)
-        init_fit_s = time.perf_counter() - tick
-        tick = time.perf_counter()
-        detections_l = self._detect(first_left, model_l, roi=left_roi, expected_count=len(self.topology))
-        detections_r = self._detect(first_right, model_r, roi=right_roi, expected_count=len(self.topology))
-        init_detect_s = time.perf_counter() - tick
-        tick = time.perf_counter()
-        snapped_l, _ = self._snap(setup_l, detections_l, model_l)
-        snapped_r, _ = self._snap(setup_r, detections_r, model_r)
-        positions = np.asarray(
-            [triangulate_point(a, b, self.calibration) for a, b in zip(snapped_l, snapped_r)]
+        bootstrap = bootstrap_mesh(
+            first_left, first_right, setup_l, setup_r, self.topology, self.calibration,
+            left_roi=left_roi, right_roi=right_roi, detection_function=self._detect,
         )
-        init_geometry_s = time.perf_counter() - tick
+        positions = bootstrap.positions
+        model_l, model_r = bootstrap.left_model, bootstrap.right_model
+        self.topology = bootstrap.topology
+        self._edge_indices = self.topology.edge_indices
+        if not len(self.topology):
+            raise ValueError("Bootstrap could not establish any stereo marker identities")
+        if bootstrap_callback is not None:
+            bootstrap_callback(bootstrap.report)
         initialization_timing = {
-            "color_model_fit": init_fit_s,
-            "detection": init_detect_s,
-            "snap_and_triangulation": init_geometry_s,
+            "bootstrap": time.perf_counter() - init_started,
             "total": time.perf_counter() - init_started,
         }
         if not np.all(np.isfinite(positions)):
@@ -298,8 +284,8 @@ class MeshTracker:
             spacing = self._projected_spacing(predicted)
             gate = float(np.clip(self.config.gate_radius_factor * spacing, self.config.min_gate_px, self.config.max_gate_px))
             tick = time.perf_counter()
-            det_l = self._detect(left_image, model_l, roi=left_roi, expected_count=len(self.topology))
-            det_r = self._detect(right_image, model_r, roi=right_roi, expected_count=len(self.topology))
+            det_l = self._detect(left_image, model_l, roi=left_roi, expected_count=self._expected_detection_count)
+            det_r = self._detect(right_image, model_r, roi=right_roi, expected_count=self._expected_detection_count)
             detect_s = time.perf_counter() - tick
             tick = time.perf_counter()
             left_assignment = self._assign(project_points(predicted, self.calibration.left), det_l, gate)
@@ -419,6 +405,7 @@ class MeshTracker:
             "config": asdict(self.config),
             "rest_lengths": rest.tolist(),
             "initialization_timing_s": initialization_timing,
+            "bootstrap": bootstrap.report,
             "frames": [frame.metrics for frame in frames],
             "totals": totals,
         }

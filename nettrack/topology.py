@@ -36,6 +36,8 @@ class NetTopology:
         for a, b in self.edges:
             self._neighbors[a].append(b)
             self._neighbors[b].append(a)
+        self.grid_cols: int | None = None
+        self.grid_rows: int | None = None
 
     def __len__(self) -> int:
         return len(self.node_ids)
@@ -92,7 +94,9 @@ class NetTopology:
                 edges.append((node_id, node_id + 1))
             if row + 1 < rows and node_id + cols in keep:
                 edges.append((node_id, node_id + cols))
-        return cls(node_ids, edges)
+        topology = cls(node_ids, edges)
+        topology.grid_cols, topology.grid_rows = cols, rows
+        return topology
 
     @classmethod
     def from_sections(cls, section_layout) -> "NetTopology":
