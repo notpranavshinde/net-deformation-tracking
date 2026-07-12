@@ -11,7 +11,7 @@ from scipy.optimize import linear_sum_assignment
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from nettrack.colormodel import MarkerColorModel
-from nettrack.detect import detect_markers
+from nettrack.detect import detect_in_window, detect_markers
 from nettrack.geometry import load_stereo_calibration, project_point, triangulate_point
 from nettrack.synth import SyntheticNetScene
 
@@ -96,6 +96,64 @@ def test_dropout_is_not_hallucinated():
             assert nearest > 3.0, (clean_camera.name, missing["marker_id"], nearest)
 
 
+def test_saturated_white_cores_and_bright_rod():
+    white_core_ids = list(range(0, 144, 3))
+    scene = SyntheticNetScene(
+        12, 12, seed=101, saturated_white_cores=white_core_ids, bright_rod=True
+    )
+    camera = scene.rig.left
+    setup_frame = scene.render_frame(camera, 0.0)
+    setup = np.array([[item["u"], item["v"]] for item in scene.ground_truth(camera, 0.0)])
+    model = MarkerColorModel().fit(setup_frame, setup)
+    restored = MarkerColorModel.from_json(model.to_json())
+    assert restored.core_l_min == model.core_l_min
+    assert restored.core_l_max == model.core_l_max
+
+    t = 0.30
+    truth = scene.ground_truth(camera, t)
+    detections = detect_markers(scene.render_frame(camera, t), restored, expected_count=144)
+    errors, matched = match_errors(detections, truth)
+    assert matched / 144 >= 0.99
+    assert len(detections) == 144  # the elongated bright rod must not become detection 145
+    assert float(np.max(errors)) < 0.7
+
+    actual = np.array([[item.u, item.v] for item in detections])
+    core_truth = np.array([[truth[index]["u"], truth[index]["v"]] for index in white_core_ids])
+    core_error = np.min(np.linalg.norm(core_truth[:, None] - actual[None], axis=2), axis=1)
+    assert float(np.max(core_error)) < 0.7
+
+
+def test_dim_marker_rescue_and_window_detection():
+    dim_ids = [row * 12 + col for row in range(12) for col in (0, 1, 10, 11)]
+    nominal = SyntheticNetScene(12, 12, seed=202)
+    dim = SyntheticNetScene(12, 12, seed=202, dim_markers=dim_ids)
+    camera = nominal.rig.left
+    setup = np.array([[item["u"], item["v"]] for item in nominal.ground_truth(camera, 0.0)])
+    model = MarkerColorModel().fit(nominal.render_frame(camera, 0.0), setup)
+
+    # expected_count=None stays on the nominal standard path.
+    nominal_truth = nominal.ground_truth(camera, 0.30)
+    nominal_detections = detect_markers(nominal.render_frame(camera, 0.30), model)
+    _, nominal_matched = match_errors(nominal_detections, nominal_truth)
+    assert nominal_matched == 144
+    assert len(nominal_detections) == 144
+
+    frame = dim.render_frame(dim.rig.left, 0.30)
+    truth = dim.ground_truth(dim.rig.left, 0.30)
+    detections = detect_markers(frame, model, expected_count=144)
+    actual = np.array([[item.u, item.v] for item in detections])
+    dim_truth = np.array([[truth[index]["u"], truth[index]["v"]] for index in dim_ids])
+    dim_error = np.min(np.linalg.norm(dim_truth[:, None] - actual[None], axis=2), axis=1)
+    assert float(np.mean(dim_error <= 2.0)) >= 0.95
+    assert len(detections) == 144
+
+    target = truth[dim_ids[5]]
+    found = detect_in_window(frame, model, (target["u"], target["v"]), 15, relaxed=True)
+    assert found is not None
+    assert np.hypot(found.u - target["u"], found.v - target["v"]) < 0.7
+    assert detect_in_window(frame, model, (50.0, 50.0), 15, relaxed=True) is None
+
+
 def test_geometry_round_trip():
     scene = SyntheticNetScene(12, 12, seed=17)
     rig_path = Path(__file__).with_name("_nettrack_synthetic_rig.json")
@@ -118,6 +176,8 @@ def test_geometry_round_trip():
 def main():
     test_detection_and_white_balance()
     test_dropout_is_not_hallucinated()
+    test_saturated_white_cores_and_bright_rod()
+    test_dim_marker_rescue_and_window_detection()
     test_geometry_round_trip()
     print("nettrack detection tests passed")
 

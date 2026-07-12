@@ -23,6 +23,8 @@ class MarkerColorModel:
     ab_cov: np.ndarray | None = None
     l_min: float = 0.0
     l_max: float = 255.0
+    core_l_min: float = 220.0
+    core_l_max: float = 255.0
     area_median: float = 0.0
     area_min: float = 0.0
     area_max: float = 0.0
@@ -58,6 +60,7 @@ class MarkerColorModel:
         generous = int(patch_radius) if patch_radius is not None else 16
         generous = max(4, generous)
         selected = []
+        core_samples = []
         components: list[np.ndarray] = []
         component_labs: list[np.ndarray] = []
         for x, y in points:
@@ -79,9 +82,19 @@ class MarkerColorModel:
                 label = int(np.bincount(nonzero).argmax()) if nonzero.size else 0
             mask = labels == label if label > 0 else initial.astype(bool)
             if np.count_nonzero(mask) >= 3:
+                # A bloomed marker has an orange component surrounding a bright,
+                # weak-chroma core.  Only admit bright pixels close enough to the
+                # chroma component to be part of the same physical marker.
+                neighborhood = cv2.dilate(mask.astype(np.uint8), np.ones((9, 9), np.uint8)) > 0
+                local_l = patch[..., 0]
+                bright_cutoff = max(205.0, float(np.percentile(local_l[mask], 75)) + 18.0)
+                core = neighborhood & (local_l >= bright_cutoff)
+                union = mask | core
                 pixels = patch[mask]
                 selected.append(pixels)
-                components.append(mask)
+                if np.any(core):
+                    core_samples.append(patch[core])
+                components.append(union)
                 component_labs.append(patch)
         if not selected:
             raise ValueError("Could not isolate marker-colored pixels around setup points")
@@ -103,6 +116,13 @@ class MarkerColorModel:
         l_sigma = max(float(_mad(l_values)), 8.0)
         self.l_min = max(0.0, l_med - 5.0 * l_sigma - 18.0)
         self.l_max = min(255.0, l_med + 5.0 * l_sigma + 18.0)
+        if core_samples:
+            core_l = np.concatenate(core_samples)[:, 0]
+            self.core_l_min = float(np.clip(np.percentile(core_l, 10) - 8.0, 190.0, 245.0))
+            self.core_l_max = float(np.clip(np.percentile(core_l, 99) + 3.0, self.core_l_min, 255.0))
+        else:
+            self.core_l_min = float(np.clip(np.percentile(l_values, 95) + 22.0, 205.0, 238.0))
+            self.core_l_max = 255.0
 
         areas = []
         solidities = []
@@ -140,32 +160,56 @@ class MarkerColorModel:
         self.patch_radius = int(patch_radius) if patch_radius is not None else max(4, derived_radius)
         return self
 
-    def _likelihood_lab(self, lab: np.ndarray) -> np.ndarray:
+    def _score_components_lab(self, lab: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         if self.ab_mean is None or self.ab_cov is None:
             raise RuntimeError("Color model has not been fitted")
         ab = lab[..., 1:3].astype(np.float32)
         delta = ab - self.ab_mean.astype(np.float32)
         inverse = np.linalg.inv(self.ab_cov).astype(np.float32)
         distance2 = np.einsum("...i,ij,...j->...", delta, inverse, delta, optimize=True)
-        score = np.exp(-0.5 * distance2).astype(np.float32)
-        luminance = lab[..., 0]
-        score[(luminance < self.l_min) | (luminance > self.l_max)] = 0.0
-        return np.clip(score, 0.0, 1.0)
+        chroma = np.exp(-0.5 * distance2).astype(np.float32)
+        luminance = lab[..., 0].astype(np.float32)
+        # Preserve a small, smoothly decaying response below the fitted rim
+        # range so the expected-count rescue pass can recover attenuated marks.
+        low_gap = np.maximum(self.l_min - luminance, 0.0)
+        chroma *= np.exp(-0.5 * (low_gap / 32.0) ** 2).astype(np.float32)
+        chroma[luminance > self.l_max + 8.0] *= 0.35
+
+        bright = np.clip(
+            (luminance - self.core_l_min) / max(self.core_l_max - self.core_l_min, 12.0) + 0.35,
+            0.0,
+            1.0,
+        ).astype(np.float32)
+        near_chroma = cv2.dilate((chroma >= 0.075).astype(np.uint8), np.ones((9, 9), np.uint8)) > 0
+        core = bright * near_chroma
+        combined = np.maximum(chroma, core)
+        return np.clip(combined, 0.0, 1.0), np.clip(chroma, 0.0, 1.0), core
+
+    def _likelihood_lab(self, lab: np.ndarray) -> np.ndarray:
+        return self._score_components_lab(lab)[0]
 
     def likelihood(self, image_bgr: np.ndarray) -> np.ndarray:
         """Return a vectorized per-pixel marker likelihood map in ``[0, 1]``."""
         lab = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2LAB)
         return self._likelihood_lab(lab)
 
+    def likelihood_components(
+        self, image_bgr: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Return combined, orange-rim, and adjacency-gated bright-core scores."""
+        lab = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2LAB)
+        return self._score_components_lab(lab)
+
     def to_json(self) -> str:
         """Serialize the fitted model to JSON text."""
         if self.ab_mean is None or self.ab_cov is None:
             raise RuntimeError("Color model has not been fitted")
         payload = {
-            "version": 1,
+            "version": 2,
             "ab_mean": self.ab_mean.tolist(),
             "ab_cov": self.ab_cov.tolist(),
             "l_range": [self.l_min, self.l_max],
+            "core_l_range": [self.core_l_min, self.core_l_max],
             "area_px": {"median": self.area_median, "min": self.area_min, "max": self.area_max},
             "solidity": {"median": self.solidity_median, "min": self.solidity_min},
             "patch_radius": self.patch_radius,
@@ -178,11 +222,14 @@ class MarkerColorModel:
         payload = value if isinstance(value, dict) else json.loads(value)
         area = payload["area_px"]
         solidity = payload.get("solidity", {"median": 1.0, "min": 0.7})
+        core_l = payload.get("core_l_range", [max(205.0, float(payload["l_range"][1]) - 20.0), 255.0])
         return cls(
             ab_mean=np.asarray(payload["ab_mean"], dtype=np.float64),
             ab_cov=np.asarray(payload["ab_cov"], dtype=np.float64),
             l_min=float(payload["l_range"][0]),
             l_max=float(payload["l_range"][1]),
+            core_l_min=float(core_l[0]),
+            core_l_max=float(core_l[1]),
             area_median=float(area["median"]),
             area_min=float(area["min"]),
             area_max=float(area["max"]),

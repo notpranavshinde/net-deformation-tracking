@@ -49,6 +49,9 @@ class SyntheticNetScene:
         crossing_time_s: float = 1.5,
         crossing_width_s: float = 0.35,
         crossing_separation_px: float = 12.0,
+        saturated_white_cores: bool | Any = False,
+        dim_markers: bool | Any = False,
+        bright_rod: bool = False,
     ) -> None:
         if grid_cols < 1 or grid_rows < 1:
             raise ValueError("Grid dimensions must be positive")
@@ -68,6 +71,9 @@ class SyntheticNetScene:
         self.crossing_time_s = float(crossing_time_s)
         self.crossing_width_s = float(crossing_width_s)
         self.crossing_separation_px = float(crossing_separation_px)
+        self.saturated_white_cores = saturated_white_cores
+        self.dim_markers = dim_markers
+        self.bright_rod = bool(bright_rod)
         xs = np.linspace(-width_m / 2.0, width_m / 2.0, grid_cols)
         ys = np.linspace(-height_m / 2.0, height_m / 2.0, grid_rows)
         gx, gy = np.meshgrid(xs, ys)
@@ -87,6 +93,12 @@ class SyntheticNetScene:
         self._phases = full_phases[self.marker_ids]
         self._color_jitter = rng.normal(0.0, 4.0, (gx.size, 3))
         self.rig = self._make_rig(baseline_m)
+
+    @staticmethod
+    def _selected(spec: bool | Any, marker_id: int) -> bool:
+        if isinstance(spec, (bool, np.bool_)):
+            return bool(spec)
+        return marker_id in set(int(value) for value in spec)
 
     def _make_rig(self, baseline_m: float) -> StereoCalibration:
         width, height = self.image_size
@@ -217,9 +229,36 @@ class SyntheticNetScene:
             px0, py0 = max(0, -x0), max(0, -y0)
             px1, py1 = gaussian.shape[1] - max(0, x1 - width), gaussian.shape[0] - max(0, y1 - height)
             x0, x1, y0, y1 = max(0, x0), min(width, x1), max(0, y0), min(height, y1)
-            color = np.array([24.0, 118.0, 244.0]) + self._color_jitter[marker_id]
-            alpha = (0.97 * gaussian[py0:py1, px0:px1])[..., None]
+            is_dim = self._selected(self.dim_markers, marker_id)
+            is_white_core = self._selected(self.saturated_white_cores, marker_id)
+            color = (
+                np.array([35.0, 90.0, 150.0])
+                if is_dim else np.array([24.0, 118.0, 244.0]) + self._color_jitter[marker_id]
+            )
+            alpha_scale = 0.84 if is_dim else 0.97
+            alpha = (alpha_scale * gaussian[py0:py1, px0:px1])[..., None]
             base[y0:y1, x0:x1] = base[y0:y1, x0:x1] * (1.0 - alpha) + color * alpha
+            if is_white_core:
+                core = np.exp(
+                    -0.5 * ((dx / (self.marker_sigma_px * 0.48)) ** 2 + (dy / (self.marker_sigma_px * 0.48)) ** 2)
+                )[py0:py1, px0:px1, None]
+                core_alpha = 0.99 * core
+                core_color = np.array([238.0, 250.0, 255.0])
+                base[y0:y1, x0:x1] = base[y0:y1, x0:x1] * (1.0 - core_alpha) + core_color * core_alpha
+        if self.bright_rod:
+            # A deterministic sinker-like distractor: very bright and elongated,
+            # but with no adjacent orange rim.
+            center = (int(round(width * 0.52)), int(round(height * 0.89)))
+            axes = (max(24, int(round(width * 0.075))), max(5, int(round(height * 0.010))))
+            cv2.ellipse(base, center, axes, -8.0, 0.0, 360.0, (215.0, 235.0, 248.0), -1, cv2.LINE_AA)
+            cv2.line(
+                base,
+                (center[0] - axes[0] + 4, center[1] - 2),
+                (center[0] + axes[0] - 4, center[1] - 2),
+                (245.0, 252.0, 255.0),
+                max(2, axes[1] // 3),
+                cv2.LINE_AA,
+            )
         return np.clip(base, 0.0, 255.0).astype(np.uint8)
 
     def write_videos(

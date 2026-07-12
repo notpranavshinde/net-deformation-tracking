@@ -32,10 +32,8 @@ def _parse_roi(roi: Any, width: int, height: int) -> tuple[int, int, int, int]:
         y = roi.get("y", roi.get("top", roi.get("y0", 0)))
         w = roi.get("width", roi.get("w"))
         h = roi.get("height", roi.get("h"))
-        if w is None:
-            w = roi.get("x1", width) - x
-        if h is None:
-            h = roi.get("y1", height) - y
+        w = roi.get("x1", width) - x if w is None else w
+        h = roi.get("y1", height) - y if h is None else h
     else:
         x, y, w, h = roi
     x0, y0 = max(0, int(round(x))), max(0, int(round(y)))
@@ -46,16 +44,125 @@ def _parse_roi(roi: Any, width: int, height: int) -> tuple[int, int, int, int]:
     return x0, y0, x1 - x0, y1 - y0
 
 
-def _coarse_components(score: np.ndarray, threshold: float) -> list[tuple[int, int, int, int]]:
+def _coarse_components(
+    score: np.ndarray, threshold: float, max_area: float | None = None
+) -> list[tuple[int, int, int, int, float]]:
     mask = (score >= threshold).astype(np.uint8)
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
-    count, _, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
-    components = []
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    result = []
     for label in range(1, count):
         x, y, w, h, area = (int(v) for v in stats[label])
-        if area >= 1:
-            components.append((x, y, w, h))
-    return components
+        if area < 1 or (max_area is not None and area > max_area):
+            continue
+        peak = float(np.max(score[labels == label]))
+        result.append((x, y, w, h, peak))
+    return result
+
+
+def _gates(model: MarkerColorModel, relaxed: bool) -> tuple[float, float, float, int]:
+    if relaxed:
+        area_min = max(3.0, min(model.area_min * 0.25, model.area_median * 0.20))
+        area_max = max(model.area_max * 1.55, model.area_median * 1.9)
+        solidity = max(0.62, min(0.82, model.solidity_min * 0.90))
+    else:
+        area_min = max(3.0, min(model.area_min * 0.55, model.area_median * 0.45))
+        area_max = max(model.area_max * 1.8, model.area_median * 2.2)
+        solidity = max(0.55, min(0.80, model.solidity_min * 0.85))
+    radius = max(7, int(np.ceil(np.sqrt(max(area_max, 9.0) / np.pi) * 2.2)))
+    return area_min, area_max, solidity, radius
+
+
+def _fine_detection(
+    crop: np.ndarray,
+    model: MarkerColorModel,
+    center_xy: tuple[float, float],
+    offset_xy: tuple[int, int],
+    threshold: float,
+    relaxed: bool,
+) -> Detection | None:
+    if crop.size == 0:
+        return None
+    score, chroma, core = model.likelihood_components(crop)
+    # The core is admitted only through the model's chroma-adjacency gate.  The
+    # explicit union keeps centroiding from following only the orange rim.
+    mask = (chroma >= threshold) | (core >= max(0.08, threshold))
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(mask.astype(np.uint8), connectivity=8)
+    if count <= 1:
+        return None
+    cx, cy = center_xy
+    choices = []
+    for label in range(1, count):
+        area = int(stats[label, cv2.CC_STAT_AREA])
+        lx = stats[label, cv2.CC_STAT_LEFT] + 0.5 * stats[label, cv2.CC_STAT_WIDTH]
+        ly = stats[label, cv2.CC_STAT_TOP] + 0.5 * stats[label, cv2.CC_STAT_HEIGHT]
+        choices.append((float(np.hypot(lx - cx, ly - cy)), -area, label))
+    label = min(choices)[2]
+    component = labels == label
+    area = int(stats[label, cv2.CC_STAT_AREA])
+    area_min, area_max, solidity_gate, _ = _gates(model, relaxed)
+    if area < area_min or area > area_max:
+        return None
+
+    contours = cv2.findContours(component.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)[-2]
+    if not contours:
+        return None
+    contour = max(contours, key=cv2.contourArea)
+    contour_area = float(cv2.contourArea(contour))
+    hull_area = float(cv2.contourArea(cv2.convexHull(contour)))
+    solidity = float(np.clip(contour_area / max(hull_area, 1.0), 0.0, 1.0))
+    _, _, bw, bh = cv2.boundingRect(contour)
+    aspect = max(bw, bh) / max(min(bw, bh), 1)
+    if solidity < solidity_gate or (relaxed and aspect > 1.85):
+        return None
+
+    ys, xs = np.where(component)
+    # Give every accepted union pixel a floor weight so a saturated center is
+    # represented geometrically even when its chroma probability is modest.
+    weights = np.maximum(score[component].astype(np.float64), 0.22)
+    weight_sum = float(weights.sum())
+    ox, oy = offset_xy
+    u = float(ox + np.dot(xs, weights) / weight_sum)
+    v = float(oy + np.dot(ys, weights) / weight_sum)
+    response_quality = float(np.mean(score[component]))
+    area_ratio = area / max(model.area_median, 1.0)
+    area_quality = float(np.exp(-0.5 * (np.log(max(area_ratio, 1e-6)) / 0.7) ** 2))
+    quality = float(np.clip(0.55 * response_quality + 0.25 * solidity + 0.20 * area_quality, 0.0, 1.0))
+    if relaxed:
+        quality *= 0.65
+    return Detection(u, v, area, solidity, quality)
+
+
+def _deduplicate(detections: list[Detection], min_separation: float) -> list[Detection]:
+    kept: list[Detection] = []
+    for detection in sorted(detections, key=lambda item: (item.v, item.u)):
+        duplicate = next(
+            (i for i, old in enumerate(kept) if np.hypot(detection.u - old.u, detection.v - old.v) < min_separation),
+            None,
+        )
+        if duplicate is None:
+            kept.append(detection)
+        elif detection.quality > kept[duplicate].quality:
+            kept[duplicate] = detection
+    return sorted(kept, key=lambda item: (item.v, item.u))
+
+
+def detect_in_window(
+    image_bgr: np.ndarray,
+    model: MarkerColorModel,
+    center_uv: tuple[float, float] | np.ndarray,
+    radius: int | float,
+    relaxed: bool = True,
+) -> Detection | None:
+    """Refine one marker in a window centered on a tracker prediction."""
+    height, width = image_bgr.shape[:2]
+    u, v = (float(value) for value in center_uv)
+    r = max(2, int(np.ceil(radius)))
+    x0, y0 = max(0, int(np.floor(u - r))), max(0, int(np.floor(v - r)))
+    x1, y1 = min(width, int(np.ceil(u + r + 1))), min(height, int(np.ceil(v + r + 1)))
+    crop = image_bgr[y0:y1, x0:x1]
+    threshold = 0.018 if relaxed else 0.075
+    return _fine_detection(crop, model, (u - x0, v - y0), (x0, y0), threshold, relaxed)
 
 
 def detect_markers(
@@ -64,97 +171,54 @@ def detect_markers(
     roi: Any = None,
     expected_count: int | None = None,
 ) -> list[Detection]:
-    """Detect markers with downscaled proposals and full-resolution refinement."""
+    """Detect markers, with an expected-count-only low-response rescue pass."""
     if model.ab_mean is None or model.ab_cov is None:
         raise RuntimeError("Color model has not been fitted")
     height, width = image_bgr.shape[:2]
     roi_x, roi_y, roi_w, roi_h = _parse_roi(roi, width, height)
     image = image_bgr[roi_y:roi_y + roi_h, roi_x:roi_x + roi_w]
-
     scale = 0.25
     coarse_size = (max(1, int(round(roi_w * scale))), max(1, int(round(roi_h * scale))))
-    coarse_image = cv2.resize(image, coarse_size, interpolation=cv2.INTER_AREA)
-    coarse_score = model.likelihood(coarse_image)
-    thresholds = (0.32, 0.24, 0.17, 0.11, 0.07, 0.05)
-    candidates_by_threshold = [(threshold, _coarse_components(coarse_score, threshold)) for threshold in thresholds]
-    if expected_count is None:
-        coarse_threshold, candidates = candidates_by_threshold[1]
-    else:
-        coarse_threshold, candidates = min(
-            candidates_by_threshold,
-            key=lambda item: (abs(len(item[1]) - expected_count), -item[0]),
-        )
+    coarse_score = model.likelihood(cv2.resize(image, coarse_size, interpolation=cv2.INTER_AREA))
+    coarse_threshold = 0.24 if expected_count is None else 0.17
+    candidates = _coarse_components(coarse_score, coarse_threshold)
     fine_threshold = max(0.035, min(0.10, coarse_threshold * 0.70))
-
-    area_gate_min = max(3.0, min(model.area_min * 0.55, model.area_median * 0.45))
-    area_gate_max = max(model.area_max * 1.8, model.area_median * 2.2)
-    solidity_gate = max(0.55, min(0.80, model.solidity_min * 0.85))
-    radius = max(7, int(np.ceil(np.sqrt(max(area_gate_max, 9.0) / np.pi) * 2.2)))
+    _, _, _, radius = _gates(model, False)
     detections: list[Detection] = []
-    for cx, cy, cw, ch in candidates:
-        center_x = (cx + 0.5 * cw) / scale
-        center_y = (cy + 0.5 * ch) / scale
-        x0 = max(0, int(np.floor(center_x - radius)))
-        y0 = max(0, int(np.floor(center_y - radius)))
-        x1 = min(roi_w, int(np.ceil(center_x + radius + 1)))
-        y1 = min(roi_h, int(np.ceil(center_y + radius + 1)))
-        crop = image[y0:y1, x0:x1]
-        if crop.size == 0:
-            continue
-        score = model.likelihood(crop)
-        mask = (score >= fine_threshold).astype(np.uint8)
-        count, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
-        if count <= 1:
-            continue
-        crop_center = np.array([(crop.shape[1] - 1) * 0.5, (crop.shape[0] - 1) * 0.5])
-        choices = []
-        for label in range(1, count):
-            area = int(stats[label, cv2.CC_STAT_AREA])
-            ys, xs = np.where(labels == label)
-            if area == 0:
-                continue
-            distance = float(np.hypot(xs.mean() - crop_center[0], ys.mean() - crop_center[1]))
-            choices.append((distance, -area, label))
-        if not choices:
-            continue
-        label = min(choices)[2]
-        component = labels == label
-        area = int(np.count_nonzero(component))
-        if area < area_gate_min or area > area_gate_max:
-            continue
-        ys, xs = np.where(component)
-        weights = score[component].astype(np.float64)
-        weight_sum = float(weights.sum())
-        if weight_sum <= 0.0:
-            continue
-        u = float(x0 + np.dot(xs, weights) / weight_sum + roi_x)
-        v = float(y0 + np.dot(ys, weights) / weight_sum + roi_y)
-        contour_data = cv2.findContours(component.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        contours = contour_data[-2]
-        solidity = 0.0
-        if contours:
-            contour = max(contours, key=cv2.contourArea)
-            contour_area = float(cv2.contourArea(contour))
-            hull_area = float(cv2.contourArea(cv2.convexHull(contour)))
-            solidity = float(np.clip(contour_area / max(hull_area, 1.0), 0.0, 1.0))
-        if solidity < solidity_gate:
-            continue
-        chroma_quality = float(np.mean(weights))
-        area_ratio = area / max(model.area_median, 1.0)
-        area_quality = float(np.exp(-0.5 * (np.log(max(area_ratio, 1e-6)) / 0.7) ** 2))
-        quality = float(np.clip(0.55 * chroma_quality + 0.25 * solidity + 0.20 * area_quality, 0.0, 1.0))
-        detections.append(Detection(u, v, area, solidity, quality))
+    failed: list[tuple[int, int, int, int, float]] = []
 
-    detections.sort(key=lambda item: (item.v, item.u))
-    deduplicated: list[Detection] = []
-    min_separation = max(2.0, np.sqrt(max(area_gate_min, 1.0) / np.pi))
-    for detection in detections:
-        duplicate_index = next(
-            (i for i, old in enumerate(deduplicated) if np.hypot(detection.u - old.u, detection.v - old.v) < min_separation),
-            None,
+    def refine(candidate, threshold, relaxed):
+        cx, cy, cw, ch, _ = candidate
+        center_x, center_y = (cx + 0.5 * cw) / scale, (cy + 0.5 * ch) / scale
+        x0, y0 = max(0, int(np.floor(center_x - radius))), max(0, int(np.floor(center_y - radius)))
+        x1, y1 = min(roi_w, int(np.ceil(center_x + radius + 1))), min(roi_h, int(np.ceil(center_y + radius + 1)))
+        return _fine_detection(
+            image[y0:y1, x0:x1], model, (center_x - x0, center_y - y0),
+            (x0 + roi_x, y0 + roi_y), threshold, relaxed,
         )
-        if duplicate_index is None:
-            deduplicated.append(detection)
-        elif detection.quality > deduplicated[duplicate_index].quality:
-            deduplicated[duplicate_index] = detection
-    return sorted(deduplicated, key=lambda item: (item.v, item.u))
+
+    for candidate in candidates:
+        detection = refine(candidate, fine_threshold, False)
+        (detections if detection is not None else failed).append(detection if detection is not None else candidate)
+
+    if expected_count is not None and len(detections) < expected_count:
+        local_max = cv2.dilate(coarse_score, np.ones((7, 7), np.uint8))
+        low_y, low_x = np.where((coarse_score >= 0.002) & (coarse_score >= local_max - 1e-7))
+        low = [(int(x), int(y), 1, 1, float(coarse_score[y, x])) for y, x in zip(low_y, low_x)]
+        standard_centers = np.asarray([((x + 0.5 * w), (y + 0.5 * h)) for x, y, w, h, _ in candidates])
+        rescue = list(failed)
+        for candidate in sorted(low, key=lambda item: -item[4]):
+            center = np.array([candidate[0] + 0.5 * candidate[2], candidate[1] + 0.5 * candidate[3]])
+            if len(standard_centers) and np.min(np.linalg.norm(standard_centers - center, axis=1)) < 3.0:
+                continue
+            rescue.append(candidate)
+        for candidate in rescue:
+            detection = refine(candidate, 0.018, True)
+            if detection is not None:
+                detections.append(detection)
+
+    area_min = _gates(model, bool(expected_count))[0]
+    result = _deduplicate(detections, max(2.0, np.sqrt(max(area_min, 1.0) / np.pi)))
+    if expected_count is not None and len(result) > expected_count:
+        result = sorted(result, key=lambda item: item.quality, reverse=True)[:expected_count]
+    return sorted(result, key=lambda item: (item.v, item.u))
