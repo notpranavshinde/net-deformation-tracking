@@ -45,6 +45,7 @@ class SyntheticNetScene:
         motion_blur_px: float = 0.0,
         present: Any = None,
         hidden_intervals: dict[int, tuple[float, float]] | None = None,
+        distractor_intervals: dict[int, tuple[float, float, float, float]] | None = None,
         crossing_pair: tuple[int, int] | None = None,
         crossing_time_s: float = 1.5,
         crossing_width_s: float = 0.35,
@@ -67,6 +68,7 @@ class SyntheticNetScene:
         self.dropout_probability = float(dropout_probability)
         self.motion_blur_px = float(motion_blur_px)
         self.hidden_intervals = dict(hidden_intervals or {})
+        self.distractor_intervals = dict(distractor_intervals or {})
         self.crossing_pair = tuple(crossing_pair) if crossing_pair is not None else None
         self.crossing_time_s = float(crossing_time_s)
         self.crossing_width_s = float(crossing_width_s)
@@ -245,6 +247,13 @@ class SyntheticNetScene:
                 core_alpha = 0.99 * core
                 core_color = np.array([238.0, 250.0, 255.0])
                 base[y0:y1, x0:x1] = base[y0:y1, x0:x1] * (1.0 - core_alpha) + core_color * core_alpha
+        for item in truth:
+            interval = self.distractor_intervals.get(int(item["marker_id"]))
+            if interval is None or not float(interval[0]) <= float(t) < float(interval[1]):
+                continue
+            center = (int(round(item["u"] + interval[2])), int(round(item["v"] + interval[3])))
+            cv2.circle(base, center, max(3, int(round(self.marker_sigma_px * 1.5))),
+                       (24.0, 118.0, 244.0), -1, cv2.LINE_AA)
         if self.bright_rod:
             # A deterministic sinker-like distractor: very bright and elongated,
             # but with no adjacent orange rim.

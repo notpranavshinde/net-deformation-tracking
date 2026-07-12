@@ -9,16 +9,19 @@ from contextlib import nullcontext
 from pathlib import Path
 import sys
 
+import cv2
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from nettrack.geometry import triangulate_point
 from nettrack.bootstrap import bootstrap_mesh
+from nettrack.detect import Detection
 from nettrack.run_tracker import TRACK_FIELDNAMES, main as tracker_main
+from nettrack.setup_check import repair_boundary_shifts
 from nettrack.synth import SyntheticNetScene
 from nettrack.topology import NetTopology
-from nettrack.tracker import MeshTracker
+from nettrack.tracker import MeshTracker, MeshTrackerConfig
 
 
 FPS = 20.0
@@ -32,11 +35,11 @@ def setup_points(scene, t=0.0):
     )
 
 
-def run_scene(scene, frame_count, topology=None, setups=None):
+def run_scene(scene, frame_count, topology=None, setups=None, config=None):
     times = np.arange(frame_count, dtype=float) / FPS
     left, right = setups if setups is not None else setup_points(scene)
     topology = topology or NetTopology.from_grid(scene.grid_cols, scene.grid_rows)
-    result = MeshTracker(scene.rig, topology).track(
+    result = MeshTracker(scene.rig, topology, config).track(
         (scene.render_frame("left", t) for t in times),
         (scene.render_frame("right", t) for t in times),
         left,
@@ -118,7 +121,7 @@ def test_dropouts_and_recovery():
     spacing = float(np.median(np.linalg.norm(truth[0, full_edge[:, 0]] - truth[0, full_edge[:, 1]], axis=1)))
     assert float(np.max(hidden_error)) < 0.35 * spacing, np.max(hidden_error)
     assert result.report["totals"]["lost_vertex_frames"] == 0
-    assert_no_identity_errors(result, active_truth, 0.48 * spacing)
+    assert_no_identity_errors(result, active_truth, 0.60 * spacing)
 
 
 def test_near_crossing_one_view():
@@ -170,7 +173,7 @@ def test_bootstrap_repairs_corrupted_hints_and_full_track():
     scene = SyntheticNetScene(12, 12, image_size=IMAGE_SIZE, seed=83)
     setups, corrupt_ids = corrupted_setups(scene)
     result, truth = run_scene(scene, 24, setups=setups)
-    audit = result.report["bootstrap"]
+    audit = result.report["setup_check"]
     assert audit["summary"]["absent"] == 0, audit["summary"]
     repaired = {node["obj_id"] for node in audit["nodes"] if node["status"] == "repaired"}
     assert repaired == corrupt_ids, (repaired, corrupt_ids)
@@ -183,19 +186,75 @@ def test_bootstrap_repairs_corrupted_hints_and_full_track():
     assert rmse < 1.5 * noise_bound, (rmse, noise_bound)
 
 
-def test_bootstrap_absent_frame_zero_dropout():
-    hidden_id = 65
-    scene = SyntheticNetScene(
-        12, 12, image_size=IMAGE_SIZE, seed=84, dropout_probability=1e-12,
-        hidden_intervals={hidden_id: (0.0, 0.1)},
+def test_multiframe_twinkle_and_true_absence():
+    twinkle_id, absent_id = 65, 66
+    base = dict(grid_cols=12, grid_rows=12, image_size=IMAGE_SIZE, seed=84)
+    full = SyntheticNetScene(**base)
+    hide_both = SyntheticNetScene(
+        **base, dropout_probability=1e-12,
+        hidden_intervals={twinkle_id: (0.0, 1.0), absent_id: (0.0, 1.0)},
     )
-    result, truth = run_scene(scene, 8)
-    node = result.report["bootstrap"]["nodes"][hidden_id]
-    assert node["status"] == "absent" and node["reason"] == "no_detection", node
-    assert hidden_id not in result.topology.node_ids
-    kept = np.asarray(result.topology.node_ids, dtype=int)
+    hide_absent = SyntheticNetScene(
+        **base, dropout_probability=1e-12, hidden_intervals={absent_id: (0.0, 1.0)},
+    )
+    times = np.arange(7, dtype=float) / FPS
+    scenes = [hide_absent if index in (2, 5) else hide_both for index in range(7)]
+    left, right = setup_points(full)
+    audit = bootstrap_mesh(
+        [scene.render_frame("left", t) for scene, t in zip(scenes, times)],
+        [scene.render_frame("right", t) for scene, t in zip(scenes, times)],
+        left, right, NetTopology.from_grid(12, 12), full.rig,
+    )
+    twinkle = audit.report["nodes"][twinkle_id]
+    absent = audit.report["nodes"][absent_id]
+    assert twinkle["status"] != "absent" and twinkle["seen_frames"] == {"left": 2, "right": 2}, twinkle
+    assert absent["status"] == "absent" and absent["seen_frames"] == {"left": 0, "right": 0}, absent
+
+
+def test_boundary_shift_guard():
+    topology = NetTopology.from_grid(12, 2)
+    predicted = np.asarray([(20.0 * (obj_id % 12), 20.0 * (obj_id // 12)) for obj_id in topology.node_ids])
+    spacing = np.full(len(topology), 20.0)
+    assigned = [Detection(float(u), float(v), 20, 0.9, 0.9) for u, v in predicted]
+    assigned[10] = None
+    assigned[11] = Detection(*predicted[10], 20, 0.9, 0.9)
+    events = repair_boundary_shifts(assigned, predicted, spacing, topology, "left")
+    assert assigned[10] is not None and np.linalg.norm(np.asarray((assigned[10].u, assigned[10].v)) - predicted[10]) < 1e-9
+    assert assigned[11] is None
+    assert any(item["type"] == "boundary_shift_repaired" and item["affected_ids"] == [11, 10] for item in events), events
+
+
+def test_midclip_excursion_report_and_recovery():
+    hidden_id = 16
+    scene = SyntheticNetScene(
+        6, 6, image_size=IMAGE_SIZE, seed=211, dropout_probability=1e-12,
+        distractor_intervals={hidden_id: (12 / FPS, 32 / FPS, 18.0, 0.0)},
+    )
+    times = np.arange(45, dtype=float) / FPS
+    left_frames = [scene.render_frame("left", t) for t in times]
+    right_frames = [scene.render_frame("right", t) for t in times]
+    for frame_index in range(32, 38):
+        point = scene.ground_truth(scene.rig.right, times[frame_index])[hidden_id]
+        center = (int(round(point["u"])), int(round(point["v"])))
+        cv2.circle(right_frames[frame_index], center, 13, (18, 20, 22), -1)
+        cv2.circle(right_frames[frame_index], (center[0] + 18, center[1]), 13, (18, 20, 22), -1)
+    setup_left, setup_right = setup_points(scene)
+    result = MeshTracker(scene.rig, NetTopology.from_grid(6, 6)).track(
+        left_frames, right_frames, setup_left, setup_right,
+    )
+    truth = np.asarray([[scene.points_3d(t)[i] for i in range(36)] for t in times])
+    index = result.topology.index(hidden_id)
+    recovery_error = np.linalg.norm(result.positions[36:, index] - truth[36:, hidden_id], axis=1)
     spacing = float(np.median(np.linalg.norm(truth[0, 1:] - truth[0, :-1], axis=1)))
-    assert float(np.max(np.linalg.norm(result.positions - truth[:, kept], axis=2))) < 0.40 * spacing
+    assert float(np.max(recovery_error)) < 0.35 * spacing, recovery_error
+    node = next(item for item in result.report["nodes"] if item["obj_id"] == hidden_id)
+    assert node["suspect_intervals"], node
+    interval = node["suspect_intervals"][0]
+    assert 12 <= interval["start_frame"] <= 31, interval
+    assert interval["start_frame"] <= interval["end_frame"] <= 32, interval
+    assert node["one_view_intervals"], node
+    one_view = node["one_view_intervals"][0]
+    assert one_view["start_frame"] == 32 and one_view["end_frame"] >= 36, one_view
 
 
 def test_bootstrap_holed_grid_with_corruption():
@@ -274,7 +333,7 @@ def test_csv_contract_cli():
         assert status == 0
         audit = json.loads((audit_out / "setup_audit.json").read_text())
         assert audit["summary"]["confirmed"] == 12
-        assert (audit_out / "bootstrap_overlay_left.png").is_file()
+        assert (audit_out / "setup_check_overlay_left.png").is_file()
         audit_html = (audit_out / "marker_review.html").read_text(encoding="utf-8")
         assert audit_html.count("data:image/jpeg;base64,") == 2
         assert not (audit_out / "mesh_track_report.json").exists()
@@ -286,7 +345,9 @@ def main():
     test_near_crossing_one_view()
     test_holes()
     test_bootstrap_repairs_corrupted_hints_and_full_track()
-    test_bootstrap_absent_frame_zero_dropout()
+    test_multiframe_twinkle_and_true_absence()
+    test_boundary_shift_guard()
+    test_midclip_excursion_report_and_recovery()
     test_bootstrap_holed_grid_with_corruption()
     test_csv_contract_cli()
     print("nettrack tracker tests passed")

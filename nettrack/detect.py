@@ -60,17 +60,24 @@ def _coarse_components(
     return result
 
 
-def _gates(model: MarkerColorModel, relaxed: bool) -> tuple[float, float, float, int]:
-    if relaxed:
+def _gates(model: MarkerColorModel, tier: str) -> tuple[float, float, float, float, int]:
+    if tier == "window":
         area_min = max(3.0, min(model.area_min * 0.25, model.area_median * 0.20))
-        area_max = max(model.area_max * 1.55, model.area_median * 1.9)
-        solidity = max(0.62, min(0.82, model.solidity_min * 0.90))
+        area_max = max(model.area_max * 2.5, model.area_median * 4.5)
+        solidity = max(0.30, min(0.50, model.solidity_min * 0.60))
+        aspect_max = 4.0
+    elif tier == "rescue":
+        area_min = max(3.0, min(model.area_min * 0.25, model.area_median * 0.20))
+        area_max = max(model.area_max * 1.8, model.area_median * 2.2)
+        solidity = max(0.50, min(0.70, model.solidity_min * 0.75))
+        aspect_max = 2.5
     else:
         area_min = max(3.0, min(model.area_min * 0.55, model.area_median * 0.45))
         area_max = max(model.area_max * 1.8, model.area_median * 2.2)
         solidity = max(0.55, min(0.80, model.solidity_min * 0.85))
+        aspect_max = float("inf")
     radius = max(7, int(np.ceil(np.sqrt(max(area_max, 9.0) / np.pi) * 2.2)))
-    return area_min, area_max, solidity, radius
+    return area_min, area_max, solidity, aspect_max, radius
 
 
 def _fine_detection(
@@ -79,7 +86,7 @@ def _fine_detection(
     center_xy: tuple[float, float],
     offset_xy: tuple[int, int],
     threshold: float,
-    relaxed: bool,
+    tier: str,
 ) -> Detection | None:
     if crop.size == 0:
         return None
@@ -100,7 +107,7 @@ def _fine_detection(
     label = min(choices)[2]
     component = labels == label
     area = int(stats[label, cv2.CC_STAT_AREA])
-    area_min, area_max, solidity_gate, _ = _gates(model, relaxed)
+    area_min, area_max, solidity_gate, aspect_max, _ = _gates(model, tier)
     if area < area_min or area > area_max:
         return None
 
@@ -113,7 +120,7 @@ def _fine_detection(
     solidity = float(np.clip(contour_area / max(hull_area, 1.0), 0.0, 1.0))
     _, _, bw, bh = cv2.boundingRect(contour)
     aspect = max(bw, bh) / max(min(bw, bh), 1)
-    if solidity < solidity_gate or (relaxed and aspect > 1.85):
+    if solidity < solidity_gate or aspect > aspect_max:
         return None
 
     ys, xs = np.where(component)
@@ -128,7 +135,7 @@ def _fine_detection(
     area_ratio = area / max(model.area_median, 1.0)
     area_quality = float(np.exp(-0.5 * (np.log(max(area_ratio, 1e-6)) / 0.7) ** 2))
     quality = float(np.clip(0.55 * response_quality + 0.25 * solidity + 0.20 * area_quality, 0.0, 1.0))
-    if relaxed:
+    if tier != "standard":
         quality *= 0.65
     return Detection(u, v, area, solidity, quality)
 
@@ -162,7 +169,8 @@ def detect_in_window(
     x1, y1 = min(width, int(np.ceil(u + r + 1))), min(height, int(np.ceil(v + r + 1)))
     crop = image_bgr[y0:y1, x0:x1]
     threshold = 0.018 if relaxed else 0.075
-    return _fine_detection(crop, model, (u - x0, v - y0), (x0, y0), threshold, relaxed)
+    tier = "window" if relaxed else "standard"
+    return _fine_detection(crop, model, (u - x0, v - y0), (x0, y0), threshold, tier)
 
 
 def detect_markers(
@@ -183,22 +191,22 @@ def detect_markers(
     coarse_threshold = 0.24 if expected_count is None else 0.17
     candidates = _coarse_components(coarse_score, coarse_threshold)
     fine_threshold = max(0.035, min(0.10, coarse_threshold * 0.70))
-    _, _, _, radius = _gates(model, False)
+    _, _, _, _, radius = _gates(model, "standard")
     detections: list[Detection] = []
     failed: list[tuple[int, int, int, int, float]] = []
 
-    def refine(candidate, threshold, relaxed):
+    def refine(candidate, threshold, tier):
         cx, cy, cw, ch, _ = candidate
         center_x, center_y = (cx + 0.5 * cw) / scale, (cy + 0.5 * ch) / scale
         x0, y0 = max(0, int(np.floor(center_x - radius))), max(0, int(np.floor(center_y - radius)))
         x1, y1 = min(roi_w, int(np.ceil(center_x + radius + 1))), min(roi_h, int(np.ceil(center_y + radius + 1)))
         return _fine_detection(
             image[y0:y1, x0:x1], model, (center_x - x0, center_y - y0),
-            (x0 + roi_x, y0 + roi_y), threshold, relaxed,
+            (x0 + roi_x, y0 + roi_y), threshold, tier,
         )
 
     for candidate in candidates:
-        detection = refine(candidate, fine_threshold, False)
+        detection = refine(candidate, fine_threshold, "standard")
         (detections if detection is not None else failed).append(detection if detection is not None else candidate)
 
     if expected_count is not None and len(detections) < expected_count:
@@ -213,11 +221,11 @@ def detect_markers(
                 continue
             rescue.append(candidate)
         for candidate in rescue:
-            detection = refine(candidate, 0.018, True)
+            detection = refine(candidate, 0.018, "rescue")
             if detection is not None:
                 detections.append(detection)
 
-    area_min = _gates(model, bool(expected_count))[0]
+    area_min = _gates(model, "rescue" if expected_count is not None else "standard")[0]
     result = _deduplicate(detections, max(2.0, np.sqrt(max(area_min, 1.0) / np.pi)))
     if expected_count is not None and len(result) > expected_count:
         result = sorted(result, key=lambda item: item.quality, reverse=True)[:expected_count]

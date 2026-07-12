@@ -5,6 +5,7 @@ import json
 import sys
 from pathlib import Path
 
+import cv2
 import numpy as np
 from scipy.optimize import linear_sum_assignment
 
@@ -152,6 +153,11 @@ def test_dim_marker_rescue_and_window_detection():
     assert found is not None
     assert np.hypot(found.u - target["u"], found.v - target["v"]) < 0.7
     assert detect_in_window(frame, model, (50.0, 50.0), 15, relaxed=True) is None
+
+    artifact_frame = frame.copy()
+    cv2.rectangle(artifact_frame, (30, 45), (70, 55), (24, 118, 244), -1)
+    artifact_detections = detect_markers(artifact_frame, model, expected_count=145)
+    assert all(np.hypot(item.u - 50.0, item.v - 50.0) > 15.0 for item in artifact_detections)
 
 
 def test_geometry_round_trip():

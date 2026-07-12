@@ -10,8 +10,12 @@ import numpy as np
 from scipy.optimize import linear_sum_assignment
 
 from .colormodel import MarkerColorModel
-from .detect import Detection, detect_in_window, detect_markers
+from .detect import Detection, detect_markers
 from .geometry import StereoCalibration, project_points, triangulate_point
+from .setup_check import (
+    boundary_edge_suspects, cluster_detections, extrapolate_missing_boundaries, repair_boundary_shifts,
+    rescue_across_frames,
+)
 from .topology import NetTopology
 
 
@@ -136,7 +140,7 @@ def _anchored_assign(predicted, hints, hint_inliers, detections, gates, spacing)
     return assigned
 
 
-def _view_bootstrap(image, hints, topology, model, detections):
+def _view_bootstrap(hints, topology, detections):
     grid = _grid_xy(topology)
     base_spacing = _spacing(hints, topology)
     predicted, hint_inliers = _smooth_fit(grid, hints, base_spacing)
@@ -198,14 +202,6 @@ def _view_bootstrap(image, hints, topology, model, detections):
         )
         for index, item in zip(missing, recovered):
             assigned[index] = item
-    used = {(round(item.u, 4), round(item.v, 4)) for item in assigned if item is not None}
-    for index, item in enumerate(assigned):
-        if item is not None:
-            continue
-        rescued = detect_in_window(image, model, predicted[index], np.clip(0.48 * local[index], 8, 60), True)
-        key = None if rescued is None else (round(rescued.u, 4), round(rescued.v, 4))
-        if rescued is not None and key not in used and np.linalg.norm(np.array([rescued.u, rescued.v]) - predicted[index]) <= 0.62 * local[index]:
-            assigned[index], _ = rescued, used.add(key)
     return predicted, local, assigned, hint_inliers
 
 
@@ -239,8 +235,8 @@ def _monotonic_violations(predicted: np.ndarray, topology: NetTopology) -> set[i
 
 
 def bootstrap_mesh(
-    left_image: np.ndarray,
-    right_image: np.ndarray,
+    left_image: np.ndarray | Sequence[np.ndarray],
+    right_image: np.ndarray | Sequence[np.ndarray],
     setup_left: np.ndarray,
     setup_right: np.ndarray,
     topology: NetTopology,
@@ -249,25 +245,52 @@ def bootstrap_mesh(
     left_roi=None,
     right_roi=None,
     detection_function: Callable[..., list[Detection]] = detect_markers,
+    setup_check_frames: int = 7,
+    setup_check_min_hits: int = 2,
+    cluster_radius_factor: float = 0.28,
 ) -> BootstrapResult:
-    """Establish marker identities from grid structure and stereo geometry."""
+    """Establish identities from a deterministic multi-frame setup check."""
+    def image_list(value):
+        if isinstance(value, np.ndarray):
+            return [value]
+        return list(value)
+
+    images = [image_list(left_image)[:setup_check_frames], image_list(right_image)[:setup_check_frames]]
+    if not images[0] or not images[1] or len(images[0]) != len(images[1]):
+        raise ValueError("Setup check requires an equal nonzero number of stereo frames")
+    frame_count = len(images[0])
+    min_hits = min(max(1, int(setup_check_min_hits)), frame_count)
     hints = [np.asarray(setup_left, float).reshape(-1, 2), np.asarray(setup_right, float).reshape(-1, 2)]
     if any(len(value) != len(topology) for value in hints):
         raise ValueError("Setup point counts must equal topology node count")
-    models = [MarkerColorModel().fit(image, points) for image, points in zip((left_image, right_image), hints)]
-    detections = [
-        detection_function(image, model, roi=roi, expected_count=len(topology))
-        for image, model, roi in zip((left_image, right_image), models, (left_roi, right_roi))
-    ]
+    models = [MarkerColorModel().fit(side_images[0], points) for side_images, points in zip(images, hints)]
+    detections, candidate_hits = [], []
+    for side_images, model, roi, points in zip(images, models, (left_roi, right_roi), hints):
+        by_frame = [
+            detection_function(image, model, roi=roi, expected_count=len(topology))
+            for image in side_images
+        ]
+        radius = max(3.0, cluster_radius_factor * _spacing(points, topology))
+        candidates, hits = cluster_detections(by_frame, radius, min_hits)
+        detections.append(candidates)
+        candidate_hits.append(hits)
     views = [
-        _view_bootstrap(image, points, topology, model, found)
-        for image, points, topology, model, found in zip(
-            (left_image, right_image), hints, (topology, topology), models, detections
-        )
+        _view_bootstrap(points, topology, found)
+        for points, topology, found in zip(hints, (topology, topology), detections)
     ]
     predicted = [view[0] for view in views]
     spacing = [view[1] for view in views]
     assigned = [view[2] for view in views]
+    audit = []
+    for side, name in enumerate(("left", "right")):
+        audit.extend(repair_boundary_shifts(
+            assigned[side], predicted[side], spacing[side], topology, name,
+        ))
+        extrapolate_missing_boundaries(assigned[side], predicted[side], topology)
+        assigned[side], new_hits = rescue_across_frames(
+            images[side], models[side], predicted[side], spacing[side], assigned[side], min_hits,
+        )
+        candidate_hits[side].update(new_hits)
 
     initial_errors = [
         _stereo_error(left, right, calibration)[0]
@@ -291,9 +314,12 @@ def bootstrap_mesh(
             fixed = assigned[1 - side][index]
             if fixed is None:
                 continue
-            used = {id(value) for value in assigned[side] if value is not None}
+            used = [value for value in assigned[side] if value is not None]
             for candidate in detections[side]:
-                if id(candidate) in used:
+                if any(
+                    id(candidate) == id(value) or np.hypot(candidate.u - value.u, candidate.v - value.v) < 0.12 * spacing[side][index]
+                    for value in used
+                ):
                     continue
                 distance = np.linalg.norm(np.array([candidate.u, candidate.v]) - predicted[side][index])
                 if assigned[side][index] is not None and distance > 0.72 * spacing[side][index]:
@@ -308,6 +334,8 @@ def bootstrap_mesh(
 
     violations = _monotonic_violations(predicted[0], topology) | _monotonic_violations(predicted[1], topology)
     nodes, positions, active = [], [], []
+    xyz_full = np.full((len(topology), 3), np.nan)
+    grid_cells = _grid_xy(topology)
     for index, node_id in enumerate(topology.node_ids):
         left, right = assigned[0][index], assigned[1][index]
         reason = None
@@ -316,7 +344,10 @@ def bootstrap_mesh(
             reason = "no_detection"
         else:
             error, xyz = _stereo_error(left, right, calibration)
-            if error > stereo_gate:
+            col, row = grid_cells[index]
+            boundary = col in (0, topology.grid_cols - 1) or row in (0, topology.grid_rows - 1)
+            node_stereo_gate = max(stereo_gate, 12.0) if boundary else stereo_gate
+            if error > node_stereo_gate:
                 reason = "stereo_inconsistent"
         distances = {
             side: (None if assigned[k][index] is None else float(np.linalg.norm(
@@ -338,14 +369,31 @@ def bootstrap_mesh(
         if reason is None:
             active.append(index)
             positions.append(xyz)
+            xyz_full[index] = xyz
+        hits = {
+            side: (0 if assigned[k][index] is None else int(candidate_hits[k].get(id(assigned[k][index]), 1)))
+            for k, side in enumerate(("left", "right"))
+        }
+        nodes[-1]["seen_frames"] = hits
+        nodes[-1]["setup_check_frames"] = frame_count
+    boundary_flags = boundary_edge_suspects(topology, xyz_full)
+    audit.extend(boundary_flags)
     active_node_ids = [topology.node_ids[index] for index in active]
     active_ids = set(active_node_ids)
     active_topology = NetTopology(active_node_ids, [edge for edge in topology.edges if edge[0] in active_ids and edge[1] in active_ids])
     active_topology.grid_cols, active_topology.grid_rows = topology.grid_cols, topology.grid_rows
     counts = {name: sum(node["status"] == name for node in nodes) for name in ("confirmed", "repaired", "absent")}
     report = {
-        "summary": {**counts, "detections_left": len(detections[0]), "detections_right": len(detections[1]), "monotonic_violations": len(violations), "stereo_gate_px": stereo_gate},
+        "stage": "setup check",
+        "summary": {
+            **counts, "setup_check_frames": frame_count, "min_hits": min_hits,
+            "detections_left": len(detections[0]), "detections_right": len(detections[1]),
+            "monotonic_violations": len(violations), "stereo_gate_px": stereo_gate,
+            "boundary_shift_repaired": sum(item["type"] == "boundary_shift_repaired" for item in audit),
+            "boundary_suspect": sum(item["type"] == "boundary_suspect" for item in audit),
+        },
         "nodes": nodes,
+        "audit": audit,
     }
     return BootstrapResult(
         active_topology, np.asarray(positions, float).reshape(-1, 3),

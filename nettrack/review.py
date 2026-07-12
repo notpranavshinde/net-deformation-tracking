@@ -84,7 +84,7 @@ def generate_review(
     run_dir = Path(run_dir)
     report_path = run_dir / "mesh_track_report.json"
     report = json.loads(report_path.read_text(encoding="utf-8")) if report_path.is_file() else {}
-    setup = setup_report or report.get("bootstrap")
+    setup = setup_report or report.get("setup_check") or report.get("bootstrap")
     if not setup:
         audit_path = run_dir / "setup_audit.json"
         if audit_path.is_file():
@@ -121,6 +121,7 @@ def generate_review(
 
     setup_nodes = setup["nodes"]
     setup_by_id = {int(node["obj_id"]): node for node in setup_nodes}
+    tracking_by_id = {int(node["obj_id"]): node for node in report.get("nodes", [])}
     setup_uv = {side: _setup_positions(setup_nodes, side) for side in ("left", "right")}
     payload_frames = []
     for pair, images in zip(sampled_pairs, decoded):
@@ -135,12 +136,20 @@ def generate_review(
         nodes = []
         for obj_id in node_ids:
             setup_node = setup_by_id.get(obj_id, {})
+            intervals = tracking_by_id.get(obj_id, {}).get("suspect_intervals", [])
+            one_view_intervals = tracking_by_id.get(obj_id, {}).get("one_view_intervals", [])
             node = {"id": obj_id, "row": setup_node.get("row"), "col": setup_node.get("col"),
                     "label": f"{setup_node.get('row', '?')},{setup_node.get('col', '?')}",
                     "setupStatus": setup_node.get("status", "confirmed"),
                     "reason": setup_node.get("reason"),
                     "repairedViews": setup_node.get("repaired_views", []),
-                    "repairDistance": setup_node.get("repair_distance_px", {})}
+                    "repairDistance": setup_node.get("repair_distance_px", {}),
+                    "suspectIntervals": intervals,
+                    "oneViewIntervals": one_view_intervals,
+                    "suspectNow": any(
+                        int(item["left_start_frame"]) <= pair[0] <= int(item["left_end_frame"])
+                        for item in intervals
+                    )}
             for side, frame_number in zip(("left", "right"), pair):
                 record = tracks[side].get(frame_number, {}).get(obj_id)
                 if record is None and setup_node.get("status") != "absent" and not tracks[side]:

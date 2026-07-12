@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+from itertools import islice
 from pathlib import Path
 
 import cv2
@@ -13,7 +14,7 @@ import numpy as np
 from .bootstrap import bootstrap_mesh
 from .geometry import load_stereo_calibration
 from .topology import NetTopology
-from .tracker import MeshTracker, MeshTrackResult
+from .tracker import MeshTracker, MeshTrackerConfig, MeshTrackResult
 
 
 TRACK_FIELDNAMES = [
@@ -193,11 +194,11 @@ def write_outputs(result: MeshTrackResult, out_dir: str | Path, crops: dict | No
     )
 
 
-def print_bootstrap_audit(report: dict) -> None:
+def print_setup_check_audit(report: dict) -> None:
     """Print a compact setup-QA table with one row per physical grid node."""
     summary = report["summary"]
     print(
-        "[BOOTSTRAP] "
+        "[SETUP CHECK] "
         f"confirmed={summary['confirmed']} repaired={summary['repaired']} absent={summary['absent']} "
         f"detections={summary['detections_left']}/{summary['detections_right']} "
         f"ordering_flags={summary['monotonic_violations']}"
@@ -212,9 +213,12 @@ def print_bootstrap_audit(report: dict) -> None:
             f"  {node['row']:3d} {node['col']:3d} {node['obj_id']:7d}  "
             f"{node['status']:<10} {views:<12} {values:<18} {reason}"
         )
+    for event in report.get("audit", []):
+        if event.get("type") in ("boundary_shift_repaired", "boundary_suspect"):
+            print(f"[SETUP CHECK WARNING] {event['type']}: ids={event.get('affected_ids', [])} view={event.get('view', 'stereo')}")
 
 
-def write_bootstrap_overlay(image: np.ndarray, report: dict, path: str | Path) -> None:
+def write_setup_check_overlay(image: np.ndarray, report: dict, path: str | Path) -> None:
     """Write the requested human-review overlay of established left identities."""
     overlay = image.copy()
     colors = {"confirmed": (40, 210, 40), "repaired": (0, 180, 255), "absent": (40, 40, 230)}
@@ -229,7 +233,16 @@ def write_bootstrap_overlay(image: np.ndarray, report: dict, path: str | Path) -
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     if not cv2.imwrite(str(path), overlay):
-        raise RuntimeError(f"Could not write bootstrap overlay: {path}")
+        raise RuntimeError(f"Could not write setup-check overlay: {path}")
+
+
+def add_source_interval_frames(report: dict, source_start: int) -> None:
+    """Attach source-video frame numbers to every reported interval."""
+    for node in report.get("nodes", []):
+        for key in ("suspect_intervals", "one_view_intervals"):
+            for interval in node.get(key, []):
+                interval["source_start_frame"] = int(source_start) + int(interval["left_start_frame"])
+                interval["source_end_frame"] = int(source_start) + int(interval["left_end_frame"])
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -245,8 +258,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--out", required=True)
     parser.add_argument("--grid-cols", type=int, required=True)
     parser.add_argument("--grid-rows", type=int, required=True)
-    parser.add_argument("--audit-only", action="store_true", help="Audit and repair first-frame identities without tracking")
+    parser.add_argument("--audit-only", action="store_true", help="Run the setup check without tracking")
     parser.add_argument("--review-html", action="store_true", help="Also write a self-contained marker_review.html")
+    parser.add_argument("--setup-check-frames", type=int, default=7)
+    parser.add_argument("--setup-check-min-hits", type=int, default=2)
+    parser.add_argument("--reacquire-after", type=int, default=2)
+    parser.add_argument("--excursion-threshold", type=float, default=0.08)
+    parser.add_argument("--excursion-min-len", type=int, default=5)
     return parser
 
 
@@ -265,19 +283,30 @@ def main(argv=None) -> int:
         args.left_input, args.right_input, args.start_frame, args.end_frame, left_drop, right_drop
     )
     calibration = load_stereo_calibration(args.stereo)
-    tracker = MeshTracker(calibration, topology)
+    config = MeshTrackerConfig(
+        setup_check_frames=max(1, args.setup_check_frames),
+        setup_check_min_hits=max(1, args.setup_check_min_hits),
+        reacquire_after=max(1, args.reacquire_after),
+        excursion_threshold=max(0.0, args.excursion_threshold),
+        excursion_min_len=max(1, args.excursion_min_len),
+    )
+    tracker = MeshTracker(calibration, topology, config)
     first_left_image = next(iter(left_frames))
     first_right_image = next(iter(right_frames))
     if args.audit_only:
+        setup_left = list(islice(iter(left_frames), config.setup_check_frames))
+        setup_right = list(islice(iter(right_frames), config.setup_check_frames))
         audit = bootstrap_mesh(
-            first_left_image, first_right_image, np.asarray(left_points), np.asarray(right_points),
+            setup_left, setup_right, np.asarray(left_points), np.asarray(right_points),
             topology, calibration, left_roi=crops.get("left"), right_roi=crops.get("right"),
+            setup_check_frames=config.setup_check_frames,
+            setup_check_min_hits=config.setup_check_min_hits,
         )
-        print_bootstrap_audit(audit.report)
+        print_setup_check_audit(audit.report)
         out = Path(args.out)
         out.mkdir(parents=True, exist_ok=True)
         (out / "setup_audit.json").write_text(json.dumps(audit.report, indent=2) + "\n", encoding="utf-8")
-        write_bootstrap_overlay(first_left_image, audit.report, out / "bootstrap_overlay_left.png")
+        write_setup_check_overlay(first_left_image, audit.report, out / "setup_check_overlay_left.png")
         if args.review_html:
             from .review import generate_review
             review_path, _ = generate_review(
@@ -300,15 +329,16 @@ def main(argv=None) -> int:
     result = tracker.track(
         left_frames, right_frames, left_points, right_points,
         frame_indices=indices, left_roi=crops.get("left"), right_roi=crops.get("right"), progress=progress,
-        bootstrap_callback=print_bootstrap_audit,
+        bootstrap_callback=print_setup_check_audit,
     )
     result.report["sync"] = sync_info
     result.report["inputs"] = {
         "left": str(args.left_input), "right": str(args.right_input),
         "start_frame": args.start_frame, "end_frame": args.end_frame,
     }
+    add_source_interval_frames(result.report, args.start_frame)
     write_outputs(result, args.out, crops)
-    write_bootstrap_overlay(first_left_image, result.report["bootstrap"], Path(args.out) / "bootstrap_overlay_left.png")
+    write_setup_check_overlay(first_left_image, result.report["setup_check"], Path(args.out) / "setup_check_overlay_left.png")
     if args.review_html:
         from .review import generate_review
         review_path, _ = generate_review(

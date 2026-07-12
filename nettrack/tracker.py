@@ -12,8 +12,9 @@ from scipy.optimize import least_squares, linear_sum_assignment
 from scipy.sparse import lil_matrix
 
 from .bootstrap import bootstrap_mesh
-from .detect import Detection, detect_markers
+from .detect import Detection, detect_in_window, detect_markers
 from .geometry import StereoCalibration, project_points, triangulate_point
+from .track_quality import node_edge_deviation, suspect_node_reports
 from .topology import NetTopology
 
 
@@ -32,6 +33,12 @@ class MeshTrackerConfig:
     audit_sigma: float = 4.0
     audit_min_px: float = 4.0
     rest_refine_frames: int = 10
+    setup_check_frames: int = 7
+    setup_check_min_hits: int = 2
+    setup_cluster_radius_factor: float = 0.28
+    reacquire_after: int = 2
+    excursion_threshold: float = 0.08
+    excursion_min_len: int = 5
     solver_ftol: float = 1e-4
     solver_xtol: float = 1e-4
     solver_gtol: float = 1e-4
@@ -238,29 +245,40 @@ class MeshTracker:
     ) -> MeshTrackResult:
         """Track paired frames; setup arrays are aligned with topology node order."""
         left_iter, right_iter = iter(left_frames), iter(right_frames)
-        try:
-            first_left, first_right = next(left_iter), next(right_iter)
-        except StopIteration as exc:
-            raise ValueError("At least one stereo frame pair is required") from exc
+        indices = iter(frame_indices) if frame_indices is not None else None
+        setup_pairs, setup_indices = [], []
+        for pair_index in range(max(1, self.config.setup_check_frames)):
+            try:
+                pair = next(left_iter), next(right_iter)
+            except StopIteration:
+                break
+            setup_pairs.append(pair)
+            setup_indices.append(next(indices) if indices is not None else (pair_index, pair_index))
+        if not setup_pairs:
+            raise ValueError("At least one stereo frame pair is required")
         setup_l, setup_r = self._points(setup_left), self._points(setup_right)
         if len(setup_l) != len(self.topology) or len(setup_r) != len(self.topology):
             raise ValueError("Setup point counts must equal topology node count")
 
         init_started = time.perf_counter()
-        bootstrap = bootstrap_mesh(
-            first_left, first_right, setup_l, setup_r, self.topology, self.calibration,
+        setup_check = bootstrap_mesh(
+            [pair[0] for pair in setup_pairs], [pair[1] for pair in setup_pairs],
+            setup_l, setup_r, self.topology, self.calibration,
             left_roi=left_roi, right_roi=right_roi, detection_function=self._detect,
+            setup_check_frames=self.config.setup_check_frames,
+            setup_check_min_hits=self.config.setup_check_min_hits,
+            cluster_radius_factor=self.config.setup_cluster_radius_factor,
         )
-        positions = bootstrap.positions
-        model_l, model_r = bootstrap.left_model, bootstrap.right_model
-        self.topology = bootstrap.topology
+        positions = setup_check.positions
+        model_l, model_r = setup_check.left_model, setup_check.right_model
+        self.topology = setup_check.topology
         self._edge_indices = self.topology.edge_indices
         if not len(self.topology):
-            raise ValueError("Bootstrap could not establish any stereo marker identities")
+            raise ValueError("Setup check could not establish any stereo marker identities")
         if bootstrap_callback is not None:
-            bootstrap_callback(bootstrap.report)
+            bootstrap_callback(setup_check.report)
         initialization_timing = {
-            "bootstrap": time.perf_counter() - init_started,
+            "setup_check": time.perf_counter() - init_started,
             "total": time.perf_counter() - init_started,
         }
         if not np.all(np.isfinite(positions)):
@@ -274,22 +292,38 @@ class MeshTracker:
         frames: list[MeshFrameResult] = []
         timings_total = {"detect_s": 0.0, "assign_s": 0.0, "solve_s": 0.0, "total_s": 0.0}
 
-        all_left = chain((first_left,), left_iter)
-        all_right = chain((first_right,), right_iter)
-        indices = iter(frame_indices) if frame_indices is not None else None
-        for pair_index, (left_image, right_image) in enumerate(zip(all_left, all_right)):
+        remaining_pairs = zip(left_iter, right_iter)
+        all_pairs = chain(setup_pairs, remaining_pairs)
+        all_indices = chain(setup_indices, indices) if indices is not None else None
+        for pair_index, (left_image, right_image) in enumerate(all_pairs):
             started = time.perf_counter()
-            left_frame, right_frame = next(indices) if indices is not None else (pair_index, pair_index)
+            left_frame, right_frame = next(all_indices) if all_indices is not None else (pair_index, pair_index)
             predicted = positions + self.config.velocity_damping * velocity
             spacing = self._projected_spacing(predicted)
             gate = float(np.clip(self.config.gate_radius_factor * spacing, self.config.min_gate_px, self.config.max_gate_px))
             tick = time.perf_counter()
+            projected_predictions = (
+                project_points(predicted, self.calibration.left),
+                project_points(predicted, self.calibration.right),
+            )
             det_l = self._detect(left_image, model_l, roi=left_roi, expected_count=self._expected_detection_count)
             det_r = self._detect(right_image, model_r, roi=right_roi, expected_count=self._expected_detection_count)
+            reacquired = [0, 0]
+            for side, (image, model, found, projected) in enumerate(zip(
+                (left_image, right_image), (model_l, model_r), (det_l, det_r), projected_predictions,
+            )):
+                for index in np.flatnonzero(inferred_streak >= self.config.reacquire_after):
+                    item = detect_in_window(image, model, projected[index], gate, True)
+                    if item is None:
+                        continue
+                    if any(np.hypot(item.u - old.u, item.v - old.v) < 2.0 for old in found):
+                        continue
+                    found.append(item)
+                    reacquired[side] += 1
             detect_s = time.perf_counter() - tick
             tick = time.perf_counter()
-            left_assignment = self._assign(project_points(predicted, self.calibration.left), det_l, gate)
-            right_assignment = self._assign(project_points(predicted, self.calibration.right), det_r, gate)
+            left_assignment = self._assign(projected_predictions[0], det_l, gate)
+            right_assignment = self._assign(projected_predictions[1], det_r, gate)
             assign_s = time.perf_counter() - tick
             tick = time.perf_counter()
             solve_initial = predicted.copy()
@@ -356,6 +390,9 @@ class MeshTracker:
                 rest = np.asarray([
                     np.mean(history[:, i][deviation[:, i] <= cutoff[i]]) for i in range(len(rest))
                 ])
+            per_node_deviation = node_edge_deviation(
+                self._edge_indices, edge_lengths, rest, len(self.topology),
+            )
             total_s = time.perf_counter() - started
             metrics = {
                 "pair_index": pair_index, "left_frame": int(left_frame), "right_frame": int(right_frame),
@@ -364,6 +401,8 @@ class MeshTracker:
                 "inferred": int(np.count_nonzero(np.asarray(statuses) == "inferred")),
                 "lost": int(np.count_nonzero(np.asarray(statuses) == "lost")),
                 "audit_drops": int(audit_drops), "solver_iterations": int(solved.nfev),
+                "reacquired_left": reacquired[0], "reacquired_right": reacquired[1],
+                "node_edge_relative_deviation": per_node_deviation.tolist(),
                 "edge_length_mean": float(np.mean(edge_lengths)) if len(edge_lengths) else 0.0,
                 "edge_length_std": float(np.std(edge_lengths)) if len(edge_lengths) else 0.0,
                 "rest_length_mean": float(np.mean(rest)) if len(rest) else 0.0,
@@ -384,6 +423,10 @@ class MeshTracker:
 
         if not frames:
             raise ValueError("The stereo iterables did not contain a complete frame pair")
+        node_reports, suspect_count = suspect_node_reports(
+            frames, self.topology, self.config.excursion_threshold, self.config.excursion_min_len,
+        )
+        one_view_count = sum(len(node["one_view_intervals"]) for node in node_reports)
         totals = {
             "frames": len(frames),
             "inferred_vertex_frames": sum(frame.metrics["inferred"] for frame in frames),
@@ -394,18 +437,23 @@ class MeshTracker:
             "assignments_left": sum(frame.metrics["assignments_left"] for frame in frames),
             "assignments_right": sum(frame.metrics["assignments_right"] for frame in frames),
             "solver_iterations": sum(frame.metrics["solver_iterations"] for frame in frames),
+            "reacquired_left": sum(frame.metrics["reacquired_left"] for frame in frames),
+            "reacquired_right": sum(frame.metrics["reacquired_right"] for frame in frames),
+            "suspect_intervals": suspect_count,
+            "one_view_intervals": one_view_count,
             "timing_s": timings_total,
             "mean_seconds_per_pair": timings_total["total_s"] / len(frames),
         }
         report = {
-            "schema_version": 1,
+            "schema_version": 2,
             "coordinate_residual_space": "distorted_pixels",
             "node_ids": list(self.topology.node_ids),
             "edges": [list(edge) for edge in self.topology.edges],
             "config": asdict(self.config),
             "rest_lengths": rest.tolist(),
             "initialization_timing_s": initialization_timing,
-            "bootstrap": bootstrap.report,
+            "setup_check": setup_check.report,
+            "nodes": node_reports,
             "frames": [frame.metrics for frame in frames],
             "totals": totals,
         }
