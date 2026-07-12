@@ -60,6 +60,13 @@ def test_synthetic_review():
         "source_start_frame": 2, "source_end_frame": 7,
         "length": 6,
     }]
+    node["inferred_intervals"] = [{
+        "start_frame": 10, "end_frame": 30,
+        "left_start_frame": 10, "left_end_frame": 30,
+        "right_start_frame": 10, "right_end_frame": 30,
+        "source_start_frame": 10, "source_end_frame": 30,
+        "length": 21,
+    }]
     report_path.write_text(json.dumps(report), encoding="utf-8")
     generate_review(out, left_video, right_video, 0, frames=9)
     review = out / "marker_review.html"
@@ -73,7 +80,10 @@ def test_synthetic_review():
     assert '"suspectNow":true' in html
     assert '"source_start_frame":4' in html
     assert '"oneViewIntervals"' in html
+    assert '"inferredIntervals"' in html
     assert "one-camera only, frames" in html
+    assert "no detections, lattice guess, frames" in html
+    assert "(source)" in html
     assert "check frames" in html and "#8f5cff" in html
     for status in ("measured", "inferred", "repaired", "absent"):
         assert status in html

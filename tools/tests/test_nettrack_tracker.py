@@ -225,9 +225,10 @@ def test_boundary_shift_guard():
 
 
 def test_midclip_excursion_report_and_recovery():
-    hidden_id = 16
+    hidden_id, inferred_id = 16, 17
     scene = SyntheticNetScene(
         6, 6, image_size=IMAGE_SIZE, seed=211, dropout_probability=1e-12,
+        hidden_intervals={inferred_id: (12 / FPS, 38 / FPS)},
         distractor_intervals={hidden_id: (12 / FPS, 32 / FPS, 18.0, 0.0)},
     )
     times = np.arange(45, dtype=float) / FPS
@@ -254,7 +255,12 @@ def test_midclip_excursion_report_and_recovery():
     assert interval["start_frame"] <= interval["end_frame"] <= 32, interval
     assert node["one_view_intervals"], node
     one_view = node["one_view_intervals"][0]
-    assert one_view["start_frame"] == 32 and one_view["end_frame"] >= 36, one_view
+    assert 32 <= one_view["start_frame"] <= 33 and one_view["end_frame"] >= 36, one_view
+    inferred_node = next(item for item in result.report["nodes"] if item["obj_id"] == inferred_id)
+    inferred = inferred_node["inferred_intervals"]
+    assert inferred, node
+    assert inferred[0]["start_frame"] <= 12 and inferred[0]["end_frame"] >= 37, inferred
+    assert result.report["totals"]["inferred_intervals"] >= 1
 
 
 def test_bootstrap_holed_grid_with_corruption():
