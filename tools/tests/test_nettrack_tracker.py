@@ -269,12 +269,14 @@ def test_csv_contract_cli():
             "--audit-only", "--left-input", str(left_video), "--right-input", str(right_video),
             "--start-frame", "2", "--end-frame", "7", "--setup-json", str(setup_path),
             "--stereo", str(rig_json), "--sync-json", str(sync), "--out", str(audit_out),
-            "--grid-cols", "4", "--grid-rows", "3",
+            "--grid-cols", "4", "--grid-rows", "3", "--review-html",
         ])
         assert status == 0
         audit = json.loads((audit_out / "setup_audit.json").read_text())
         assert audit["summary"]["confirmed"] == 12
         assert (audit_out / "bootstrap_overlay_left.png").is_file()
+        audit_html = (audit_out / "marker_review.html").read_text(encoding="utf-8")
+        assert audit_html.count("data:image/jpeg;base64,") == 2
         assert not (audit_out / "mesh_track_report.json").exists()
 
 

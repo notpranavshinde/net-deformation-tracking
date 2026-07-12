@@ -246,6 +246,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--grid-cols", type=int, required=True)
     parser.add_argument("--grid-rows", type=int, required=True)
     parser.add_argument("--audit-only", action="store_true", help="Audit and repair first-frame identities without tracking")
+    parser.add_argument("--review-html", action="store_true", help="Also write a self-contained marker_review.html")
     return parser
 
 
@@ -277,6 +278,13 @@ def main(argv=None) -> int:
         out.mkdir(parents=True, exist_ok=True)
         (out / "setup_audit.json").write_text(json.dumps(audit.report, indent=2) + "\n", encoding="utf-8")
         write_bootstrap_overlay(first_left_image, audit.report, out / "bootstrap_overlay_left.png")
+        if args.review_html:
+            from .review import generate_review
+            review_path, _ = generate_review(
+                out, args.left_input, args.right_input, args.start_frame, frames=1,
+                setup_report=audit.report, sync_info=sync_info, frame_pairs=[indices[0]],
+            )
+            print(f"[OK] Wrote marker review: {review_path}")
         print(f"[OK] Wrote setup audit and overlay: {out}")
         return 0
 
@@ -301,6 +309,12 @@ def main(argv=None) -> int:
     }
     write_outputs(result, args.out, crops)
     write_bootstrap_overlay(first_left_image, result.report["bootstrap"], Path(args.out) / "bootstrap_overlay_left.png")
+    if args.review_html:
+        from .review import generate_review
+        review_path, _ = generate_review(
+            args.out, args.left_input, args.right_input, args.start_frame,
+        )
+        print(f"[OK] Wrote marker review: {review_path}")
     print(f"[OK] Wrote mesh tracks and report: {Path(args.out)}")
     return 0
 

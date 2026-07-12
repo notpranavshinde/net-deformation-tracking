@@ -329,6 +329,8 @@ def bootstrap_mesh(
             "obj_id": int(node_id), "row": int(_grid_xy(topology)[index, 1]),
             "col": int(_grid_xy(topology)[index, 0]), "status": status, "reason": reason,
             "repair_distance_px": distances, "repaired_views": repaired_views,
+            "predicted_left": [float(value) for value in predicted[0][index]],
+            "predicted_right": [float(value) for value in predicted[1][index]],
             "left": None if left is None else [float(left.u), float(left.v)],
             "right": None if right is None else [float(right.u), float(right.v)],
             "monotonic_violation": index in violations,
