@@ -144,8 +144,9 @@ def load_config(required: bool = True) -> dict:
         if required and not payload.get(key):
             raise RemotePipelineError(f"remote_config.json is missing `{key}`.")
     payload.setdefault("ssh_extra_args", [])
-    if not isinstance(payload["ssh_extra_args"], list):
-        raise RemotePipelineError("remote_config.json `ssh_extra_args` must be a JSON list.")
+    for key in ("ssh_extra_args", "scp_extra_args"):
+        if key in payload and not isinstance(payload[key], list):
+            raise RemotePipelineError(f"remote_config.json `{key}` must be a JSON list.")
     return payload
 
 
@@ -193,8 +194,31 @@ def ssh_command(config: dict, remote_shell: str, *, tty: bool = False) -> list[s
     return command
 
 
+def derive_scp_args(ssh_args: list[str]) -> list[str]:
+    scp_args: list[str] = []
+    index = 0
+    while index < len(ssh_args):
+        arg = ssh_args[index]
+        if arg == "-p":
+            if index + 1 < len(ssh_args):
+                scp_args.extend(["-P", ssh_args[index + 1]])
+                index += 2
+                continue
+        elif arg.startswith("-p") and len(arg) > 2:
+            scp_args.extend(["-P", arg[2:]])
+            index += 1
+            continue
+        if arg not in ("-t", "-T"):
+            scp_args.append(arg)
+        index += 1
+    return scp_args
+
+
 def scp_command(config: dict, source: str, dest: str) -> list[str]:
-    return ["scp", *config.get("ssh_extra_args", []), source, dest]
+    extra_args = config.get("scp_extra_args")
+    if extra_args is None:
+        extra_args = derive_scp_args(config.get("ssh_extra_args", []))
+    return ["scp", *extra_args, source, dest]
 
 
 def remote_shell(config: dict, command: str) -> str:
@@ -788,6 +812,21 @@ def cmd_init(args: argparse.Namespace) -> int:
             raise RemotePipelineError("ssh_extra_args must be a JSON list, e.g. [\"-i\", \"key.pem\"].") from exc
     else:
         ssh_extra_args = existing.get("ssh_extra_args", [])
+    default_scp_extra = json.dumps(existing["scp_extra_args"]) if "scp_extra_args" in existing else "derive"
+    raw_scp_extra = input(
+        f"scp_extra_args JSON list (empty = derive automatically) [{default_scp_extra}]: "
+    ).strip()
+    if raw_scp_extra:
+        try:
+            scp_extra_args = json.loads(raw_scp_extra)
+            if not isinstance(scp_extra_args, list):
+                raise ValueError
+        except Exception as exc:
+            raise RemotePipelineError("scp_extra_args must be a JSON list, e.g. [\"-P\", \"2222\"].") from exc
+    elif "scp_extra_args" in existing:
+        scp_extra_args = existing["scp_extra_args"]
+    else:
+        scp_extra_args = None
     if not host or not remote_repo:
         raise RemotePipelineError("host and remote_repo are required.")
     config = {
@@ -796,6 +835,8 @@ def cmd_init(args: argparse.Namespace) -> int:
         "remote_python": remote_python,
         "ssh_extra_args": ssh_extra_args,
     }
+    if scp_extra_args is not None:
+        config["scp_extra_args"] = scp_extra_args
     write_json(CONFIG_PATH, config)
     print_line(f"[INIT] Wrote {CONFIG_PATH.name}")
     doctor_status = run_doctor(config, args.verbose)

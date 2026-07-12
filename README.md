@@ -332,7 +332,10 @@ python remote_pipeline.py init
 `init` writes the local, git-ignored `remote_config.json`, checks the remote
 environment, and asks for directories the remote machine should search for raw
 videos. It validates those directories and writes the git-ignored
-`machine_paths.json` in the remote repository automatically.
+`machine_paths.json` in the remote repository automatically. An optional
+`scp_extra_args` list in `remote_config.json` can provide scp-specific
+options; if omitted, SSH port arguments are translated from `-p` to scp's
+`-P` automatically.
 
 To add or replace the remote search directories later, run:
 
@@ -393,6 +396,15 @@ python remote_pipeline.py logs -f
 ```bash
 python remote_pipeline.py pull
 ```
+
+Pull compares the remote queue against local state stage by stage before
+copying anything. If the remote manifest is not a safe superset of local
+progress, pull lists every divergence, saves the remote manifest as
+`queue_manifest.remote.json`, and exits without changing local files; re-run
+with `--force` to merge anyway. Any local file that a pull would overwrite
+with different content is first backed up under
+`work/pipeline_queue/<queue-id>/pull_backup_<timestamp>/`, and the adopted
+manifest keeps this machine's source-video paths.
 
 Queue directories are machine-portable: paths inside the queue are stored
 relative where possible, and source videos carry portable fingerprints. Pushes

@@ -222,7 +222,35 @@ def test_configure_remote_video_roots():
     assert args.dry_run is True
 
 
+def test_derive_scp_args():
+    assert remote.derive_scp_args(["-p", "2222"]) == ["-P", "2222"]
+    assert remote.derive_scp_args(["-p2222"]) == ["-P", "2222"]
+    passthrough = ["-i", "key.pem", "-J", "jump", "-o", "key=value", "-4", "-6"]
+    assert remote.derive_scp_args(passthrough) == passthrough
+    assert remote.derive_scp_args(["-t", "-T", "-p", "22"]) == ["-P", "22"]
+    assert remote.derive_scp_args([]) == []
+
+
+def test_scp_command_honors_explicit_extra_args():
+    config = {
+        "host": "gpu",
+        "ssh_extra_args": ["-p", "2222", "-t"],
+        "scp_extra_args": ["-P", "2200", "-o", "Compression=no"],
+    }
+    assert remote.scp_command(config, "source", "dest") == [
+        "scp",
+        "-P",
+        "2200",
+        "-o",
+        "Compression=no",
+        "source",
+        "dest",
+    ]
+
+
 def main():
+    test_derive_scp_args()
+    test_scp_command_honors_explicit_extra_args()
     test_superset_verdicts()
     test_configure_remote_video_roots()
     tmp_parent = Path(__file__).resolve().parent / "_tmp"
