@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import argparse
+import copy
+import filecmp
 import json
 import os
 import shlex
@@ -14,6 +16,7 @@ import tarfile
 import tempfile
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 
 
@@ -37,6 +40,14 @@ class CommandResult:
     code: int
     stdout: str = ""
     stderr: str = ""
+
+
+@dataclass
+class PullMergeResult:
+    compatible: bool
+    reasons: list[str]
+    backup_dir: Path | None = None
+    remote_manifest_copy: Path | None = None
 
 
 class RemotePipelineError(RuntimeError):
@@ -441,53 +452,242 @@ def status_rank(status: str | None) -> int:
     return {"pending": 0, "running": 1, "failed": 1, "complete": 2}.get(str(status or ""), 0)
 
 
-def manifest_progress_score(manifest: dict) -> tuple[int, int]:
-    score = 0
-    total = 0
-    calibration = manifest.get("preprocessing", {}).get("calibration", {})
-    for stage in calibration.get("stages", {}).values():
-        total += 1
-        score += status_rank(stage.get("status"))
-    for job in manifest.get("jobs", []):
-        for stage in job.get("stages", {}).values():
-            total += 1
-            score += status_rank(stage.get("status"))
-    return score, total
+def _jobs_by_index(manifest: dict, label: str, reasons: list[str]) -> dict[int, dict]:
+    jobs: dict[int, dict] = {}
+    for position, job in enumerate(manifest.get("jobs", [])):
+        try:
+            index = int(job.get("index"))
+        except (TypeError, ValueError):
+            reasons.append(f"{label} job at position {position} has an invalid index: {job.get('index')!r}")
+            continue
+        if index in jobs:
+            reasons.append(f"{label} manifest has duplicate job index {index}")
+        jobs[index] = job
+    return jobs
+
+
+def _stage_status(stage: object) -> str:
+    if isinstance(stage, dict):
+        return str(stage.get("status") or "missing")
+    return "missing"
+
+
+def remote_manifest_superset_verdict(local_manifest: dict, remote_manifest: dict) -> tuple[bool, list[str]]:
+    """Return whether remote is a stage-wise superset and any divergence reasons."""
+    reasons: list[str] = []
+    if remote_manifest.get("queue_id") != local_manifest.get("queue_id"):
+        reasons.append(
+            f"queue_id differs: local={local_manifest.get('queue_id')!r}, "
+            f"remote={remote_manifest.get('queue_id')!r}"
+        )
+
+    configuration = (
+        ("setup_mode", local_manifest.get("setup_mode"), remote_manifest.get("setup_mode")),
+        ("grid_cols", local_manifest.get("grid_cols"), remote_manifest.get("grid_cols")),
+        ("grid_rows", local_manifest.get("grid_rows"), remote_manifest.get("grid_rows")),
+        (
+            "settings.scale",
+            local_manifest.get("settings", {}).get("scale"),
+            remote_manifest.get("settings", {}).get("scale"),
+        ),
+    )
+    for name, local_value, remote_value in configuration:
+        if remote_value != local_value:
+            reasons.append(f"{name} differs: local={local_value!r}, remote={remote_value!r}")
+
+    local_jobs = _jobs_by_index(local_manifest, "Local", reasons)
+    remote_jobs = _jobs_by_index(remote_manifest, "Remote", reasons)
+    local_indices = set(local_jobs)
+    remote_indices = set(remote_jobs)
+    if local_indices != remote_indices:
+        missing = sorted(local_indices - remote_indices)
+        extra = sorted(remote_indices - local_indices)
+        if missing:
+            reasons.append(f"remote manifest is missing job indices: {missing}")
+        if extra:
+            reasons.append(f"remote manifest has extra job indices: {extra}")
+
+    for index in sorted(local_indices & remote_indices):
+        local_job = local_jobs[index]
+        remote_job = remote_jobs[index]
+        for field in ("velocity_slug", "start_frame", "end_frame"):
+            if remote_job.get(field) != local_job.get(field):
+                reasons.append(
+                    f"job {index} {field} differs: local={local_job.get(field)!r}, "
+                    f"remote={remote_job.get(field)!r}"
+                )
+        for name, local_stage in local_job.get("stages", {}).items():
+            remote_stage = remote_job.get("stages", {}).get(name)
+            local_status = _stage_status(local_stage)
+            remote_status = _stage_status(remote_stage)
+            if status_rank(remote_status) < status_rank(local_status):
+                reasons.append(
+                    f"job {index} stage {name!r} regressed: "
+                    f"local={local_status}, remote={remote_status}"
+                )
+
+    local_calibration = local_manifest.get("preprocessing", {}).get("calibration", {})
+    remote_calibration = remote_manifest.get("preprocessing", {}).get("calibration", {})
+    for name, local_stage in local_calibration.get("stages", {}).items():
+        remote_stage = remote_calibration.get("stages", {}).get(name)
+        local_status = _stage_status(local_stage)
+        remote_status = _stage_status(remote_stage)
+        if status_rank(remote_status) < status_rank(local_status):
+            reasons.append(
+                f"calibration stage {name!r} regressed: local={local_status}, remote={remote_status}"
+            )
+
+    return not reasons, reasons
 
 
 def remote_manifest_superset(local_manifest: dict, remote_manifest: dict) -> bool:
-    if remote_manifest.get("queue_id") != local_manifest.get("queue_id"):
-        return False
-    if manifest_progress_score(remote_manifest)[0] < manifest_progress_score(local_manifest)[0]:
-        return False
-    local_jobs = {int(job.get("index", -1)): job for job in local_manifest.get("jobs", [])}
-    remote_jobs = {int(job.get("index", -1)): job for job in remote_manifest.get("jobs", [])}
-    for index, local_job in local_jobs.items():
-        remote_job = remote_jobs.get(index)
-        if not remote_job:
+    return remote_manifest_superset_verdict(local_manifest, remote_manifest)[0]
+
+
+class PullBackup:
+    def __init__(self, queue_dir: Path):
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S_%fZ")
+        self.path = queue_dir / f"pull_backup_{timestamp}"
+        self.used = False
+
+    def backup(self, path: Path, relative_path: Path) -> None:
+        if not self.used:
+            self.path.mkdir(parents=True, exist_ok=False)
+            self.used = True
+            print_line(f"[PULL] Backing up overwritten local files under {self.path}")
+        target = self.path / relative_path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if not target.exists():
+            shutil.copy2(path, target)
+
+
+def copy_pulled_file(src: Path, dest: Path, backup: PullBackup, backup_rel: Path) -> bool:
+    if dest.is_file():
+        if filecmp.cmp(src, dest, shallow=False):
             return False
-        for name, local_stage in local_job.get("stages", {}).items():
-            if local_stage.get("status") == "complete":
-                if remote_job.get("stages", {}).get(name, {}).get("status") != "complete":
-                    return False
+        backup.backup(dest, backup_rel)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(src, dest)
     return True
 
 
-def copy_tree_contents(src: Path, dest: Path, exclude_manifest: bool = False) -> None:
+def copy_tree_contents(
+    src: Path,
+    dest: Path,
+    exclude_manifest: bool = False,
+    *,
+    backup: PullBackup | None = None,
+    backup_prefix: Path = Path(),
+    preserve_local_split_manifest: bool = False,
+) -> None:
     for path in src.rglob("*"):
         if path.is_dir():
             continue
         rel = path.relative_to(src).as_posix()
         if excluded_from_pull(rel):
             continue
-        if exclude_manifest and rel == "queue_manifest.json":
+        if exclude_manifest and rel in {"queue_manifest.json", "queue_manifest.remote.json"}:
+            continue
+        if preserve_local_split_manifest and rel == "split/split_manifest.json" and (dest / rel).is_file():
             continue
         out = dest / rel
-        out.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(path, out)
+        if backup is None:
+            out.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(path, out)
+        else:
+            copy_pulled_file(path, out, backup, backup_prefix / Path(rel))
 
 
-def pull_from_remote(config: dict, manifest_path: Path, queue_id: str, verbose: bool, dry_run: bool) -> None:
+def graft_local_source_paths(local_manifest: dict, remote_manifest: dict) -> dict:
+    adopted = copy.deepcopy(remote_manifest)
+    local_preprocessing = local_manifest.get("preprocessing", {})
+    adopted_preprocessing = adopted.setdefault("preprocessing", {})
+    for key in ("raw_left", "raw_right"):
+        if key in local_preprocessing:
+            adopted_preprocessing[key] = local_preprocessing[key]
+
+    local_calibration = local_preprocessing.get("calibration", {})
+    adopted_calibration = adopted_preprocessing.setdefault("calibration", {})
+    for key in ("left_video", "right_video"):
+        if key in local_calibration:
+            adopted_calibration[key] = local_calibration[key]
+
+    local_jobs = _jobs_by_index(local_manifest, "Local", [])
+    for remote_job in adopted.get("jobs", []):
+        try:
+            local_job = local_jobs.get(int(remote_job.get("index")))
+        except (TypeError, ValueError):
+            local_job = None
+        if not local_job:
+            continue
+        for key in ("left_video", "right_video"):
+            if key in local_job:
+                remote_job[key] = local_job[key]
+    return adopted
+
+
+def merge_staged_pull(
+    local_queue: Path,
+    remote_queue: Path,
+    result_trees: list[tuple[Path, Path, Path]] | None = None,
+    *,
+    force: bool = False,
+) -> PullMergeResult:
+    """Compare and merge an extracted pull without performing any network operations."""
+    remote_manifest_path = remote_queue / "queue_manifest.json"
+    if not remote_manifest_path.is_file():
+        raise RemotePipelineError(f"Pulled archive has no queue manifest: {remote_manifest_path}")
+    remote_manifest = read_json(remote_manifest_path)
+    local_manifest_path = local_queue / "queue_manifest.json"
+    local_manifest = read_json(local_manifest_path) if local_manifest_path.is_file() else None
+    compatible, reasons = (
+        remote_manifest_superset_verdict(local_manifest, remote_manifest)
+        if local_manifest is not None
+        else (True, [])
+    )
+
+    local_queue.mkdir(parents=True, exist_ok=True)
+    saved_remote = local_queue / "queue_manifest.remote.json"
+    if not compatible and not force:
+        shutil.copy2(remote_manifest_path, saved_remote)
+        return PullMergeResult(False, reasons, remote_manifest_copy=saved_remote)
+
+    backup = PullBackup(local_queue)
+    for src, dest, backup_prefix in result_trees or []:
+        if src.exists():
+            copy_tree_contents(src, dest, backup=backup, backup_prefix=backup_prefix)
+            print_line(f"[PULL] Updated {backup_prefix.as_posix()}")
+    copy_tree_contents(
+        remote_queue,
+        local_queue,
+        exclude_manifest=True,
+        backup=backup,
+        preserve_local_split_manifest=compatible,
+    )
+    copy_pulled_file(remote_manifest_path, saved_remote, backup, Path("queue_manifest.remote.json"))
+
+    adopted_manifest = (
+        graft_local_source_paths(local_manifest, remote_manifest)
+        if local_manifest is not None
+        else remote_manifest
+    )
+    adopted_temp = remote_queue / ".queue_manifest.adopted.json"
+    write_json(adopted_temp, adopted_manifest)
+    try:
+        copy_pulled_file(adopted_temp, local_manifest_path, backup, Path("queue_manifest.json"))
+    finally:
+        adopted_temp.unlink(missing_ok=True)
+    return PullMergeResult(compatible, reasons, backup.path if backup.used else None, saved_remote)
+
+
+def pull_from_remote(
+    config: dict,
+    manifest_path: Path,
+    queue_id: str,
+    verbose: bool,
+    dry_run: bool,
+    force: bool = False,
+) -> None:
     manifest = read_json(manifest_path) if manifest_path.is_file() else {"queue_id": queue_id, "jobs": []}
     result_paths = []
     for job in manifest.get("jobs", []):
@@ -547,37 +747,27 @@ def pull_from_remote(config: dict, manifest_path: Path, queue_id: str, verbose: 
         stage.mkdir()
         with tarfile.open(local_archive, "r:gz") as archive:
             extract_archive(archive, stage)
-        for result_rel in result_paths:
-            src = stage / Path(result_rel)
-            if src.exists():
-                copy_tree_contents(src, REPO_ROOT / result_rel)
-                print_line(f"[PULL] Updated {result_rel}")
         remote_queue = stage / Path(queue_rel)
-        local_queue = QUEUE_ROOT / queue_id
-        if remote_queue.exists():
-            copy_tree_contents(remote_queue, local_queue, exclude_manifest=True)
-            remote_manifest_path = remote_queue / "queue_manifest.json"
-            if remote_manifest_path.is_file():
-                remote_manifest = read_json(remote_manifest_path)
-                local_queue.mkdir(parents=True, exist_ok=True)
-                saved_remote = local_queue / "queue_manifest.remote.json"
-                shutil.copy2(remote_manifest_path, saved_remote)
-                print_line(f"[PULL] Saved remote manifest as {local_repo_rel(saved_remote)}")
-                if manifest_path.is_file():
-                    local_manifest = read_json(manifest_path)
-                    if remote_manifest_superset(local_manifest, remote_manifest):
-                        backup = local_queue / "queue_manifest.local.bak.json"
-                        shutil.copy2(manifest_path, backup)
-                        shutil.copy2(remote_manifest_path, manifest_path)
-                        print_line(
-                            "[PULL] Remote manifest is a progress superset; replaced local "
-                            f"manifest after backup to {local_repo_rel(backup)}"
-                        )
-                    else:
-                        print_line("[PULL] Local manifest kept; remote progress was not a clear superset.")
-                else:
-                    shutil.copy2(remote_manifest_path, local_queue / "queue_manifest.json")
-                    print_line("[PULL] No local manifest existed; copied remote manifest into place.")
+        local_queue = manifest_path.parent
+        result_trees = [
+            (stage / Path(result_rel), REPO_ROOT / result_rel, Path(result_rel))
+            for result_rel in result_paths
+            if (stage / Path(result_rel)).exists()
+        ]
+        merge = merge_staged_pull(local_queue, remote_queue, result_trees, force=force)
+        if not merge.compatible and not force:
+            print_line("[PULL] !!! CONFLICT: REMOTE QUEUE IS NOT A SAFE SUPERSET !!!")
+            for reason in merge.reasons:
+                print_line(f"  - {reason}")
+            print_line(f"[PULL] Remote manifest saved as {local_repo_rel(merge.remote_manifest_copy)}")
+            print_line("[PULL] No result or queue files were copied. Re-run with --force to override.")
+            raise RemotePipelineError("Pull refused because remote queue state conflicts with local state.")
+        print_line(f"[PULL] Saved remote manifest as {local_repo_rel(merge.remote_manifest_copy)}")
+        if force and merge.reasons:
+            print_line("[PULL] WARNING: --force overrode these manifest conflicts:")
+            for reason in merge.reasons:
+                print_line(f"  - {reason}")
+        print_line("[PULL] Adopted remote manifest while preserving local source-video paths.")
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
 
@@ -751,7 +941,7 @@ def cmd_pull(args: argparse.Namespace) -> int:
     config = load_config()
     manifest_path = queue_manifest_path(args.queue, allow_missing_dry_run=args.dry_run)
     queue_id = queue_id_from_manifest(manifest_path)
-    pull_from_remote(config, manifest_path, queue_id, args.verbose, args.dry_run)
+    pull_from_remote(config, manifest_path, queue_id, args.verbose, args.dry_run, args.force)
     return 0
 
 
@@ -816,6 +1006,7 @@ def build_parser() -> argparse.ArgumentParser:
     pull = sub.add_parser("pull", help="Pull results, queue logs, SAM2 tracks, and remote manifest back locally.")
     add_queue_arg(pull)
     pull.add_argument("--dry-run", action="store_true", help="Print pull commands and selected paths without changing local files.")
+    pull.add_argument("--force", action="store_true", help="Merge the remote pull even when its manifest conflicts with local state.")
     pull.set_defaults(func=cmd_pull)
     return parser
 
