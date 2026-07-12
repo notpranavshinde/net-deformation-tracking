@@ -10,6 +10,8 @@ import hashlib
 import json
 import os
 import re
+import shlex
+import shutil
 import signal
 import subprocess
 import sys
@@ -33,6 +35,21 @@ QUEUE_TRIANGULATION_META = "queue_triangulation_meta.json"
 MACHINE_PATHS_FILE = REPO_ROOT / "machine_paths.json"
 QUEUE_PATH_PREFIX = "queue:"
 REPO_PATH_PREFIX = "repo:"
+
+
+SETUP_REQUIRED_MODULES = {
+    "cv2": "opencv-python",
+    "numpy": "numpy",
+    "scipy": "scipy",
+    "skimage": "scikit-image",
+    "torch": "torch",
+    "rich": "rich",
+    "pandas": "pandas",
+    "matplotlib": "matplotlib",
+    "PIL": "pillow",
+    "hydra": "hydra-core",
+    "iopath": "iopath",
+}
 
 
 def utc_now():
@@ -62,9 +79,19 @@ def parse_positive_float(value):
     return parsed
 
 
+def normalize_pasted_path(value):
+    """Accept plain paths plus paths copied from a PowerShell invocation."""
+    text = str(value).strip()
+    if text.startswith("&"):
+        text = text[1:].strip()
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in {'"', "'"}:
+        text = text[1:-1].strip()
+    return text
+
+
 def prompt_video_path(label):
     while True:
-        raw = input(f"{label}: ").strip().strip('"').strip("'")
+        raw = normalize_pasted_path(input(f"{label}: "))
         path = Path(raw).expanduser()
         if not path.is_absolute():
             path = (Path.cwd() / path).resolve()
@@ -93,6 +120,105 @@ def restore_terminal_input():
         termios.tcsetattr(sys.stdin.fileno(), termios.TCSANOW, attrs)
     except (ImportError, OSError):
         pass
+
+
+def format_command(command, windows=None):
+    parts = [str(part) for part in command]
+    use_windows = os.name == "nt" if windows is None else bool(windows)
+    return subprocess.list2cmdline(parts) if use_windows else shlex.join(parts)
+
+
+def setup_rerun_command(args, resume_path=None):
+    command = ["python", str(Path(__file__).resolve()), "--setup-only"]
+    if resume_path is not None:
+        command.extend(["--resume", str(Path(resume_path))])
+    elif getattr(args, "resume", None):
+        command.extend(["--resume", str(args.resume)])
+    if getattr(args, "sam2_scale", None) is not None:
+        command.extend(["--sam2-scale", str(args.sam2_scale)])
+    if getattr(args, "sam2_model_id", None) is not None:
+        command.extend(["--sam2-model-id", str(args.sam2_model_id)])
+    return format_command(command)
+
+
+def collect_windows_setup_preflight_issues(
+    python_version=None,
+    module_finder=None,
+    ui_framework_probe=None,
+    executable_finder=None,
+):
+    """Return blocking issues and non-blocking warnings for native Windows setup."""
+    if python_version is None:
+        python_version = tuple(sys.version_info[:2])
+    if module_finder is None:
+        import importlib.util
+
+        module_finder = importlib.util.find_spec
+    if executable_finder is None:
+        executable_finder = shutil.which
+
+    issues = []
+    warnings = []
+    if tuple(python_version) != (3, 11):
+        issues.append(
+            f"Python 3.11 is required; this interpreter is "
+            f"{python_version[0]}.{python_version[1]} ({sys.executable})."
+        )
+
+    missing_packages = []
+    for module_name, package_name in SETUP_REQUIRED_MODULES.items():
+        try:
+            found = module_finder(module_name)
+        except (ImportError, AttributeError, ValueError):
+            found = None
+        if found is None:
+            missing_packages.append(package_name)
+    if missing_packages:
+        issues.append("Missing setup packages: " + ", ".join(sorted(set(missing_packages))))
+
+    missing_scripts = [
+        path for path in (SPLITTER_SCRIPT, CALIBRATION_SCRIPT, MARKERS_SCRIPT) if not path.is_file()
+    ]
+    if missing_scripts:
+        issues.append("Missing setup scripts: " + ", ".join(str(path) for path in missing_scripts))
+
+    if "opencv-python" not in missing_packages:
+        try:
+            if ui_framework_probe is None:
+                import cv2
+
+                framework = cv2.currentUIFramework() if hasattr(cv2, "currentUIFramework") else "unknown"
+            else:
+                framework = ui_framework_probe()
+            if not framework or str(framework).lower() in {"none", "unknown"}:
+                issues.append(
+                    "OpenCV has no interactive UI backend; install opencv-python, not opencv-python-headless."
+                )
+        except Exception as exc:
+            issues.append(f"Could not validate the OpenCV UI backend: {exc}")
+
+    if executable_finder("ffprobe") is None:
+        warnings.append("ffprobe was not found; splitter IMU-event navigation will be unavailable.")
+    return issues, warnings
+
+
+def validate_windows_setup_environment(args):
+    if os.name != "nt":
+        return True
+    print("[PREFLIGHT] Checking the Windows --setup-only environment...")
+    issues, warnings = collect_windows_setup_preflight_issues()
+    for warning in warnings:
+        print(f"[PREFLIGHT][WARN] {warning}")
+    if not issues:
+        print("[PREFLIGHT] Python 3.11, setup packages, scripts, and OpenCV GUI are ready.")
+        return True
+    print("[PREFLIGHT] Setup cannot start in the current environment:")
+    for issue in issues:
+        print(f"  - {issue}")
+    print("\nActivate the tested environment and rerun the same setup command:")
+    print("  conda activate sam2py311")
+    print(f"  {setup_rerun_command(args)}")
+    return False
 
 
 def prompt_velocity(index, total, used_velocities):
@@ -438,7 +564,10 @@ def same_points_json(recorded, expected, setup_dir):
         return False
     try:
         recorded_path = Path(recorded).expanduser()
-        if recorded_path.is_absolute():
+        # pathlib follows the current OS, so a Windows absolute path is
+        # considered relative on Linux (and vice versa). Treat either syntax
+        # as absolute when validating a queue copied between machines.
+        if path_is_absolute_string(recorded):
             if same_path(recorded_path, expected_path):
                 return True
             recorded_parts = Path(str(recorded).replace("\\", "/")).parts
@@ -701,14 +830,86 @@ def resolve_source_videos(manifest_path, manifest):
     return changed
 
 
+def write_console_text(output):
+    try:
+        sys.stdout.write(output)
+    except UnicodeEncodeError:
+        encoding = sys.stdout.encoding or "utf-8"
+        safe_output = output.encode(encoding, errors="replace").decode(encoding)
+        sys.stdout.write(safe_output)
+    sys.stdout.flush()
+
+
+def write_streamed_output(output, log):
+    if not output:
+        return
+    log.write(output)
+    log.flush()
+    write_console_text(output)
+
+
+def stop_process_tree(process, graceful_timeout=8):
+    """Stop a logged child and any workers it created."""
+    if process.poll() is not None:
+        return
+    if os.name == "nt":
+        try:
+            process.send_signal(signal.CTRL_BREAK_EVENT)
+        except (AttributeError, OSError, ValueError):
+            pass
+        try:
+            process.wait(timeout=graceful_timeout)
+            return
+        except subprocess.TimeoutExpired:
+            pass
+        subprocess.run(
+            ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+        return
+
+    if hasattr(os, "killpg"):
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            return
+    else:
+        process.terminate()
+    try:
+        process.wait(timeout=graceful_timeout)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    if hasattr(os, "killpg"):
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            return
+    else:
+        process.kill()
+    process.wait()
+
+
 def run_logged(command, cwd, log_path, use_pty=True):
     log_path.parent.mkdir(parents=True, exist_ok=True)
-    print("\n$", " ".join(str(part) for part in command))
-    with open(log_path, "a", buffering=1) as log:
-        log.write(f"\n[{utc_now()}] $ {' '.join(str(part) for part in command)}\n")
+    display_command = format_command(command)
+    write_console_text(f"\n$ {display_command}\n")
+    with open(log_path, "a", buffering=1, encoding="utf-8") as log:
+        log.write(f"\n[{utc_now()}] $ {display_command}\n")
         popen_kwargs = {}
         master_fd = None
         slave_fd = None
+        child_env = os.environ.copy()
+        child_env["PYTHONUNBUFFERED"] = "1"
+        child_env["PYTHONIOENCODING"] = "utf-8"
+        child_env["PYTHONUTF8"] = "1"
         if os.name == "nt":
             popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
         else:
@@ -722,8 +923,9 @@ def run_logged(command, cwd, log_path, use_pty=True):
             cwd=str(cwd),
             stdout=slave_fd if slave_fd is not None else subprocess.PIPE,
             stderr=slave_fd if slave_fd is not None else subprocess.STDOUT,
-            text=True,
-            bufsize=1,
+            text=False,
+            bufsize=0,
+            env=child_env,
             **popen_kwargs,
         )
         if slave_fd is not None:
@@ -742,40 +944,21 @@ def run_logged(command, cwd, log_path, use_pty=True):
                     if not chunk:
                         break
                     output = decoder.decode(chunk)
-                    if output:
-                        sys.stdout.write(output)
-                        sys.stdout.flush()
-                        log.write(output)
+                    write_streamed_output(output, log)
                 output = decoder.decode(b"", final=True)
-                if output:
-                    sys.stdout.write(output)
-                    sys.stdout.flush()
-                    log.write(output)
+                write_streamed_output(output, log)
             else:
                 assert process.stdout is not None
-                for line in process.stdout:
-                    print(line, end="", flush=True)
-                    log.write(line)
+                decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+                while True:
+                    chunk = process.stdout.read(65536)
+                    if not chunk:
+                        break
+                    write_streamed_output(decoder.decode(chunk), log)
+                write_streamed_output(decoder.decode(b"", final=True), log)
             return_code = process.wait()
         except KeyboardInterrupt:
-            if hasattr(os, "killpg"):
-                try:
-                    os.killpg(process.pid, signal.SIGTERM)
-                except ProcessLookupError:
-                    pass
-            else:
-                process.terminate()
-            try:
-                process.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                if hasattr(os, "killpg"):
-                    try:
-                        os.killpg(process.pid, signal.SIGKILL)
-                    except ProcessLookupError:
-                        pass
-                else:
-                    process.kill()
-                process.wait()
+            stop_process_tree(process)
             log.write(f"[{utc_now()}] interrupted\n")
             raise
         finally:
@@ -1887,6 +2070,11 @@ def prepare_setups(manifest_path, manifest):
             if not layout_arg:
                 raise RuntimeError("Sectioned setup requires section_layout in the queue manifest.")
             command.extend(["--section-layout", layout_arg])
+        print("[SETUP] Starting the marker-setup program.")
+        print(
+            "[SETUP] It will load both frames and estimate markers before the OpenCV review "
+            "windows open; high-resolution frames can take about a minute."
+        )
         return_code = run_logged(
             command,
             SAM2_DIR,
@@ -2053,7 +2241,15 @@ def process_jobs(manifest_path, manifest):
 
 def process_only_missing(manifest_path, manifest):
     missing = []
-    setup_command = f'python run_pipeline_queue.py --resume "{Path(manifest_path).parent}" --setup-only'
+    setup_command = format_command(
+        [
+            "python",
+            str(Path(__file__).resolve()),
+            "--resume",
+            str(Path(manifest_path).parent),
+            "--setup-only",
+        ]
+    )
     preprocessing = manifest.get("preprocessing", {})
     if not splitter_complete(manifest):
         missing.append("splitter GUI virtual ranges are incomplete")
@@ -2201,65 +2397,114 @@ def load_existing_queue(args):
     return manifest_path, manifest
 
 
+def mark_setup_only_interrupted(manifest_path, manifest):
+    interrupted = []
+
+    def reset_stage(stage, label):
+        if isinstance(stage, dict) and stage.get("status") == "running":
+            stage.update(
+                {
+                    "status": "pending",
+                    "interrupted_at": utc_now(),
+                    "error": "Interrupted by user; resume setup to retry this stage.",
+                }
+            )
+            interrupted.append(label)
+
+    preprocessing = manifest.get("preprocessing", {})
+    reset_stage(preprocessing.get("splitter", {}).get("stage"), "splitter")
+    reset_stage(
+        preprocessing.get("calibration", {}).get("stages", {}).get("sync"),
+        "calibration sync",
+    )
+    for job in manifest.get("jobs", []):
+        reset_stage(
+            job.get("stages", {}).get("setup"),
+            f"marker setup for {job.get('velocity', 'unknown run')}",
+        )
+    if interrupted:
+        manifest["status"] = "incomplete"
+        save_manifest(manifest_path, manifest)
+    return interrupted
+
+
 def main():
     args = parse_args()
     if (args.process_only or args.check_only) and not args.resume:
         print("[QUEUE] --process-only and --check-only require --resume.")
         return 2
-    if args.resume:
-        try:
-            manifest_path, manifest = load_existing_queue(args)
-        except (FileNotFoundError, RuntimeError) as exc:
-            print(f"[QUEUE] {exc}")
+    if args.setup_only and not validate_windows_setup_environment(args):
+        return 2
+
+    manifest_path = None
+    manifest = None
+    try:
+        if args.resume:
+            try:
+                manifest_path, manifest = load_existing_queue(args)
+            except (FileNotFoundError, RuntimeError) as exc:
+                print(f"[QUEUE] {exc}")
+                return 1
+            print(f"[QUEUE] Resuming: {manifest_path}")
+        else:
+            manifest_path, manifest = create_manifest(args)
+        print_queue_settings(manifest)
+        if args.check_only:
+            return 0 if print_check_status(manifest_path, manifest) else 1
+        if args.process_only:
+            if not validate_process_only(manifest_path, manifest):
+                return 1
+            if bool(manifest.setdefault("settings", {}).get("preview", False)):
+                print("[PROCESS-ONLY] Disabling SAM2 preview for non-interactive processing.")
+                manifest["settings"]["preview"] = False
+                save_manifest(manifest_path, manifest)
+            if not prepare_calibration(manifest_path, manifest, ("stats", "mono", "stereo")):
+                print("[QUEUE] Calibration compute is incomplete. Resume this manifest to try again.")
+                return 1
+            process_jobs(manifest_path, manifest)
+            return 0
+        if not prepare_splitter(manifest_path, manifest):
+            print("[QUEUE] Splitter is incomplete. Resume this manifest to try again.")
             return 1
-        print(f"[QUEUE] Resuming: {manifest_path}")
-    else:
-        manifest_path, manifest = create_manifest(args)
-    print_queue_settings(manifest)
-    if args.check_only:
-        return 0 if print_check_status(manifest_path, manifest) else 1
-    if args.process_only:
-        if not validate_process_only(manifest_path, manifest):
+        ensure_jobs_from_split(manifest_path, manifest)
+        calibration_stages = ("sync",) if args.setup_only else ("sync", "stats", "mono", "stereo")
+        if not prepare_calibration(manifest_path, manifest, calibration_stages):
+            print("[QUEUE] Calibration is incomplete. Resume this manifest to try again.")
             return 1
-        if bool(manifest.setdefault("settings", {}).get("preview", False)):
-            print("[PROCESS-ONLY] Disabling SAM2 preview for non-interactive processing.")
-            manifest["settings"]["preview"] = False
-            save_manifest(manifest_path, manifest)
-        if not prepare_calibration(manifest_path, manifest, ("stats", "mono", "stereo")):
-            print("[QUEUE] Calibration compute is incomplete. Resume this manifest to try again.")
-            return 1
+        ensure_section_layout(manifest_path, manifest)
+        prepare_setups(manifest_path, manifest)
+        if args.setup_only:
+            missing, setup_command = process_only_missing(manifest_path, manifest)
+            if missing:
+                print("\n[QUEUE] Interactive setup is incomplete; queue is not ready for processing.")
+                print("[QUEUE] Missing:")
+                for item in missing:
+                    print(f"  - {item}")
+                print("[QUEUE] Re-run setup on this machine:")
+                print(f"  {setup_command}")
+                return 1
+            print("\n[QUEUE] Interactive setup is complete.")
+            print(f"[QUEUE] Queue dir: {Path(manifest_path).parent}")
+            print("[QUEUE] Copy this queue directory to the processing machine and run:")
+            print(f'  python run_pipeline_queue.py --resume "{Path(manifest_path).parent}" --process-only')
+            print("[QUEUE] Or use the remote helper:")
+            print("  python remote_pipeline.py push")
+            print("  python remote_pipeline.py run")
+            return 0
         process_jobs(manifest_path, manifest)
         return 0
-    if not prepare_splitter(manifest_path, manifest):
-        print("[QUEUE] Splitter is incomplete. Resume this manifest to try again.")
-        return 1
-    ensure_jobs_from_split(manifest_path, manifest)
-    calibration_stages = ("sync",) if args.setup_only else ("sync", "stats", "mono", "stereo")
-    if not prepare_calibration(manifest_path, manifest, calibration_stages):
-        print("[QUEUE] Calibration is incomplete. Resume this manifest to try again.")
-        return 1
-    ensure_section_layout(manifest_path, manifest)
-    prepare_setups(manifest_path, manifest)
-    if args.setup_only:
-        missing, setup_command = process_only_missing(manifest_path, manifest)
-        if missing:
-            print("\n[QUEUE] Interactive setup is incomplete; queue is not ready for processing.")
-            print("[QUEUE] Missing:")
-            for item in missing:
-                print(f"  - {item}")
-            print("[QUEUE] Re-run setup on this machine:")
-            print(f"  {setup_command}")
-            return 1
-        print("\n[QUEUE] Interactive setup is complete.")
-        print(f"[QUEUE] Queue dir: {Path(manifest_path).parent}")
-        print("[QUEUE] Copy this queue directory to the processing machine and run:")
-        print(f'  python run_pipeline_queue.py --resume "{Path(manifest_path).parent}" --process-only')
-        print("[QUEUE] Or use the remote helper:")
-        print("  python remote_pipeline.py push")
-        print("  python remote_pipeline.py run")
-        return 0
-    process_jobs(manifest_path, manifest)
-    return 0
+    except KeyboardInterrupt:
+        interrupted = []
+        if args.setup_only and manifest_path is not None and manifest is not None:
+            interrupted = mark_setup_only_interrupted(manifest_path, manifest)
+        print("\n[QUEUE] Setup interrupted by user.")
+        if interrupted:
+            print("[QUEUE] Saved resumable stage state: " + ", ".join(interrupted))
+        print("[QUEUE] Resume from the tested environment:")
+        print("  conda activate sam2py311")
+        resume_path = Path(manifest_path).parent if manifest_path is not None else None
+        print(f"  {setup_rerun_command(args, resume_path=resume_path)}")
+        return 130
 
 
 if __name__ == "__main__":

@@ -6159,8 +6159,13 @@ def main():
                 crop_right = None
                 print("[INFO] RIGHT crop disabled; using full frame")
 
+        print(
+            f"[SETUP] Loading LEFT and RIGHT frames at virtual frame {start_frame}...",
+            flush=True,
+        )
         left_first = load_first_frame_from_video(left_video, crop=crop_left, frame_idx=start_frame)
         right_first = load_first_frame_from_video(right_video, crop=crop_right, frame_idx=start_frame)
+        print("[SETUP] Frames loaded.", flush=True)
 
         if args.semi_auto_setup_sections:
             left_points, right_points, left_meta, right_meta = _run_sectioned_grid_setup(
@@ -6181,10 +6186,17 @@ def main():
             if cols < 2 or rows < 2:
                 raise RuntimeError("--grid-cols and --grid-rows must both be at least 2.")
             expected_points = cols * rows
+            print(
+                "[SETUP] Estimating LEFT and RIGHT marker-grid corners before opening the "
+                "OpenCV review windows.",
+                flush=True,
+            )
             try:
+                print("[SETUP][LEFT] Detecting marker-grid corners...", flush=True)
                 left_corners, left_corner_meta = _estimate_grid_corners_from_detection(
                     "left", left_first, cols, rows
                 )
+                print("[SETUP][RIGHT] Detecting marker-grid corners...", flush=True)
                 right_corners, right_corner_meta = _estimate_grid_corners_from_detection(
                     "right", right_first, cols, rows
                 )
@@ -6198,7 +6210,8 @@ def main():
             else:
                 print(
                     "[INFO] Review the four automatic corner guesses. Move any incorrect guess, "
-                    "then press q to continue."
+                    "then press q to continue.",
+                    flush=True,
                 )
                 left_corners, right_corners = click_points_dual(
                     left_first,

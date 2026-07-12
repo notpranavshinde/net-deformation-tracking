@@ -354,13 +354,27 @@ Per-experiment cycle:
 
 1. On the laptop, run all interactive setup stages:
 
-```bash
-python run_pipeline_queue.py --setup-only
+```powershell
+conda activate sam2py311
+python .\run_pipeline_queue.py --setup-only
 ```
 
 This opens the splitter, asks for velocity labels, confirms audio sync, and
 collects every SAM2 setup prompt. Heavy calibration stages do not run locally
-in this mode.
+in this mode. On Windows, the runner checks Python 3.11, the setup packages,
+and the OpenCV GUI backend before it creates or changes a queue. If the wrong
+environment is active, it stops and prints the exact activation and rerun
+commands.
+
+The marker setup loads both high-resolution frames and estimates LEFT and
+RIGHT marker-grid corners before opening the OpenCV review windows. This can
+take about a minute for 4K/5K recordings. Progress for each phase is streamed
+to the terminal, so leave the command running while detection is reported.
+
+If setup is interrupted with Ctrl+C, the active stage is saved as pending and
+the runner prints a resumable command. Activate `sam2py311`, then run that
+printed `--resume ... --setup-only` command; completed split, sync, and setup
+stages are retained.
 
 2. Push the portable queue to the remote machine:
 

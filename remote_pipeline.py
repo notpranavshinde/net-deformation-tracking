@@ -8,6 +8,7 @@ import copy
 import filecmp
 import json
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -55,10 +56,21 @@ class RemotePipelineError(RuntimeError):
 
 
 def print_line(message: str = "") -> None:
+    encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
+    message = str(message).encode(encoding, errors="replace").decode(encoding, errors="replace")
     if console:
         console.print(message)
     else:
         print(message)
+
+
+ANSI_ESCAPE_RE = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))")
+
+
+def clean_log_tail(text: str, max_lines: int = 15) -> str:
+    cleaned = ANSI_ESCAPE_RE.sub("", text).replace("\x00", "")
+    lines = [line.rstrip() for line in cleaned.splitlines() if line.strip()]
+    return "\n".join(lines[-max_lines:])
 
 
 def read_json(path: Path) -> dict:
@@ -175,6 +187,8 @@ def run_command(
             command,
             input=input_text,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             capture_output=True,
             timeout=timeout,
         )
@@ -417,9 +431,23 @@ def tmux_session_alive(config: dict, session: str, verbose: bool, dry_run: bool 
 def process_alive(config: dict, queue_id: str, verbose: bool, dry_run: bool = False) -> bool:
     if dry_run:
         return False
-    pattern = f"run_pipeline_queue.py --resume work/pipeline_queue/{queue_id} --process-only"
+    # Bracket the first character so the regex matches the worker command but
+    # not the pgrep/SSH probe command containing the literal regex itself.
+    pattern = f"[r]un_pipeline_queue.py --resume work/pipeline_queue/{queue_id} --process-only"
     result = run_command(
-        ssh_command(config, f"pgrep -af {shell_quote(pattern)} >/dev/null 2>&1"),
+        ssh_command(config, f"pgrep -af -- {shell_quote(pattern)} >/dev/null 2>&1"),
+        verbose=verbose,
+        dry_run=dry_run,
+    )
+    return result.code == 0
+
+
+def remote_queue_present(config: dict, queue_id: str, verbose: bool, dry_run: bool = False) -> bool:
+    if dry_run:
+        return True
+    manifest = remote_join("work/pipeline_queue", queue_id, "queue_manifest.json")
+    result = run_command(
+        ssh_command(config, remote_shell(config, f"test -f {shell_quote(manifest)}")),
         verbose=verbose,
         dry_run=dry_run,
     )
@@ -899,9 +927,10 @@ def cmd_push(args: argparse.Namespace) -> int:
         print_line(result.stdout.rstrip())
     if result.stderr:
         print_line(result.stderr.rstrip())
-    if result.code != 0:
+    if result.code != 0 or not check_output_process_ready(result.stdout):
         raise RemotePipelineError(
-            "Remote --check-only failed. If video resolution failed, run "
+            "Remote queue is not ready for unattended processing. Review the "
+            "`Process-only missing` items above; if video resolution failed, run "
             "`python remote_pipeline.py configure-paths <remote-video-directory>`."
         )
     print_line(f"[PUSH] Remote queue ready: work/pipeline_queue/{queue_id}")
@@ -912,6 +941,10 @@ def cmd_run(args: argparse.Namespace) -> int:
     config = load_config()
     manifest_path = queue_manifest_path(args.queue, allow_missing_dry_run=args.dry_run)
     queue_id = queue_id_from_manifest(manifest_path)
+    if not remote_queue_present(config, queue_id, args.verbose, args.dry_run):
+        raise RemotePipelineError(
+            f"Remote queue `{queue_id}` is missing. Run `python remote_pipeline.py push` before `run`."
+        )
     session = f"pipeline_{queue_id}"
     log_rel = remote_join("work/pipeline_queue", queue_id, "remote_run.log")
     process_cmd = (
@@ -955,7 +988,7 @@ def cmd_status(args: argparse.Namespace) -> int:
     tail_cmd = f"test -f {shell_quote(log_rel)} && tail -n 15 {shell_quote(log_rel)} || true"
     tail = run_command(ssh_command(config, remote_shell(config, tail_cmd)), verbose=args.verbose)
     print_line("[STATUS] Last remote_run.log lines:")
-    print_line((tail.stdout or "").rstrip() or "  <no log yet>")
+    print_line(clean_log_tail(tail.stdout or "") or "  <no log yet>")
     return 0 if result.code == 0 else result.code
 
 

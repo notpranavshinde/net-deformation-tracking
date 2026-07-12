@@ -289,6 +289,13 @@ def main():
         assert queue.calibration_stage_fingerprint(hopped, "sync") == migrated_sync_fp
         assert queue.setup_complete(hopped["jobs"][0], hopped)
 
+        points_path = Path(hopped["jobs"][0]["setup_json"])
+        assert queue.same_points_json(
+            "C:\\old-machine\\queue\\run_001_v1\\setup\\prompts\\points_left_right.json",
+            points_path,
+            Path(hopped["jobs"][0]["setup_dir"]),
+        )
+
         missing_setup = json.loads(json.dumps(hopped))
         Path(missing_setup["jobs"][0]["setup_json"]).unlink()
         missing, command = queue.process_only_missing(hopped_path, missing_setup)

@@ -282,12 +282,12 @@ def pick_regions(reference_video):
     digit_buf = ""
     g_mode = False
 
-    window = "Dual Video Clip Picker Linux"
+    window = "Dual Video Clip Picker"
     cv2.namedWindow(window, cv2.WINDOW_NORMAL)
     cv2.createTrackbar("Frame", window, 0, max(1, total_frames - 1), _on_trackbar)
     last_trackbar = 0
 
-    print("\nLinux controls:")
+    print("\nClip picker controls:")
     print("  s         mark start of a clip")
     print("  e         mark end of clip (after marking start)")
     print("  x         remove last clip (or cancel open start)")
@@ -324,7 +324,7 @@ def pick_regions(reference_video):
             draw_imu_overlay(display, imu, current_frame, total_frames, fps, fsize)
         cv2.putText(
             display,
-            "Linux keys: d/a frame  f/r ~1s  v/c ~10s  n next IMU  s start  e end  x undo  g goto  q export",
+            "Keys: d/a frame  f/r ~1s  v/c ~10s  n next IMU  s start  e end  x undo  g goto  q export",
             (20, display.shape[0] - 38),
             cv2.FONT_HERSHEY_SIMPLEX,
             max(0.5, fsize * 0.75),

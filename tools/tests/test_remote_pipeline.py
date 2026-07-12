@@ -248,9 +248,98 @@ def test_scp_command_honors_explicit_extra_args():
     ]
 
 
+def test_remote_process_probe_does_not_match_itself():
+    captured = {}
+    original_run_command = remote.run_command
+
+    def fake_run_command(command, **kwargs):
+        captured["command"] = command
+        return remote.CommandResult(1, "", "")
+
+    try:
+        remote.run_command = fake_run_command
+        assert not remote.process_alive(
+            {"host": "gpu", "ssh_extra_args": []}, "queue_a", verbose=False
+        )
+    finally:
+        remote.run_command = original_run_command
+
+    probe = captured["command"][-1]
+    assert "pgrep -af --" in probe
+    assert "[r]un_pipeline_queue.py" in probe
+
+
+def test_remote_queue_present_checks_manifest():
+    captured = {}
+    original_run_command = remote.run_command
+
+    def fake_run_command(command, **kwargs):
+        captured["command"] = command
+        return remote.CommandResult(0, "", "")
+
+    config = {
+        "host": "gpu",
+        "remote_repo": "/remote/repo",
+        "ssh_extra_args": [],
+    }
+    try:
+        remote.run_command = fake_run_command
+        assert remote.remote_queue_present(config, "queue_a", verbose=False)
+    finally:
+        remote.run_command = original_run_command
+
+    probe = captured["command"][-1]
+    assert probe == (
+        "cd /remote/repo && "
+        "test -f work/pipeline_queue/queue_a/queue_manifest.json"
+    )
+
+
+def test_run_command_decodes_remote_output_as_utf8():
+    command = [
+        sys.executable,
+        "-c",
+        "import sys; sys.stdout.buffer.write('GPU → ready'.encode('utf-8'))",
+    ]
+    result = remote.run_command(command)
+    assert result.code == 0
+    assert result.stdout == "GPU → ready"
+
+
+def test_print_line_replaces_characters_unsupported_by_console(capsys=None):
+    class AsciiStream:
+        encoding = "ascii"
+
+    original_stdout = remote.sys.stdout
+    original_console = remote.console
+    try:
+        remote.sys.stdout = AsciiStream()
+        remote.console = None
+        captured = []
+        remote.print = lambda message: captured.append(message)
+        remote.print_line("progress ━")
+    finally:
+        if hasattr(remote, "print"):
+            del remote.print
+        remote.sys.stdout = original_stdout
+        remote.console = original_console
+    assert captured == ["progress ?"]
+
+
+def test_clean_log_tail_removes_terminal_progress_noise():
+    payload = "header\n\x1b[2Kprogress 1%\r\x1b[2Kprogress 2%\rresult\n"
+    assert remote.clean_log_tail(payload) == "header\nprogress 1%\nprogress 2%\nresult"
+    assert remote.clean_log_tail("one\ntwo\nthree\n", max_lines=2) == "two\nthree"
+
+
 def main():
     test_derive_scp_args()
     test_scp_command_honors_explicit_extra_args()
+    test_remote_process_probe_does_not_match_itself()
+    test_remote_queue_present_checks_manifest()
+    test_run_command_decodes_remote_output_as_utf8()
+    test_print_line_replaces_characters_unsupported_by_console()
+    test_clean_log_tail_removes_terminal_progress_noise()
     test_superset_verdicts()
     test_configure_remote_video_roots()
     tmp_parent = Path(__file__).resolve().parent / "_tmp"
