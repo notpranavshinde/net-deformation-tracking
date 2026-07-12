@@ -60,6 +60,7 @@ triangulation/out/
 triangulation/results/
 imu_analysis/
 work/
+*.npz
 codex resume session id.txt
 
 # Generated frame/image debug dumps

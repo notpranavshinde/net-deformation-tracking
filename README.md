@@ -25,7 +25,7 @@ conda create -n sam2py311 python=3.11 -y
 conda activate sam2py311
 python -m pip install --upgrade pip
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
-pip install opencv-python numpy rich scipy scikit-image pandas matplotlib pillow hydra-core iopath huggingface_hub
+pip install -r requirements.txt
 cd sam2\sam2
 pip install -e .
 ```
@@ -45,7 +45,7 @@ conda create -n sam2py311 python=3.11 -y
 conda activate sam2py311
 python -m pip install --upgrade pip
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
-pip install opencv-python numpy rich scipy scikit-image pandas matplotlib pillow hydra-core iopath huggingface_hub
+pip install -r requirements.txt
 cd sam2/sam2
 pip install -e .
 ```
@@ -62,6 +62,16 @@ SAM2 model weights are not tracked in Git. The SAM2 scripts use Hugging Face
 run and then stay cached on that machine. DINO external repos are also not
 tracked; the DINO prompt scripts need their separate setup again if you return
 to them later.
+
+### Running tests
+
+From the repository root, run all standalone test scripts with:
+
+```bash
+python tools/run_tests.py
+```
+
+Use `python tools/run_tests.py --filter substring` to run matching scripts only.
 
 ## Calibration
 
