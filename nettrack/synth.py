@@ -43,6 +43,12 @@ class SyntheticNetScene:
         marker_sigma_px: float = 3.2,
         dropout_probability: float = 0.0,
         motion_blur_px: float = 0.0,
+        present: Any = None,
+        hidden_intervals: dict[int, tuple[float, float]] | None = None,
+        crossing_pair: tuple[int, int] | None = None,
+        crossing_time_s: float = 1.5,
+        crossing_width_s: float = 0.35,
+        crossing_separation_px: float = 12.0,
     ) -> None:
         if grid_cols < 1 or grid_rows < 1:
             raise ValueError("Grid dimensions must be positive")
@@ -57,12 +63,28 @@ class SyntheticNetScene:
         self.marker_sigma_px = float(marker_sigma_px)
         self.dropout_probability = float(dropout_probability)
         self.motion_blur_px = float(motion_blur_px)
+        self.hidden_intervals = dict(hidden_intervals or {})
+        self.crossing_pair = tuple(crossing_pair) if crossing_pair is not None else None
+        self.crossing_time_s = float(crossing_time_s)
+        self.crossing_width_s = float(crossing_width_s)
+        self.crossing_separation_px = float(crossing_separation_px)
         xs = np.linspace(-width_m / 2.0, width_m / 2.0, grid_cols)
         ys = np.linspace(-height_m / 2.0, height_m / 2.0, grid_rows)
         gx, gy = np.meshgrid(xs, ys)
-        self._base_points = np.column_stack((gx.ravel(), gy.ravel(), np.full(gx.size, depth_m)))
+        full_points = np.column_stack((gx.ravel(), gy.ravel(), np.full(gx.size, depth_m)))
+        if present is None:
+            self.marker_ids = np.arange(gx.size, dtype=np.int32)
+        else:
+            values = np.asarray(present)
+            self.marker_ids = (
+                np.flatnonzero(values.reshape(-1)).astype(np.int32)
+                if values.dtype == np.bool_
+                else values.reshape(-1).astype(np.int32)
+            )
+        self._base_points = full_points[self.marker_ids]
         rng = np.random.default_rng(seed)
-        self._phases = rng.uniform(0.0, 2.0 * np.pi, gx.size)
+        full_phases = rng.uniform(0.0, 2.0 * np.pi, gx.size)
+        self._phases = full_phases[self.marker_ids]
         self._color_jitter = rng.normal(0.0, 4.0, (gx.size, 3))
         self.rig = self._make_rig(baseline_m)
 
@@ -96,6 +118,26 @@ class SyntheticNetScene:
         points[:, 2] += self.billow_amplitude_m * envelope * wave
         points[:, 0] += self.sway_amplitude_m * np.sin(2.0 * np.pi * self.sway_frequency_hz * t)
         points[:, 1] += 0.012 * np.sin(2.0 * np.pi * 0.17 * t + 1.3 * x_norm)
+        if self.crossing_pair is not None and self.crossing_width_s > 0.0:
+            by_id = {int(marker_id): index for index, marker_id in enumerate(self.marker_ids)}
+            if all(int(marker_id) in by_id for marker_id in self.crossing_pair):
+                first, second = (by_id[int(marker_id)] for marker_id in self.crossing_pair)
+                camera_center = -self.rig.left.R.T @ self.rig.left.t
+                ray = points[first] - camera_center
+                pair_distance = float(np.linalg.norm(self._base_points[second] - self._base_points[first]))
+                camera_depth = float((self.rig.left.R @ points[first] + self.rig.left.t)[2])
+                lateral = min(
+                    abs(self.crossing_separation_px) * camera_depth / self.rig.left.K[0, 0],
+                    0.9 * pair_distance,
+                )
+                depth_offset = np.sqrt(max(pair_distance * pair_distance - lateral * lateral, 0.0))
+                along_ray = (
+                    points[first]
+                    + depth_offset * ray / np.linalg.norm(ray)
+                    + np.sign(self.crossing_separation_px or 1.0) * lateral * self.rig.left.R.T[:, 0]
+                )
+                blend = np.exp(-0.5 * ((float(t) - self.crossing_time_s) / self.crossing_width_s) ** 2)
+                points[second] = (1.0 - blend) * points[second] + blend * along_ray
         return points
 
     def _dropout_mask(self, camera: CameraCalibration, t: float) -> np.ndarray:
@@ -104,7 +146,12 @@ class SyntheticNetScene:
         time_key = int(round(float(t) * 1000.0))
         camera_key = 0 if camera.name == "left" else 1
         rng = np.random.default_rng(self.seed * 1_000_003 + time_key * 97 + camera_key * 7_919)
-        return rng.random(len(self._base_points)) < self.dropout_probability
+        dropped = rng.random(len(self._base_points)) < self.dropout_probability
+        for index, marker_id in enumerate(self.marker_ids):
+            interval = self.hidden_intervals.get(int(marker_id))
+            if interval is not None and float(interval[0]) <= float(t) < float(interval[1]):
+                dropped[index] = True
+        return dropped
 
     def ground_truth(self, camera: CameraCalibration, t: float) -> list[dict[str, Any]]:
         """Return marker positions, projections, and visibility for one camera/time."""
@@ -118,7 +165,7 @@ class SyntheticNetScene:
         )
         return [
             {
-                "marker_id": i,
+                "marker_id": int(self.marker_ids[i]),
                 "xyz": xyz[i].tolist(),
                 "u": float(uv[i, 0]),
                 "v": float(uv[i, 1]),
@@ -175,18 +222,28 @@ class SyntheticNetScene:
             base[y0:y1, x0:x1] = base[y0:y1, x0:x1] * (1.0 - alpha) + color * alpha
         return np.clip(base, 0.0, 255.0).astype(np.uint8)
 
-    def write_videos(self, out_dir: str | Path, n_frames: int, fps: float) -> tuple[Path, Path, Path]:
-        """Write stereo MP4s and complete rig/per-marker ground truth JSON."""
+    def write_videos(
+        self,
+        out_dir: str | Path,
+        n_frames: int,
+        fps: float,
+        *,
+        video_suffix: str = ".mp4",
+        codec: str | None = None,
+    ) -> tuple[Path, Path, Path]:
+        """Write stereo videos and complete rig/per-marker ground truth JSON."""
         out_dir = Path(out_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
         width, height = self.image_size
-        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        paths = (out_dir / "left.mp4", out_dir / "right.mp4")
+        suffix = video_suffix if str(video_suffix).startswith(".") else f".{video_suffix}"
+        codec = codec or ("MJPG" if suffix.lower() == ".avi" else "mp4v")
+        fourcc = cv2.VideoWriter_fourcc(*codec)
+        paths = (out_dir / f"left{suffix}", out_dir / f"right{suffix}")
         writers = [cv2.VideoWriter(str(path), fourcc, float(fps), (width, height)) for path in paths]
         if not all(writer.isOpened() for writer in writers):
             for writer in writers:
                 writer.release()
-            raise RuntimeError("Could not open synthetic MP4 writers")
+            raise RuntimeError("Could not open synthetic video writers")
         frames = []
         try:
             for frame_index in range(int(n_frames)):
@@ -203,6 +260,7 @@ class SyntheticNetScene:
         payload = {
             "schema_version": 1,
             "grid": {"cols": self.grid_cols, "rows": self.grid_rows},
+            "marker_ids": self.marker_ids.tolist(),
             "rig": self.rig.to_dict(),
             "fps": float(fps),
             "frames": frames,

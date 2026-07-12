@@ -1,0 +1,425 @@
+"""Topology-constrained stereo tracking for visually identical net markers."""
+
+from __future__ import annotations
+
+import time
+from dataclasses import asdict, dataclass, field
+from itertools import chain
+from typing import Callable, Iterable, Sequence
+
+import numpy as np
+from scipy.optimize import least_squares, linear_sum_assignment
+from scipy.sparse import lil_matrix
+
+from .colormodel import MarkerColorModel
+from .detect import Detection, detect_markers
+from .geometry import StereoCalibration, project_points, triangulate_point
+from .topology import NetTopology
+
+
+@dataclass
+class MeshTrackerConfig:
+    """Numerical and confidence controls for :class:`MeshTracker`."""
+
+    gate_radius_factor: float = 0.48
+    edge_weight: float = 0.1
+    temporal_weight: float = 0.01
+    robust_loss_scale: float = 2.5
+    max_inferred_streak: int = 20
+    velocity_damping: float = 0.35
+    min_gate_px: float = 8.0
+    max_gate_px: float = 90.0
+    audit_sigma: float = 4.0
+    audit_min_px: float = 4.0
+    rest_refine_frames: int = 10
+    solver_ftol: float = 1e-4
+    solver_xtol: float = 1e-4
+    solver_gtol: float = 1e-4
+    solver_max_nfev: int = 5
+
+
+@dataclass
+class MeshFrameResult:
+    """Solved state, observations, statuses, and metrics for one frame pair."""
+
+    pair_index: int
+    left_frame: int
+    right_frame: int
+    positions: np.ndarray
+    statuses: tuple[str, ...]
+    left_assignments: tuple[Detection | None, ...]
+    right_assignments: tuple[Detection | None, ...]
+    left_output: np.ndarray
+    right_output: np.ndarray
+    valid: np.ndarray
+    inferred_quality: np.ndarray
+    metrics: dict
+
+
+@dataclass
+class MeshTrackResult:
+    """Complete clip result plus the JSON-ready paper metrics report."""
+
+    topology: NetTopology
+    frames: list[MeshFrameResult]
+    rest_lengths: np.ndarray
+    report: dict = field(default_factory=dict)
+
+    @property
+    def positions(self) -> np.ndarray:
+        return np.asarray([frame.positions for frame in self.frames], dtype=np.float64)
+
+
+class MeshTracker:
+    """Track a single stereo 3-D mesh with fixed identity and connectivity.
+
+    Reprojection residuals are evaluated in distorted pixel coordinates.  Edge
+    and temporal residuals are converted to pixel-like units using the median
+    projected edge spacing, allowing one robust-loss scale to cover all terms.
+    """
+
+    def __init__(
+        self,
+        calibration: StereoCalibration,
+        topology: NetTopology,
+        config: MeshTrackerConfig | None = None,
+        detection_function: Callable[..., list[Detection]] = detect_markers,
+    ) -> None:
+        self.calibration = calibration
+        self.topology = topology
+        self.config = config or MeshTrackerConfig()
+        self._detect = detection_function
+        self._edge_indices = topology.edge_indices
+
+    @staticmethod
+    def _points(points: Sequence) -> np.ndarray:
+        parsed = []
+        for point in points:
+            if isinstance(point, dict):
+                parsed.append((point.get("x", point.get("u")), point.get("y", point.get("v"))))
+            else:
+                parsed.append((point[0], point[1]))
+        return np.asarray(parsed, dtype=np.float64).reshape(-1, 2)
+
+    def _projected_spacing(self, xyz: np.ndarray) -> float:
+        if len(self._edge_indices) == 0:
+            return 30.0
+        values = []
+        for camera in (self.calibration.left, self.calibration.right):
+            uv = project_points(xyz, camera)
+            delta = uv[self._edge_indices[:, 0]] - uv[self._edge_indices[:, 1]]
+            values.extend(np.linalg.norm(delta, axis=1).tolist())
+        return max(float(np.median(values)), 2.0)
+
+    def _assign(
+        self, predicted_uv: np.ndarray, detections: Sequence[Detection], gate_px: float
+    ) -> list[Detection | None]:
+        assigned: list[Detection | None] = [None] * len(predicted_uv)
+        if not detections or len(predicted_uv) == 0:
+            return assigned
+        observed = np.asarray([(item.u, item.v) for item in detections], dtype=np.float64)
+        distance = np.linalg.norm(predicted_uv[:, None, :] - observed[None, :, :], axis=2)
+        quality = np.asarray([item.quality for item in detections], dtype=np.float64)
+        cost = distance / (0.5 + 0.5 * quality[None, :])
+        cost[distance > gate_px] = 1e9
+        rows, cols = linear_sum_assignment(cost)
+        for row, col in zip(rows, cols):
+            if distance[row, col] <= gate_px:
+                assigned[int(row)] = detections[int(col)]
+        return assigned
+
+    def _snap(
+        self, points: np.ndarray, detections: Sequence[Detection], model: MarkerColorModel
+    ) -> tuple[np.ndarray, list[Detection | None]]:
+        gate = max(self.config.min_gate_px, 2.5 * max(model.patch_radius, 1))
+        assignments = self._assign(points, detections, gate)
+        snapped = points.copy()
+        for index, detection in enumerate(assignments):
+            if detection is not None:
+                snapped[index] = detection.u, detection.v
+        return snapped, assignments
+
+    def _sparsity(
+        self, left: Sequence[Detection | None], right: Sequence[Detection | None]
+    ):
+        n, edge_count = len(self.topology), len(self._edge_indices)
+        observation_count = sum(item is not None for item in left) + sum(
+            item is not None for item in right
+        )
+        rows = 2 * observation_count + edge_count + 3 * n
+        pattern = lil_matrix((rows, 3 * n), dtype=np.int8)
+        row = 0
+        for assignments in (left, right):
+            for index, detection in enumerate(assignments):
+                if detection is not None:
+                    pattern[row:row + 2, 3 * index:3 * index + 3] = 1
+                    row += 2
+        for a, b in self._edge_indices:
+            pattern[row, 3 * a:3 * a + 3] = 1
+            pattern[row, 3 * b:3 * b + 3] = 1
+            row += 1
+        for index in range(n):
+            pattern[row:row + 3, 3 * index:3 * index + 3] = 1
+            row += 3
+        return pattern.tocsr()
+
+    def _solve(
+        self,
+        initial: np.ndarray,
+        predicted: np.ndarray,
+        left: Sequence[Detection | None],
+        right: Sequence[Detection | None],
+        rest_lengths: np.ndarray,
+        spacing_px: float,
+    ):
+        config = self.config
+        edge_scale = config.edge_weight * spacing_px
+        temporal_scale = config.temporal_weight * spacing_px / max(
+            float(np.median(rest_lengths)) if len(rest_lengths) else 1.0, 1e-9
+        )
+
+        def residual(flat):
+            xyz = flat.reshape(-1, 3)
+            values = []
+            for camera, assignments in (
+                (self.calibration.left, left),
+                (self.calibration.right, right),
+            ):
+                uv = project_points(xyz, camera)
+                for index, detection in enumerate(assignments):
+                    if detection is not None:
+                        weight = np.sqrt(max(0.15, detection.quality))
+                        values.extend(weight * (uv[index] - (detection.u, detection.v)))
+            if len(self._edge_indices):
+                delta = xyz[self._edge_indices[:, 0]] - xyz[self._edge_indices[:, 1]]
+                lengths = np.linalg.norm(delta, axis=1)
+                values.extend(edge_scale * (lengths - rest_lengths) / np.maximum(rest_lengths, 1e-9))
+            values.extend((temporal_scale * (xyz - predicted)).reshape(-1))
+            return np.asarray(values, dtype=np.float64)
+
+        return least_squares(
+            residual,
+            initial.reshape(-1),
+            method="trf",
+            loss="soft_l1",
+            f_scale=config.robust_loss_scale,
+            jac_sparsity=self._sparsity(left, right),
+            ftol=config.solver_ftol,
+            xtol=config.solver_xtol,
+            gtol=config.solver_gtol,
+            max_nfev=config.solver_max_nfev,
+        )
+
+    def _audit(
+        self,
+        xyz: np.ndarray,
+        assignments: list[Detection | None],
+        camera,
+    ) -> int:
+        uv = project_points(xyz, camera)
+        present = [(i, item) for i, item in enumerate(assignments) if item is not None]
+        if not present:
+            return 0
+        errors = np.asarray(
+            [np.linalg.norm(uv[i] - (item.u, item.v)) for i, item in present], dtype=float
+        )
+        median = float(np.median(errors))
+        mad = 1.4826 * float(np.median(np.abs(errors - median)))
+        threshold = max(self.config.audit_min_px, median + self.config.audit_sigma * max(mad, 0.25))
+        dropped = 0
+        for (index, _item), error in zip(present, errors):
+            if error > threshold:
+                assignments[index] = None
+                dropped += 1
+        return dropped
+
+    def track(
+        self,
+        left_frames: Iterable[np.ndarray],
+        right_frames: Iterable[np.ndarray],
+        setup_left: Sequence,
+        setup_right: Sequence,
+        *,
+        frame_indices: Iterable[tuple[int, int]] | None = None,
+        left_roi=None,
+        right_roi=None,
+        progress: Callable[[int, dict], None] | None = None,
+    ) -> MeshTrackResult:
+        """Track paired frames; setup arrays are aligned with topology node order."""
+        left_iter, right_iter = iter(left_frames), iter(right_frames)
+        try:
+            first_left, first_right = next(left_iter), next(right_iter)
+        except StopIteration as exc:
+            raise ValueError("At least one stereo frame pair is required") from exc
+        setup_l, setup_r = self._points(setup_left), self._points(setup_right)
+        if len(setup_l) != len(self.topology) or len(setup_r) != len(self.topology):
+            raise ValueError("Setup point counts must equal topology node count")
+
+        init_started = time.perf_counter()
+        tick = time.perf_counter()
+        model_l = MarkerColorModel().fit(first_left, setup_l)
+        model_r = MarkerColorModel().fit(first_right, setup_r)
+        init_fit_s = time.perf_counter() - tick
+        tick = time.perf_counter()
+        detections_l = self._detect(first_left, model_l, roi=left_roi, expected_count=len(self.topology))
+        detections_r = self._detect(first_right, model_r, roi=right_roi, expected_count=len(self.topology))
+        init_detect_s = time.perf_counter() - tick
+        tick = time.perf_counter()
+        snapped_l, _ = self._snap(setup_l, detections_l, model_l)
+        snapped_r, _ = self._snap(setup_r, detections_r, model_r)
+        positions = np.asarray(
+            [triangulate_point(a, b, self.calibration) for a, b in zip(snapped_l, snapped_r)]
+        )
+        init_geometry_s = time.perf_counter() - tick
+        initialization_timing = {
+            "color_model_fit": init_fit_s,
+            "detection": init_detect_s,
+            "snap_and_triangulation": init_geometry_s,
+            "total": time.perf_counter() - init_started,
+        }
+        if not np.all(np.isfinite(positions)):
+            raise ValueError("Initial setup triangulated to non-finite coordinates")
+        rest = np.linalg.norm(
+            positions[self._edge_indices[:, 0]] - positions[self._edge_indices[:, 1]], axis=1
+        ) if len(self._edge_indices) else np.empty(0)
+        velocity = np.zeros_like(positions)
+        inferred_streak = np.zeros(len(self.topology), dtype=np.int32)
+        rest_history = [rest.copy()]
+        frames: list[MeshFrameResult] = []
+        timings_total = {"detect_s": 0.0, "assign_s": 0.0, "solve_s": 0.0, "total_s": 0.0}
+
+        all_left = chain((first_left,), left_iter)
+        all_right = chain((first_right,), right_iter)
+        indices = iter(frame_indices) if frame_indices is not None else None
+        for pair_index, (left_image, right_image) in enumerate(zip(all_left, all_right)):
+            started = time.perf_counter()
+            left_frame, right_frame = next(indices) if indices is not None else (pair_index, pair_index)
+            predicted = positions + self.config.velocity_damping * velocity
+            spacing = self._projected_spacing(predicted)
+            gate = float(np.clip(self.config.gate_radius_factor * spacing, self.config.min_gate_px, self.config.max_gate_px))
+            tick = time.perf_counter()
+            det_l = self._detect(left_image, model_l, roi=left_roi, expected_count=len(self.topology))
+            det_r = self._detect(right_image, model_r, roi=right_roi, expected_count=len(self.topology))
+            detect_s = time.perf_counter() - tick
+            tick = time.perf_counter()
+            left_assignment = self._assign(project_points(predicted, self.calibration.left), det_l, gate)
+            right_assignment = self._assign(project_points(predicted, self.calibration.right), det_r, gate)
+            assign_s = time.perf_counter() - tick
+            tick = time.perf_counter()
+            solve_initial = predicted.copy()
+            for index, (left_item, right_item) in enumerate(zip(left_assignment, right_assignment)):
+                if left_item is not None and right_item is not None:
+                    solve_initial[index] = triangulate_point(
+                        (left_item.u, left_item.v), (right_item.u, right_item.v), self.calibration
+                    )
+            solved = self._solve(solve_initial, predicted, left_assignment, right_assignment, rest, spacing)
+            new_positions = solved.x.reshape(-1, 3)
+            audit_drops = self._audit(new_positions, left_assignment, self.calibration.left)
+            audit_drops += self._audit(new_positions, right_assignment, self.calibration.right)
+            if audit_drops:
+                solved = self._solve(new_positions, predicted, left_assignment, right_assignment, rest, spacing)
+                new_positions = solved.x.reshape(-1, 3)
+            solve_s = time.perf_counter() - tick
+
+            measured_l = np.asarray([item is not None for item in left_assignment])
+            measured_r = np.asarray([item is not None for item in right_assignment])
+            measured = measured_l | measured_r
+            inferred_streak[measured] = 0
+            inferred_streak[~measured] += 1
+            valid = inferred_streak <= self.config.max_inferred_streak
+            statuses = []
+            for l_ok, r_ok, is_valid in zip(measured_l, measured_r, valid):
+                if l_ok and r_ok:
+                    statuses.append("measured-both")
+                elif l_ok:
+                    statuses.append("measured-left")
+                elif r_ok:
+                    statuses.append("measured-right")
+                elif is_valid:
+                    statuses.append("inferred")
+                else:
+                    statuses.append("lost")
+            projected_l = project_points(new_positions, self.calibration.left)
+            projected_r = project_points(new_positions, self.calibration.right)
+            output_l, output_r = projected_l.copy(), projected_r.copy()
+            for index, item in enumerate(left_assignment):
+                if item is not None:
+                    output_l[index] = item.u, item.v
+            for index, item in enumerate(right_assignment):
+                if item is not None:
+                    output_r[index] = item.u, item.v
+            confidence = np.power(0.78, inferred_streak.astype(float))
+            one_view_quality = np.asarray([
+                max(l.quality if l else 0.0, r.quality if r else 0.0)
+                for l, r in zip(left_assignment, right_assignment)
+            ])
+            inferred_quality = np.where(measured, np.maximum(0.05, one_view_quality) * 0.8, 0.65 * confidence)
+            inferred_quality[~valid] = 0.0
+
+            velocity = new_positions - positions
+            positions = new_positions
+            edge_lengths = np.linalg.norm(
+                positions[self._edge_indices[:, 0]] - positions[self._edge_indices[:, 1]], axis=1
+            ) if len(self._edge_indices) else np.empty(0)
+            if pair_index + 1 < self.config.rest_refine_frames and len(rest):
+                rest_history.append(edge_lengths)
+                history = np.asarray(rest_history)
+                center = np.median(history, axis=0)
+                deviation = np.abs(history - center)
+                cutoff = 3.0 * np.maximum(np.median(deviation, axis=0), 1e-9)
+                rest = np.asarray([
+                    np.mean(history[:, i][deviation[:, i] <= cutoff[i]]) for i in range(len(rest))
+                ])
+            total_s = time.perf_counter() - started
+            metrics = {
+                "pair_index": pair_index, "left_frame": int(left_frame), "right_frame": int(right_frame),
+                "detections_left": len(det_l), "detections_right": len(det_r),
+                "assignments_left": int(measured_l.sum()), "assignments_right": int(measured_r.sum()),
+                "inferred": int(np.count_nonzero(np.asarray(statuses) == "inferred")),
+                "lost": int(np.count_nonzero(np.asarray(statuses) == "lost")),
+                "audit_drops": int(audit_drops), "solver_iterations": int(solved.nfev),
+                "edge_length_mean": float(np.mean(edge_lengths)) if len(edge_lengths) else 0.0,
+                "edge_length_std": float(np.std(edge_lengths)) if len(edge_lengths) else 0.0,
+                "rest_length_mean": float(np.mean(rest)) if len(rest) else 0.0,
+                "rest_length_std": float(np.std(rest)) if len(rest) else 0.0,
+                "edge_length_mean_minus_rest": float(np.mean(edge_lengths - rest)) if len(rest) else 0.0,
+                "edge_relative_rmse_vs_rest": float(np.sqrt(np.mean(((edge_lengths - rest) / rest) ** 2))) if len(rest) else 0.0,
+                "timing_s": {"detect": detect_s, "assign": assign_s, "solve": solve_s, "total": total_s},
+            }
+            for key, value in (("detect_s", detect_s), ("assign_s", assign_s), ("solve_s", solve_s), ("total_s", total_s)):
+                timings_total[key] += value
+            frames.append(MeshFrameResult(
+                pair_index, int(left_frame), int(right_frame), positions.copy(), tuple(statuses),
+                tuple(left_assignment), tuple(right_assignment), output_l, output_r, valid.copy(),
+                inferred_quality, metrics,
+            ))
+            if progress is not None:
+                progress(pair_index + 1, metrics)
+
+        if not frames:
+            raise ValueError("The stereo iterables did not contain a complete frame pair")
+        totals = {
+            "frames": len(frames),
+            "inferred_vertex_frames": sum(frame.metrics["inferred"] for frame in frames),
+            "lost_vertex_frames": sum(frame.metrics["lost"] for frame in frames),
+            "audit_drops": sum(frame.metrics["audit_drops"] for frame in frames),
+            "detections_left": sum(frame.metrics["detections_left"] for frame in frames),
+            "detections_right": sum(frame.metrics["detections_right"] for frame in frames),
+            "assignments_left": sum(frame.metrics["assignments_left"] for frame in frames),
+            "assignments_right": sum(frame.metrics["assignments_right"] for frame in frames),
+            "solver_iterations": sum(frame.metrics["solver_iterations"] for frame in frames),
+            "timing_s": timings_total,
+            "mean_seconds_per_pair": timings_total["total_s"] / len(frames),
+        }
+        report = {
+            "schema_version": 1,
+            "coordinate_residual_space": "distorted_pixels",
+            "node_ids": list(self.topology.node_ids),
+            "edges": [list(edge) for edge in self.topology.edges],
+            "config": asdict(self.config),
+            "rest_lengths": rest.tolist(),
+            "initialization_timing_s": initialization_timing,
+            "frames": [frame.metrics for frame in frames],
+            "totals": totals,
+        }
+        return MeshTrackResult(self.topology, frames, rest.copy(), report)
