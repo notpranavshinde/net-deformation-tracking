@@ -39,6 +39,7 @@ class MeshTrackerConfig:
     reacquire_after: int = 2
     excursion_threshold: float = 0.08
     excursion_min_len: int = 5
+    inferred_min_len: int = 25
     solver_ftol: float = 1e-4
     solver_xtol: float = 1e-4
     solver_gtol: float = 1e-4
@@ -425,8 +426,10 @@ class MeshTracker:
             raise ValueError("The stereo iterables did not contain a complete frame pair")
         node_reports, suspect_count = suspect_node_reports(
             frames, self.topology, self.config.excursion_threshold, self.config.excursion_min_len,
+            self.config.inferred_min_len,
         )
         one_view_count = sum(len(node["one_view_intervals"]) for node in node_reports)
+        inferred_count = sum(len(node["inferred_intervals"]) for node in node_reports)
         totals = {
             "frames": len(frames),
             "inferred_vertex_frames": sum(frame.metrics["inferred"] for frame in frames),
@@ -441,6 +444,7 @@ class MeshTracker:
             "reacquired_right": sum(frame.metrics["reacquired_right"] for frame in frames),
             "suspect_intervals": suspect_count,
             "one_view_intervals": one_view_count,
+            "inferred_intervals": inferred_count,
             "timing_s": timings_total,
             "mean_seconds_per_pair": timings_total["total_s"] / len(frames),
         }

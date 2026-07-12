@@ -239,7 +239,7 @@ def write_setup_check_overlay(image: np.ndarray, report: dict, path: str | Path)
 def add_source_interval_frames(report: dict, source_start: int) -> None:
     """Attach source-video frame numbers to every reported interval."""
     for node in report.get("nodes", []):
-        for key in ("suspect_intervals", "one_view_intervals"):
+        for key in ("suspect_intervals", "one_view_intervals", "inferred_intervals"):
             for interval in node.get(key, []):
                 interval["source_start_frame"] = int(source_start) + int(interval["left_start_frame"])
                 interval["source_end_frame"] = int(source_start) + int(interval["left_end_frame"])
@@ -265,6 +265,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--reacquire-after", type=int, default=2)
     parser.add_argument("--excursion-threshold", type=float, default=0.08)
     parser.add_argument("--excursion-min-len", type=int, default=5)
+    parser.add_argument("--inferred-min-len", type=int, default=25)
     return parser
 
 
@@ -289,6 +290,7 @@ def main(argv=None) -> int:
         reacquire_after=max(1, args.reacquire_after),
         excursion_threshold=max(0.0, args.excursion_threshold),
         excursion_min_len=max(1, args.excursion_min_len),
+        inferred_min_len=max(1, args.inferred_min_len),
     )
     tracker = MeshTracker(calibration, topology, config)
     first_left_image = next(iter(left_frames))

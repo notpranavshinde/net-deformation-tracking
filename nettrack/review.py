@@ -138,6 +138,7 @@ def generate_review(
             setup_node = setup_by_id.get(obj_id, {})
             intervals = tracking_by_id.get(obj_id, {}).get("suspect_intervals", [])
             one_view_intervals = tracking_by_id.get(obj_id, {}).get("one_view_intervals", [])
+            inferred_intervals = tracking_by_id.get(obj_id, {}).get("inferred_intervals", [])
             node = {"id": obj_id, "row": setup_node.get("row"), "col": setup_node.get("col"),
                     "label": f"{setup_node.get('row', '?')},{setup_node.get('col', '?')}",
                     "setupStatus": setup_node.get("status", "confirmed"),
@@ -146,6 +147,7 @@ def generate_review(
                     "repairDistance": setup_node.get("repair_distance_px", {}),
                     "suspectIntervals": intervals,
                     "oneViewIntervals": one_view_intervals,
+                    "inferredIntervals": inferred_intervals,
                     "suspectNow": any(
                         int(item["left_start_frame"]) <= pair[0] <= int(item["left_end_frame"])
                         for item in intervals
@@ -173,7 +175,7 @@ def generate_review(
 
     data = {"title": "Stereo marker review", "frames": payload_frames}
     template = Path(__file__).with_name("review_template.html").read_text(encoding="utf-8")
-    html = template.replace("__REVIEW_DATA__", json.dumps(data, separators=(",", ":")).replace("</", "<\\/"))
+    html = template.replace("__REVIEW_DATA__", json.dumps(data, separators=(",", ":"), ensure_ascii=False).replace("</", "<\\/"))
     output = run_dir / "marker_review.html"
     output.write_text(html, encoding="utf-8")
     return output, sampled_pairs
