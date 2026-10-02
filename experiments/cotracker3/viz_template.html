@@ -1,0 +1,330 @@
+<title>Net Tracker Faceoff</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Barlow+Semi+Condensed:wght@500;600;700&family=IBM+Plex+Sans:wght@400;500&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+/* Layout: one dark instrument panel, like the towing-tank footage it measures —
+   transport bar on top, two synchronized 3D nets, then camera footage and one knot's path. */
+:root {
+  --tank: #0d1416;        /* page ground, the black-lined tank */
+  --panel: #142024;       /* raised surfaces */
+  --rule: #24343a;        /* hairlines, grid */
+  --ink: #dfe8e6;         /* primary text */
+  --muted: #8ea19f;       /* secondary text */
+  --knot: #f39a2b;        /* painted-knot orange, the accent */
+  --sam: #4cc9f0;         /* SAM2 series */
+  --cot: #5ad27a;         /* CoTracker3 series */
+  --bad: #ff5a4f;         /* large edge error */
+  --display: "Barlow Semi Condensed", "Arial Narrow", system-ui, sans-serif;
+  --body: "IBM Plex Sans", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --mono: "IBM Plex Mono", ui-monospace, "Cascadia Mono", Consolas, monospace;
+  color-scheme: dark;
+}
+html { background: var(--tank); }
+body { background: var(--tank); color: var(--ink); font-family: var(--body); font-size: 15px; line-height: 1.5; }
+.wrap { max-width: 1240px; margin: 0 auto; padding-inline: clamp(16px, 3vw, 32px); padding-block: 28px 56px; display: grid; gap: 28px; }
+
+header { display: grid; gap: 6px; }
+.eyebrow { font-family: var(--mono); font-size: 12px; letter-spacing: .08em; text-transform: uppercase; color: var(--knot); }
+h1 { font-family: var(--display); font-weight: 700; font-size: clamp(30px, 4.4vw, 46px); line-height: 1.05; margin: 0; text-wrap: balance; letter-spacing: .005em; }
+h2 { font-family: var(--display); font-weight: 600; font-size: 22px; margin: 0; letter-spacing: .01em; }
+.lede { color: var(--muted); max-width: 68ch; margin: 0; }
+.lede b { color: var(--ink); font-weight: 500; }
+
+.transport { position: sticky; top: env(safe-area-inset-top, 0px); z-index: 5; background: color-mix(in srgb, var(--tank) 92%, transparent); backdrop-filter: blur(6px);
+  display: flex; flex-wrap: wrap; align-items: center; gap: 10px 16px; padding-block: 10px; border-bottom: 1px solid var(--rule); }
+button { font: 500 13px var(--body); color: var(--ink); background: var(--panel); border: 1px solid var(--rule); border-radius: 6px; padding: 7px 12px; cursor: pointer; }
+button:hover { border-color: var(--muted); }
+button:focus-visible, input:focus-visible { outline: 2px solid var(--knot); outline-offset: 2px; }
+button[aria-pressed="true"] { border-color: var(--knot); color: var(--knot); }
+#play { min-width: 76px; }
+.scrub { flex: 1 1 260px; display: flex; align-items: center; gap: 12px; min-width: 0; }
+input[type=range] { flex: 1; accent-color: var(--knot); min-width: 0; }
+.readout { font-family: var(--mono); font-size: 13px; color: var(--muted); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.readout b { color: var(--ink); font-weight: 500; }
+.group { display: flex; gap: 6px; flex-wrap: wrap; }
+
+.nets { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+.view { background: var(--panel); border: 1px solid var(--rule); border-radius: 10px; overflow: hidden; display: grid; grid-template-rows: auto 1fr auto; min-width: 0; }
+.view-head { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; padding: 12px 14px 0; }
+.tag { font-family: var(--display); font-weight: 600; font-size: 20px; display: flex; align-items: center; gap: 8px; }
+.tag i { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }
+.live { font-family: var(--mono); font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; text-align: right; }
+.live b { font-weight: 500; }
+canvas.net { width: 100%; aspect-ratio: 1 / 1; display: block; cursor: grab; touch-action: none; }
+canvas.net:active { cursor: grabbing; }
+.view-foot { display: flex; justify-content: space-between; gap: 12px; padding: 0 14px 12px; font-size: 12px; color: var(--muted); font-family: var(--mono); }
+
+.legend { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 18px; font-size: 13px; color: var(--muted); }
+.ramp { display: flex; align-items: center; gap: 8px; font-family: var(--mono); font-size: 12px; }
+.ramp span.bar { width: 160px; height: 8px; border-radius: 4px; background: linear-gradient(90deg, #4f6470 0%, #4f6470 10%, var(--knot) 50%, var(--bad) 100%); }
+.hint { font-size: 13px; color: var(--muted); }
+
+.row2 { display: grid; grid-template-columns: minmax(0, 1.15fr) minmax(0, 1fr); gap: 16px; align-items: start; }
+.card { background: var(--panel); border: 1px solid var(--rule); border-radius: 10px; padding: 14px; display: grid; gap: 10px; min-width: 0; }
+video { width: 100%; max-width: 100%; border-radius: 6px; background: #000; display: block; }
+.dot { display: inline-flex; align-items: center; gap: 6px; }
+.dot i { width: 12px; height: 12px; border-radius: 50%; border: 2px solid currentColor; display: inline-block; }
+canvas.chart { width: 100%; height: 300px; display: block; }
+
+.metrics { overflow-x: auto; }
+table { border-collapse: collapse; width: 100%; font-variant-numeric: tabular-nums; }
+th, td { text-align: left; padding: 9px 12px; border-bottom: 1px solid var(--rule); white-space: nowrap; }
+th { font: 500 12px var(--mono); letter-spacing: .06em; text-transform: uppercase; color: var(--muted); }
+td.num { font-family: var(--mono); text-align: right; }
+th.num { text-align: right; }
+td.win { color: var(--cot); }
+td small { color: var(--muted); font-family: var(--body); }
+
+@media (max-width: 760px) {
+  .nets, .row2 { grid-template-columns: 1fr; }
+}
+@media (prefers-reduced-motion: reduce) { * { scroll-behavior: auto; } }
+</style>
+
+<div class="wrap">
+  <header>
+    <div class="eyebrow" id="eyebrow">Trial 15 · run 006 · 0.30 m/s tow</div>
+    <h1>Net Tracker Faceoff</h1>
+    <p class="lede">The same 12 × 12 painted-knot grid, reconstructed in 3D from the same two GoPros, once with <b>SAM2</b> tracks and once with <b>CoTracker3</b> tracks plus a full-resolution snap to each knot. Every edge is colored by how far its length strays from that edge's usual length. The twine between two knots barely stretches, so a hot edge is a tracking error.</p>
+  </header>
+
+  <div class="transport" role="group" aria-label="Playback">
+    <button id="play" type="button">Play</button>
+    <div class="scrub">
+      <input id="scrub" type="range" min="0" max="0" value="0" aria-label="Frame">
+      <span class="readout">frame <b id="fnum">0</b> · <b id="tsec">0.00</b> s</span>
+    </div>
+    <div class="group" role="group" aria-label="Playback speed">
+      <button type="button" data-rate="0.25">¼×</button>
+      <button type="button" data-rate="0.5" aria-pressed="true">½×</button>
+      <button type="button" data-rate="1">1×</button>
+    </div>
+    <div class="group" role="group" aria-label="View">
+      <button type="button" data-view="iso" aria-pressed="true">Angled</button>
+      <button type="button" data-view="front">Camera</button>
+      <button type="button" data-view="side">Side</button>
+      <button type="button" data-view="top">Top</button>
+    </div>
+  </div>
+
+  <section class="nets" aria-label="3D nets">
+    <div class="view">
+      <div class="view-head">
+        <div class="tag"><i style="background:var(--sam)"></i>SAM2</div>
+        <div class="live" id="live-sam2"></div>
+      </div>
+      <canvas class="net" id="c-sam2" aria-label="SAM2 3D net"></canvas>
+      <div class="view-foot"><span id="miss-sam2"></span><span>drag to rotate · scroll to zoom</span></div>
+    </div>
+    <div class="view">
+      <div class="view-head">
+        <div class="tag"><i style="background:var(--cot)"></i>CoTracker3</div>
+        <div class="live" id="live-cot"></div>
+      </div>
+      <canvas class="net" id="c-cot" aria-label="CoTracker3 3D net"></canvas>
+      <div class="view-foot"><span id="miss-cot"></span><span>384×512 track + full-res snap</span></div>
+    </div>
+  </section>
+
+  <div class="legend">
+    <div class="ramp"><span>0</span><span class="bar"></span><span>≥ 10 mm</span></div>
+    <span>edge length error vs. that edge's median</span>
+    <span class="hint">Knots ringed in orange are the ones the two trackers disagree on most.</span>
+  </div>
+
+  <section class="row2">
+    <div class="card">
+      <h2>Left camera</h2>
+      <div class="legend">
+        <span class="dot" style="color:var(--sam)"><i></i>SAM2</span>
+        <span class="dot" style="color:var(--cot)"><i></i>CoTracker3</span>
+        <span class="hint">Numbered knots are the disputed ones. Follows the timeline above.</span>
+      </div>
+      <video id="vid" src="__VIDEO_SRC__" muted playsinline preload="auto"></video>
+    </div>
+    <div class="card">
+      <h2 id="chart-title">Knot path</h2>
+      <p class="hint" style="margin:0">Downstream movement of one central knot (toward the cameras), relative to its first-frame position. Same knot, same frames, two trackers. The spread around the smooth curve is tracking noise.</p>
+      <canvas class="chart" id="chart" aria-label="Knot depth over time"></canvas>
+    </div>
+  </section>
+
+  <section class="card metrics">
+    <h2>Whole-run numbers</h2>
+    <table>
+      <thead><tr><th>Measure</th><th class="num">SAM2</th><th class="num">CoTracker3</th></tr></thead>
+      <tbody id="mtable"></tbody>
+    </table>
+  </section>
+</div>
+
+<script>
+const D = /*__DATA__*/null;
+const css = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+const C = { sam: css('--sam'), cot: css('--cot'), knot: css('--knot'), bad: css('--bad'), rule: css('--rule'), muted: css('--muted'), ink: css('--ink') };
+const G = D.grid, N = G * G, T = D.frames.length;
+const KEYS = ['sam2', 'cot'];
+
+// Unpack: positions in mm, camera frame (x right, y down, z away from cameras).
+const P = {};
+for (const k of KEYS) P[k] = D[k].map(f => { const a = new Float32Array(N * 3); for (let i = 0; i < N * 3; i++) a[i] = f[i] == null ? NaN : f[i] / 10; return a; });
+
+const EDGES = [];
+for (let i = 0; i < N; i++) { if (i % G < G - 1) EDGES.push([i, i + 1]); if (i + G < N) EDGES.push([i, i + G]); }
+const len = (a, i, j) => Math.hypot(a[3*i] - a[3*j], a[3*i+1] - a[3*j+1], a[3*i+2] - a[3*j+2]);
+const median = v => { const s = v.filter(Number.isFinite).sort((a, b) => a - b); return s.length ? s[s.length >> 1] : NaN; };
+const REF = {};
+for (const k of KEYS) REF[k] = EDGES.map(([i, j]) => median(P[k].map(a => len(a, i, j))));
+
+// View state shared by both canvases.
+const VIEWS = { iso: [-0.75, 0.38], front: [0, 0], side: [-Math.PI / 2, 0], top: [0, Math.PI / 2 - 0.001] };
+let yaw = VIEWS.iso[0], pitch = VIEWS.iso[1], zoom = 1, frame = 0;
+
+// Fit: span of the CoTracker net over the run, so both nets share one scale.
+let span = 0; { const a = P.cot; for (const f of a) for (let i = 0; i < N; i++) if (Number.isFinite(f[3*i])) span = Math.max(span, Math.abs(f[3*i]), Math.abs(f[3*i+1]), Math.abs(f[3*i+2])); }
+const centre = (() => { let s = [0, 0, 0], n = 0; for (const f of [P.cot[0], P.cot[T - 1]]) for (let i = 0; i < N; i++) if (Number.isFinite(f[3*i])) { s[0] += f[3*i]; s[1] += f[3*i+1]; s[2] += f[3*i+2]; n++; } return s.map(v => v / n); })();
+
+function project(x, y, z, w, h) {
+  // Centre, flip y so up is up, flip z so downstream bowing points toward the viewer side.
+  x -= centre[0]; y = -(y - centre[1]); z = -(z - centre[2]);
+  const cy = Math.cos(yaw), sy = Math.sin(yaw), cp = Math.cos(pitch), sp = Math.sin(pitch);
+  const x1 = cy * x + sy * z, z1 = -sy * x + cy * z;
+  const y2 = cp * y - sp * z1, z2 = sp * y + cp * z1;
+  const s = zoom * Math.min(w, h) * 0.42 / span;
+  return [w / 2 + x1 * s, h / 2 - y2 * s, z2];
+}
+
+function errColor(e) {
+  // 0-1 mm slate, ramps through knot orange at 5 mm to red at 10 mm.
+  const stops = [[0, [79, 100, 112]], [1, [79, 100, 112]], [5, [243, 154, 43]], [10, [255, 90, 79]]];
+  e = Math.min(Math.abs(e), 10);
+  for (let k = 1; k < stops.length; k++) if (e <= stops[k][0]) {
+    const [e0, c0] = stops[k - 1], [e1, c1] = stops[k], t = (e - e0) / (e1 - e0 || 1);
+    return `rgb(${c0.map((c, i) => Math.round(c + (c1[i] - c) * t)).join(',')})`;
+  }
+  return 'rgb(255,90,79)';
+}
+
+const canv = { sam2: document.getElementById('c-sam2'), cot: document.getElementById('c-cot') };
+function sizeCanvas(c) { const r = c.getBoundingClientRect(), d = devicePixelRatio || 1; c.width = Math.round(r.width * d); c.height = Math.round(r.height * d); }
+
+function drawNet(k) {
+  const c = canv[k], g = c.getContext('2d'), w = c.width, h = c.height, d = devicePixelRatio || 1;
+  g.clearRect(0, 0, w, h);
+  const a = P[k][frame], ref = REF[k];
+  const pts = []; for (let i = 0; i < N; i++) pts.push(Number.isFinite(a[3*i]) ? project(a[3*i], a[3*i+1], a[3*i+2], w, h) : null);
+  // Faint first-frame ghost for reference.
+  g.strokeStyle = 'rgba(142,161,159,0.16)'; g.lineWidth = d;
+  const a0 = P[k][0]; g.beginPath();
+  for (const [i, j] of EDGES) { if (!Number.isFinite(a0[3*i]) || !Number.isFinite(a0[3*j])) continue;
+    const p = project(a0[3*i], a0[3*i+1], a0[3*i+2], w, h), q = project(a0[3*j], a0[3*j+1], a0[3*j+2], w, h); g.moveTo(p[0], p[1]); g.lineTo(q[0], q[1]); }
+  g.stroke();
+  // Edges sorted so hot ones draw on top.
+  const list = [];
+  let worst = 0, over5 = 0;
+  EDGES.forEach(([i, j], e) => { if (!pts[i] || !pts[j]) return; const err = len(a, i, j) - ref[e]; worst = Math.max(worst, Math.abs(err)); if (Math.abs(err) > 5) over5++; list.push([Math.abs(err), i, j]); });
+  list.sort((x, y) => x[0] - y[0]);
+  for (const [err, i, j] of list) {
+    g.strokeStyle = errColor(err); g.lineWidth = d * (err > 5 ? 2.6 : err > 1 ? 1.6 : 1.1);
+    g.beginPath(); g.moveTo(pts[i][0], pts[i][1]); g.lineTo(pts[j][0], pts[j][1]); g.stroke();
+  }
+  g.fillStyle = C.ink;
+  for (const p of pts) if (p) { g.beginPath(); g.arc(p[0], p[1], 1.6 * d, 0, 7); g.fill(); }
+  g.strokeStyle = C.knot; g.lineWidth = 1.6 * d;
+  for (const i of D.disputed) if (pts[i]) { g.beginPath(); g.arc(pts[i][0], pts[i][1], 7 * d, 0, 7); g.stroke(); }
+  const missing = pts.filter(p => !p).length;
+  document.getElementById('live-' + k).innerHTML = `worst edge <b style="color:${errColor(worst)}">${worst.toFixed(1)} mm</b><br>edges &gt; 5 mm <b>${over5}</b>`;
+  document.getElementById('miss-' + k).textContent = missing ? `${missing} knot${missing > 1 ? 's' : ''} missing` : 'all 144 knots';
+}
+
+// Knot path chart: z (downstream, toward cameras) relative to frame 0.
+const chart = document.getElementById('chart');
+const series = {};
+for (const k of KEYS) { const a = P[k]; const z0 = a.map(f => f[3*D.knot+2]).find(Number.isFinite); series[k] = a.map(f => z0 - f[3*D.knot+2]); }
+document.getElementById('chart-title').textContent = `Path of knot ${D.knot} (row ${Math.floor(D.knot / G) + 1}, column ${D.knot % G + 1})`;
+function drawChart() {
+  const c = chart, g = c.getContext('2d'), w = c.width, h = c.height, d = devicePixelRatio || 1;
+  g.clearRect(0, 0, w, h);
+  const vals = [...series.sam2, ...series.cot].filter(Number.isFinite);
+  let lo = Math.min(0, ...vals), hi = Math.max(...vals); const pad = (hi - lo) * 0.08; lo -= pad; hi += pad;
+  const L = 46 * d, R = 10 * d, Tp = 10 * d, B = 26 * d;
+  const X = i => L + (w - L - R) * i / (T - 1), Y = v => Tp + (h - Tp - B) * (1 - (v - lo) / (hi - lo));
+  g.font = `${11 * d}px ${css('--mono')}`; g.fillStyle = C.muted; g.strokeStyle = C.rule; g.lineWidth = d;
+  const step = (hi - lo) > 150 ? 50 : (hi - lo) > 60 ? 20 : 10;
+  for (let v = Math.ceil(lo / step) * step; v <= hi; v += step) { g.beginPath(); g.moveTo(L, Y(v)); g.lineTo(w - R, Y(v)); g.stroke(); g.textAlign = 'right'; g.fillText(`${v}`, L - 6 * d, Y(v) + 4 * d); }
+  g.textAlign = 'left'; g.fillText('mm', 4 * d, Tp + 8 * d);
+  g.textAlign = 'center';
+  for (let s = 0; s * D.fps < T; s++) { const i = Math.round(s * D.fps); g.fillText(`${s} s`, X(i), h - 8 * d); }
+  for (const k of KEYS) {
+    g.strokeStyle = k === 'sam2' ? C.sam : C.cot; g.lineWidth = 1.6 * d; g.beginPath(); let on = false;
+    series[k].forEach((v, i) => { if (!Number.isFinite(v)) { on = false; return; } on ? g.lineTo(X(i), Y(v)) : g.moveTo(X(i), Y(v)); on = true; });
+    g.stroke();
+  }
+  g.strokeStyle = C.knot; g.lineWidth = 1.2 * d; g.beginPath(); g.moveTo(X(frame), Tp); g.lineTo(X(frame), h - B); g.stroke();
+  g.textAlign = 'left';
+  [['sam2', 'SAM2', C.sam], ['cot', 'CoTracker3', C.cot]].forEach(([k, label, col], n) => {
+    const v = series[k][frame]; g.fillStyle = col;
+    g.fillText(`${label} ${Number.isFinite(v) ? v.toFixed(1) + ' mm' : 'missing'}`, L + 8 * d, Tp + (14 + 14 * n) * d);
+  });
+}
+
+// Transport.
+const scrub = document.getElementById('scrub'), vid = document.getElementById('vid'), playBtn = document.getElementById('play');
+scrub.max = T - 1;
+function render() {
+  document.getElementById('fnum').textContent = frame;
+  document.getElementById('tsec').textContent = (frame / D.fps).toFixed(2);
+  scrub.value = frame; drawNet('sam2'); drawNet('cot'); drawChart();
+}
+function setFrame(i, seek = true) { frame = Math.max(0, Math.min(T - 1, i)); if (seek && vid.readyState >= 1) vid.currentTime = (frame + 0.5) / D.fps; render(); }
+scrub.addEventListener('input', () => { pause(); setFrame(+scrub.value); });
+let playing = false;
+function tick() { if (!playing) return; const i = Math.floor(vid.currentTime * D.fps); if (i !== frame) setFrame(i, false); if (vid.ended) { pause(); } requestAnimationFrame(tick); }
+function play() { if (frame >= T - 1) setFrame(0); playing = true; playBtn.textContent = 'Pause'; vid.play().catch(() => {}); requestAnimationFrame(tick); }
+function pause() { playing = false; playBtn.textContent = 'Play'; vid.pause(); }
+playBtn.addEventListener('click', () => playing ? pause() : play());
+document.querySelectorAll('[data-rate]').forEach(b => b.addEventListener('click', () => {
+  vid.playbackRate = +b.dataset.rate; document.querySelectorAll('[data-rate]').forEach(x => x.setAttribute('aria-pressed', x === b));
+}));
+vid.playbackRate = 0.5;
+document.querySelectorAll('[data-view]').forEach(b => b.addEventListener('click', () => {
+  [yaw, pitch] = VIEWS[b.dataset.view]; zoom = 1; document.querySelectorAll('[data-view]').forEach(x => x.setAttribute('aria-pressed', x === b)); render();
+}));
+document.addEventListener('keydown', e => {
+  if (e.target.tagName === 'INPUT' && e.key !== ' ') return;
+  if (e.key === ' ') { e.preventDefault(); playing ? pause() : play(); }
+  if (e.key === 'ArrowRight') { pause(); setFrame(frame + 1); }
+  if (e.key === 'ArrowLeft') { pause(); setFrame(frame - 1); }
+});
+
+// Drag to rotate, wheel / pinch to zoom; both canvases share the camera.
+for (const c of Object.values(canv)) {
+  let drag = null;
+  c.addEventListener('pointerdown', e => { drag = [e.clientX, e.clientY]; c.setPointerCapture(e.pointerId); });
+  c.addEventListener('pointermove', e => { if (!drag) return; yaw += (e.clientX - drag[0]) * 0.01; pitch = Math.max(-1.5, Math.min(1.5, pitch + (e.clientY - drag[1]) * 0.01)); drag = [e.clientX, e.clientY];
+    document.querySelectorAll('[data-view]').forEach(x => x.setAttribute('aria-pressed', 'false')); drawNet('sam2'); drawNet('cot'); });
+  c.addEventListener('pointerup', () => drag = null);
+  c.addEventListener('wheel', e => { e.preventDefault(); zoom = Math.max(0.4, Math.min(6, zoom * Math.exp(-e.deltaY * 0.0015))); drawNet('sam2'); drawNet('cot'); }, { passive: false });
+}
+
+// Metrics table.
+const M = D.metrics;
+const rows = [
+  ['Knots reconstructed in 3D', m => (m.valid_3d_frac * 100).toFixed(1) + '%', 'hi', m => m.valid_3d_frac],
+  ['Reprojection error, median', m => m.reproj_err_px.median.toFixed(2) + ' px', 'lo', m => m.reproj_err_px.median],
+  ['Frame-to-frame jitter, median', m => m.jitter_2nd_diff_mm.median.toFixed(2) + ' mm', 'lo', m => m.jitter_2nd_diff_mm.median],
+  ['Edge-length wobble, median', m => m.edge_len_temporal_std_mm.median.toFixed(2) + ' mm', 'lo', m => m.edge_len_temporal_std_mm.median],
+  ['Edge-length wobble, worst edge', m => m.edge_len_temporal_std_mm.max.toFixed(1) + ' mm', 'lo', m => m.edge_len_temporal_std_mm.max],
+];
+document.getElementById('mtable').innerHTML = rows.map(([label, fmt, dir, val]) => {
+  const s = val(M.sam2), k = val(M.cot), cotWins = dir === 'hi' ? k > s : k < s;
+  return `<tr><td>${label}</td><td class="num${cotWins ? '' : ' win'}">${fmt(M.sam2)}</td><td class="num${cotWins ? ' win' : ''}">${fmt(M.cot)}</td></tr>`;
+}).join('');
+
+document.getElementById('eyebrow').textContent = `Trial 15 · ${D.run.replace(/_v_.*/, '').replace('_', ' ')} · ${D.speed} m/s tow · ${T} frames`;
+function resize() { Object.values(canv).forEach(sizeCanvas); sizeCanvas(chart); render(); }
+new ResizeObserver(resize).observe(document.querySelector('.nets'));
+addEventListener('resize', resize);
+resize();
+</script>
