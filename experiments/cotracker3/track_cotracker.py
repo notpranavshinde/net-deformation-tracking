@@ -7,6 +7,11 @@ schema, so ``triangulation/points_to_3d.py`` runs on the output unchanged.
 Frames are extracted with the exact ffmpeg seek used by ``run_sam2_markers.py``
 so frame indices line up with the SAM2 tracks of the same run.
 
+With ``--refine dtpeak`` each prediction the model calls visible is snapped to the
+knot centre at full resolution. Predictions the model calls hidden keep the model's
+own estimate (method ``cotracker_inferred``): snapping them would grab whatever
+visible knot happens to be nearby.
+
 Example::
 
     .venv-cotracker/Scripts/python experiments/cotracker3/track_cotracker.py \
@@ -22,6 +27,7 @@ import shutil
 import subprocess
 import time
 from pathlib import Path
+from typing import Callable
 
 import cv2
 import numpy as np
@@ -30,6 +36,10 @@ import torch
 
 ROOT = Path(__file__).resolve().parents[2]
 FRAME_CACHE = ROOT / "work" / "cotracker3" / "frames"
+VIS_THRESHOLD = 0.9  # the offline predictor's own cut on the sigmoid visibility
+
+# An occluder edits a full-resolution BGR frame in place, given its frame index.
+Occluder = Callable[[np.ndarray, int], None]
 
 
 def video_fps(video: Path) -> float:
@@ -68,44 +78,52 @@ def extract_frames(video: Path, start: int, end: int, out_dir: Path) -> list[Pat
     return frames
 
 
-def load_video_tensor(frames: list[Path], model_hw: tuple[int, int]) -> tuple[torch.Tensor, tuple[int, int]]:
-    """Load frames resized straight to the model resolution as a (1, T, 3, H, W) float tensor.
+def read_frame(path: Path, t: int, occluder: Occluder | None) -> np.ndarray:
+    bgr = cv2.imread(str(path))
+    if occluder is not None:
+        occluder(bgr, t)
+    return bgr
 
-    Resizing on load keeps host memory small; the predictor then sees an input that is
-    already at its interpolation size, so its own resize is a no-op.
-    """
+
+def load_video_tensor(frames: list[Path], model_hw: tuple[int, int],
+                      occluder: Occluder | None = None) -> tuple[torch.Tensor, tuple[int, int]]:
+    """Load frames resized straight to the model resolution as a (1, T, 3, H, W) float tensor."""
 
     h, w = model_hw
-    first = cv2.imread(str(frames[0]))
-    full_hw = first.shape[:2]
     video = np.empty((len(frames), h, w, 3), dtype=np.uint8)
-    for i, path in enumerate(frames):
-        bgr = cv2.imread(str(path))
-        video[i] = cv2.cvtColor(cv2.resize(bgr, (w, h), interpolation=cv2.INTER_AREA), cv2.COLOR_BGR2RGB)
-    tensor = torch.from_numpy(video).permute(0, 3, 1, 2)[None].float()
-    return tensor, full_hw
+    full_hw = None
+    for t, path in enumerate(frames):
+        bgr = read_frame(path, t, occluder)
+        full_hw = bgr.shape[:2]
+        video[t] = cv2.cvtColor(cv2.resize(bgr, (w, h), interpolation=cv2.INTER_AREA), cv2.COLOR_BGR2RGB)
+    return torch.from_numpy(video).permute(0, 3, 1, 2)[None].float(), full_hw
 
 
-def build_predictor(model: str, model_hw: tuple[int, int], device: str):
-    if model == "offline":
-        predictor = torch.hub.load("facebookresearch/co-tracker", "cotracker3_offline")
-    else:
-        predictor = torch.hub.load("facebookresearch/co-tracker", "cotracker3_online")
-    # Inputs are pre-resized to model_hw, so the predictor's own resize must target the same size.
-    predictor.interp_shape = model_hw
-    return predictor.to(device).eval()
+def load_model(device: str):
+    predictor = torch.hub.load("facebookresearch/co-tracker", "cotracker3_offline")
+    return predictor.model.to(device).eval()
 
 
 @torch.inference_mode()
-def run_tracker(predictor, model: str, video: torch.Tensor, queries: torch.Tensor):
-    if model == "offline":
-        tracks, vis = predictor(video, queries=queries)
-        return tracks, vis
-    predictor(video_chunk=video, is_first_step=True, queries=queries)
-    tracks = vis = None
-    for i in range(0, video.shape[1] - predictor.step, predictor.step):
-        tracks, vis = predictor(video_chunk=video[:, i : i + predictor.step * 2])
-    return tracks, vis
+def track_points(model, video: torch.Tensor, points: np.ndarray, full_hw: tuple[int, int], device: str):
+    """Run the offline model on a video already at model resolution.
+
+    ``points`` are (N, 2) full-resolution pixel coordinates queried at frame 0. Returns
+    full-resolution tracks (T, N, 2), visibility probability (T, N) and confidence (T, N).
+    Mirrors CoTrackerPredictor._compute_sparse_tracks without its boolean threshold.
+    """
+
+    _, _, _, h, w = video.shape
+    sx, sy = (w - 1) / (full_hw[1] - 1), (h - 1) / (full_hw[0] - 1)
+    queries = torch.zeros((1, len(points), 3))
+    queries[0, :, 1] = torch.from_numpy(points[:, 0] * sx)
+    queries[0, :, 2] = torch.from_numpy(points[:, 1] * sy)
+    tracks, vis, conf, _ = model(video=video.to(device), queries=queries.to(device), iters=6)
+    tracks = tracks[0].float().cpu().numpy() / np.array([sx, sy], dtype=np.float32)
+    tracks[0] = points  # the query frame is known exactly
+    vis, conf = vis[0].float().cpu().numpy(), conf[0].float().cpu().numpy()
+    vis[0] = 1.0
+    return tracks, vis, conf
 
 
 def refine_dtpeak(bgr: np.ndarray, u: float, v: float, radius: int) -> tuple[float, float, float, float] | None:
@@ -145,12 +163,51 @@ def refine_dtpeak(bgr: np.ndarray, u: float, v: float, radius: int) -> tuple[flo
     return x0 + float((xs * wts).sum() / wts.sum()), y0 + float((ys * wts).sum() / wts.sum()), area, peak
 
 
+def build_rows(frames: list[Path], tracks: np.ndarray, vis: np.ndarray, conf: np.ndarray, full_hw,
+               refine: str, radius: int, occluder: Occluder | None = None, gate: bool = True) -> list[dict]:
+    """Turn model output into tracks_2d.csv rows, snapping visible points when refine == 'dtpeak'.
+
+    ``gate=False`` snaps every point regardless of visibility; it exists only so the
+    occlusion test can show what ungated snapping does to hidden knots.
+    """
+
+    full_h, full_w = full_hw
+    rows = []
+    for t in range(tracks.shape[0]):
+        bgr = read_frame(frames[t], t, occluder) if refine == "dtpeak" else None
+        for i in range(tracks.shape[1]):
+            cu, cv_ = float(tracks[t, i, 0]), float(tracks[t, i, 1])
+            visible = bool(vis[t, i] > VIS_THRESHOLD)
+            u, v, method, area, core = cu, cv_, "cotracker", 0.0, 0.0
+            if bgr is not None and (visible or not gate):
+                hit = refine_dtpeak(bgr, cu, cv_, radius)
+                if hit is not None:
+                    u, v, area, core = hit
+                    method = "cotracker+dtpeak"
+            elif bgr is not None:
+                method = "cotracker_inferred"
+            rows.append({
+                "frame": t, "obj_id": i, "u": u, "v": v, "u_local": u, "v_local": v,
+                "method": method, "area_px": area, "core_radius_px": core, "solidity": 1.0,
+                "quality": float(vis[t, i]), "valid": int(0 <= u < full_w and 0 <= v < full_h),
+                "u_coarse": cu, "v_coarse": cv_, "visibility": float(vis[t, i]),
+                "confidence": float(conf[t, i]), "visible": int(visible),
+            })
+    return rows
+
+
+def load_prompts(run_dir: Path, side: str) -> tuple[int, int, np.ndarray]:
+    prompts = json.loads((run_dir / "setup" / "prompts" / "points_left_right.json").read_text())
+    start, end = int(prompts["frame_range"]["start_frame"]), int(prompts["frame_range"]["end_frame"])
+    points = np.array([[p["x"], p["y"]] for p in prompts[side]], dtype=np.float32)
+    return start, end, points
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--run-dir", required=True, type=Path, help="Run folder containing setup/prompts/points_left_right.json")
     ap.add_argument("--side", choices=["left", "right"], required=True)
     ap.add_argument("--video", required=True, type=Path, help="Raw video for this side")
-    ap.add_argument("--model", choices=["offline", "online"], default="offline")
     ap.add_argument("--model-res", default="384x512", help="Tracker input resolution HxW (trained at 384x512)")
     ap.add_argument("--refine", choices=["none", "dtpeak"], default="none")
     ap.add_argument("--refine-radius", type=int, default=40, help="Half-window (full-res px) for --refine dtpeak")
@@ -158,76 +215,34 @@ def main() -> int:
     ap.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
     args = ap.parse_args()
 
-    prompts = json.loads((args.run_dir / "setup" / "prompts" / "points_left_right.json").read_text())
-    start, end = int(prompts["frame_range"]["start_frame"]), int(prompts["frame_range"]["end_frame"])
-    points = np.array([[p["x"], p["y"]] for p in prompts[args.side]], dtype=np.float32)
+    start, end, points = load_prompts(args.run_dir, args.side)
     model_hw = tuple(int(x) for x in args.model_res.lower().split("x"))
     if model_hw[0] % 4 or model_hw[1] % 4:
         raise SystemExit("--model-res must be divisible by 4")
-
     video_path = args.video if args.video.is_absolute() else ROOT / args.video
     frames = extract_frames(video_path, start, end, FRAME_CACHE / f"{video_path.stem}_{start}_{end}")
-
     device = args.device if args.device != "auto" else ("cuda" if torch.cuda.is_available() else "cpu")
+
     t0 = time.perf_counter()
-    video, (full_h, full_w) = load_video_tensor(frames, model_hw)
+    video, full_hw = load_video_tensor(frames, model_hw)
     t_load = time.perf_counter() - t0
-
-    # Queries are (t, x, y) in the tensor's pixel space, i.e. the model resolution.
-    sx, sy = (model_hw[1] - 1) / (full_w - 1), (model_hw[0] - 1) / (full_h - 1)
-    queries = torch.zeros((1, len(points), 3))
-    queries[0, :, 1] = torch.from_numpy(points[:, 0] * sx)
-    queries[0, :, 2] = torch.from_numpy(points[:, 1] * sy)
-
-    predictor = build_predictor(args.model, model_hw, device)
-    if device == "cuda":
-        torch.cuda.reset_peak_memory_stats()
-        torch.cuda.synchronize()
+    model = load_model(device)
     t1 = time.perf_counter()
-    tracks, vis = run_tracker(predictor, args.model, video.to(device), queries.to(device))
-    if device == "cuda":
-        torch.cuda.synchronize()
+    tracks, vis, conf = track_points(model, video, points, full_hw, device)
     t_track = time.perf_counter() - t1
-    peak_mem = torch.cuda.max_memory_allocated() / 2**30 if device == "cuda" else 0.0
-
-    tracks = tracks[0].float().cpu().numpy()  # (T, N, 2) in model pixels
-    vis = vis[0].float().cpu().numpy()
-    if vis.ndim == 3:
-        vis = vis[..., 0]
-    coarse = tracks / np.array([sx, sy], dtype=np.float32)
-
-    rows = []
     t2 = time.perf_counter()
-    for t in range(coarse.shape[0]):
-        bgr = cv2.imread(str(frames[t])) if args.refine == "dtpeak" else None
-        for i in range(coarse.shape[1]):
-            cu, cv_ = float(coarse[t, i, 0]), float(coarse[t, i, 1])
-            u, v, method, area, core = cu, cv_, "cotracker", 0.0, 0.0
-            if bgr is not None:
-                hit = refine_dtpeak(bgr, cu, cv_, args.refine_radius)
-                if hit is not None:
-                    u, v, area, core = hit
-                    method = "cotracker+dtpeak"
-            inside = 0 <= u < full_w and 0 <= v < full_h
-            rows.append({
-                "frame": t, "obj_id": i, "u": u, "v": v, "u_local": u, "v_local": v,
-                "method": method, "area_px": area, "core_radius_px": core, "solidity": 1.0,
-                "quality": float(vis[t, i]), "valid": int(inside),
-                "u_coarse": cu, "v_coarse": cv_, "visibility": float(vis[t, i]),
-            })
+    rows = build_rows(frames, tracks, vis, conf, full_hw, args.refine, args.refine_radius)
     t_refine = time.perf_counter() - t2
 
     args.out.mkdir(parents=True, exist_ok=True)
     pd.DataFrame(rows).to_csv(args.out / "tracks_2d.csv", index=False)
     meta = {
         "side": args.side, "video": str(video_path), "frame_range": [start, end],
-        "model": args.model, "model_res": list(model_hw), "refine": args.refine,
+        "model": "offline", "model_res": list(model_hw), "refine": args.refine,
         "refine_radius": args.refine_radius, "device": device,
-        "gpu": torch.cuda.get_device_name(0) if device == "cuda" else None,
-        "n_frames": int(coarse.shape[0]), "n_points": int(coarse.shape[1]),
+        "n_frames": int(tracks.shape[0]), "n_points": int(tracks.shape[1]),
         "seconds": {"load": round(t_load, 2), "track": round(t_track, 2), "refine": round(t_refine, 2)},
-        "peak_gpu_mem_gib": round(peak_mem, 2),
-        "n_params_m": round(sum(p.numel() for p in predictor.parameters()) / 1e6, 2),
+        "n_params_m": round(sum(p.numel() for p in model.parameters()) / 1e6, 2),
     }
     (args.out / "run_meta.json").write_text(json.dumps(meta, indent=2))
     print(json.dumps(meta, indent=2))

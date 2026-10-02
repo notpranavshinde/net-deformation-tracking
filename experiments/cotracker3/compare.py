@@ -82,13 +82,13 @@ def _stats(x) -> dict:
             {"median": np.median(x), "mean": x.mean(), "p95": np.percentile(x, 95), "max": x.max()}.items()}
 
 
-def triangulate(run_dir: Path, left_csv: Path, right_csv: Path, out_dir: Path) -> Path:
+def triangulate(run_dir: Path, left_csv: Path, right_csv: Path, out_dir: Path, python: str = sys.executable) -> Path:
     prompts = json.loads((run_dir / "setup" / "prompts" / "points_left_right.json").read_text())
     calib = run_dir.parent / "calibration"
     out_dir.mkdir(parents=True, exist_ok=True)
     out_csv = out_dir / "tri.csv"
     cmd = [
-        sys.executable, "triangulation/points_to_3d.py",
+        python, "triangulation/points_to_3d.py",
         "--left", str(left_csv), "--right", str(right_csv),
         "--left-video", str(LEFT_VIDEO), "--right-video", str(RIGHT_VIDEO),
         "--start-frame", str(prompts["frame_range"]["start_frame"]),
