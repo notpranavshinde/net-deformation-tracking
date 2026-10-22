@@ -1,0 +1,161 @@
+<title>Lighting Lab</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Barlow+Semi+Condensed:wght@500;600;700&family=IBM+Plex+Sans:wght@400;500&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+/* Layout: the same dark tank instrument as the other CoTracker3 viewers — a condition-by-severity
+   score grid on top, the selected case's clip and numbers below. */
+:root {
+  --tank: #0d1416; --panel: #142024; --panel-hi: #1b2b30; --rule: #24343a;
+  --ink: #dfe8e6; --muted: #8ea19f;
+  --knot: #f39a2b; --good: #5ad27a; --bad: #ff5a4f;
+  --display: "Barlow Semi Condensed", "Arial Narrow", system-ui, sans-serif;
+  --body: "IBM Plex Sans", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --mono: "IBM Plex Mono", ui-monospace, "Cascadia Mono", Consolas, monospace;
+  color-scheme: dark;
+}
+html { background: var(--tank); }
+body { background: var(--tank); color: var(--ink); font-family: var(--body); font-size: 15px; line-height: 1.5; }
+.wrap { max-width: 1200px; margin: 0 auto; padding-inline: clamp(16px, 3vw, 32px); padding-block: 28px 56px; display: grid; gap: 24px; }
+header { display: grid; gap: 6px; }
+.eyebrow { font-family: var(--mono); font-size: 12px; letter-spacing: .08em; text-transform: uppercase; color: var(--knot); }
+h1 { font-family: var(--display); font-weight: 700; font-size: clamp(30px, 4.4vw, 46px); line-height: 1.05; margin: 0; }
+h2 { font-family: var(--display); font-weight: 600; font-size: 22px; margin: 0; }
+p { margin: 0; }
+.lede { color: var(--muted); max-width: 72ch; }
+.lede b { color: var(--ink); font-weight: 500; }
+.bar { display: flex; flex-wrap: wrap; gap: 8px 16px; align-items: center; }
+.label { font: 500 12px var(--mono); letter-spacing: .06em; text-transform: uppercase; color: var(--muted); }
+button { font: 500 13px var(--body); color: var(--ink); background: var(--panel); border: 1px solid var(--rule); border-radius: 6px; padding: 7px 12px; cursor: pointer; }
+button:hover { border-color: var(--muted); }
+button:focus-visible, td.cell:focus-visible { outline: 2px solid var(--knot); outline-offset: 2px; }
+button[aria-pressed="true"] { border-color: var(--knot); color: var(--knot); }
+
+.gridwrap { overflow-x: auto; background: var(--panel); border: 1px solid var(--rule); border-radius: 10px; }
+table { border-collapse: collapse; width: 100%; font-variant-numeric: tabular-nums; }
+th, td { padding: 10px 12px; border-bottom: 1px solid var(--rule); text-align: left; white-space: nowrap; }
+th { font: 500 11px var(--mono); letter-spacing: .06em; text-transform: uppercase; color: var(--muted); }
+tbody tr:last-child td { border-bottom: 0; }
+td.name { font-size: 15px; }
+td.cell { cursor: pointer; font-family: var(--mono); font-size: 14px; border-left: 1px solid var(--rule); }
+td.cell:hover { background: var(--panel-hi); }
+td.cell[aria-selected="true"] { box-shadow: inset 0 0 0 2px var(--knot); }
+td.pending { color: var(--muted); font-family: var(--mono); font-size: 13px; border-left: 1px solid var(--rule); }
+.chip { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 8px; vertical-align: 0; }
+.cell small { color: var(--muted); font-size: 12px; margin-left: 6px; }
+
+.detail { display: grid; grid-template-columns: minmax(0, 1.1fr) minmax(0, 1fr); gap: 16px; align-items: start; }
+.card { background: var(--panel); border: 1px solid var(--rule); border-radius: 10px; padding: 14px; display: grid; gap: 10px; min-width: 0; }
+video { width: 100%; max-width: 100%; border-radius: 6px; background: #000; display: block; }
+.legend { display: flex; flex-wrap: wrap; gap: 6px 16px; font-size: 13px; color: var(--muted); }
+.mk { display: inline-flex; align-items: center; gap: 6px; }
+.mk i { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }
+.mk i.ring { background: transparent !important; border: 2px solid var(--muted); }
+.stats { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+.stat { border-top: 1px solid var(--rule); padding-top: 8px; display: grid; gap: 2px; }
+.stat b { font: 500 22px var(--mono); font-variant-numeric: tabular-nums; }
+.stat span { font-size: 12px; color: var(--muted); }
+.stat em { font-style: normal; font-size: 12px; color: var(--muted); font-family: var(--mono); }
+@media (max-width: 820px) { .detail { grid-template-columns: 1fr; } .stats { grid-template-columns: 1fr 1fr; } }
+</style>
+
+<div class="wrap">
+  <header>
+    <div class="eyebrow">CoTracker3 · synthetic lighting · run 006 · 0.30 m/s</div>
+    <h1>Lighting Lab</h1>
+    <p class="lede">Both camera views were degraded with the same lighting condition, CoTracker3 was rerun on each, and every knot is scored against where it was in the clean recording. Grid cells show the <b>median 2D error after the snap</b> and the share of knot-frames that ended up on the <b>wrong knot</b>. Click a cell to watch it.</p>
+  </header>
+
+  <div class="bar">
+    <span class="label">Score</span>
+    <span class="bar" id="metric" role="group" aria-label="Score shown in the grid">
+      <button type="button" data-m="snap" aria-pressed="true">2D error, snapped</button>
+      <button type="button" data-m="raw">2D error, raw model</button>
+      <button type="button" data-m="3d">3D error</button>
+      <button type="button" data-m="valid">3D points kept</button>
+    </span>
+  </div>
+
+  <div class="gridwrap">
+    <table>
+      <thead><tr><th>Condition</th><th>Mild</th><th>Moderate</th><th>Severe</th></tr></thead>
+      <tbody id="grid"></tbody>
+    </table>
+  </div>
+
+  <section class="detail">
+    <div class="card">
+      <h2 id="d-title">—</h2>
+      <div class="legend">
+        <span class="mk"><i style="background:var(--good)"></i>within 10 px</span>
+        <span class="mk"><i style="background:var(--knot)"></i>more than 10 px off</span>
+        <span class="mk"><i style="background:var(--bad)"></i>on the wrong knot</span>
+        <span class="mk"><i class="ring"></i>model says hidden</span>
+      </div>
+      <video id="vid" muted playsinline controls loop preload="auto"></video>
+      <p class="legend">Left camera, cropped to the marked grid, half speed.</p>
+    </div>
+    <div class="card">
+      <h2>Scores</h2>
+      <div class="stats" id="stats"></div>
+      <p class="legend" id="clean"></p>
+    </div>
+  </section>
+</div>
+
+<script>
+const D = /*__DATA__*/null;
+let metric = 'snap', sel = null;
+const byKey = Object.fromEntries(D.results.map(r => [r.kind + '/' + r.level, r]));
+const both = (r, f) => (f(r['2d_left']) + f(r['2d_right'])) / 2;
+const M = {
+  snap: { get: r => both(r, s => s.snap_err_px.median), fmt: v => v.toFixed(1) + ' px', lim: [3, 10] },
+  raw: { get: r => both(r, s => s.raw_err_px.median), fmt: v => v.toFixed(1) + ' px', lim: [8, 20] },
+  '3d': { get: r => r['3d'].err_vs_clean_mm.median, fmt: v => v.toFixed(1) + ' mm', lim: [1.5, 5] },
+  valid: { get: r => r['3d'].valid_3d_frac * 100, fmt: v => v.toFixed(1) + '%', lim: [97, 90], hiGood: true },
+};
+const wrong = r => both(r, s => s.wrong_knot);
+function tone(r) {
+  const m = M[metric], v = m.get(r), [a, b] = m.lim;
+  const bad = wrong(r) > 0.01 || (m.hiGood ? v < b : v > b);
+  const mid = m.hiGood ? v < a : v > a;
+  return bad ? 'var(--bad)' : mid ? 'var(--knot)' : 'var(--good)';
+}
+function grid() {
+  document.getElementById('grid').innerHTML = D.conditions.map(k => `<tr><td class="name">${D.labels[k]}</td>` + D.levels.map(l => {
+    const r = byKey[k + '/' + l];
+    if (!r) return '<td class="pending">running…</td>';
+    const w = wrong(r);
+    return `<td class="cell" tabindex="0" data-k="${k}/${l}" aria-selected="${sel === k + '/' + l}"><span class="chip" style="background:${tone(r)}"></span>${M[metric].fmt(M[metric].get(r))}<small>${(w * 100).toFixed(w < 0.01 ? 2 : 1)}% wrong</small></td>`;
+  }).join('') + '</tr>').join('');
+  document.querySelectorAll('td.cell').forEach(td => {
+    td.addEventListener('click', () => select(td.dataset.k));
+    td.addEventListener('keydown', e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); select(td.dataset.k); } });
+  });
+}
+function select(key) {
+  sel = key; grid();
+  const r = byKey[key];
+  document.getElementById('d-title').textContent = `${r.label} · ${r.level}`;
+  const v = document.getElementById('vid'); v.src = r.video; v.playbackRate = 1; v.play().catch(() => {});
+  const L = r['2d_left'], R = r['2d_right'], t = r['3d'];
+  const st = [
+    ['2D error after snap', `${L.snap_err_px.median.toFixed(1)} / ${R.snap_err_px.median.toFixed(1)} px`, 'median, left / right'],
+    ['2D error, raw model', `${L.raw_err_px.median.toFixed(1)} / ${R.raw_err_px.median.toFixed(1)} px`, 'median, left / right'],
+    ['On the wrong knot', `${(L.wrong_knot * 100).toFixed(2)} / ${(R.wrong_knot * 100).toFixed(2)}%`, 'knot-frames, left / right'],
+    ['Snap found the knot', `${(L.snapped * 100).toFixed(0)} / ${(R.snapped * 100).toFixed(0)}%`, 'left / right'],
+    ['Marked hidden', `${(L.flagged_hidden * 100).toFixed(1)} / ${(R.flagged_hidden * 100).toFixed(1)}%`, 'nothing is really hidden'],
+    ['3D error vs clean', `${t.err_vs_clean_mm.median.toFixed(1)} mm`, `95th pct ${t.err_vs_clean_mm.p95.toFixed(1)} mm`],
+    ['3D points kept', `${(t.valid_3d_frac * 100).toFixed(1)}%`, 'pass the 20 px reprojection check'],
+    ['3D jitter', `${t.jitter_2nd_diff_mm.median.toFixed(2)} mm`, 'median frame-to-frame'],
+  ];
+  document.getElementById('stats').innerHTML = st.map(([l, v, e]) => `<div class="stat"><span>${l}</span><b>${v}</b><em>${e}</em></div>`).join('');
+}
+document.querySelectorAll('[data-m]').forEach(b => b.addEventListener('click', () => {
+  metric = b.dataset.m; document.querySelectorAll('[data-m]').forEach(x => x.setAttribute('aria-pressed', x === b)); grid();
+}));
+const c = D.clean;
+document.getElementById('clean').textContent = `Clean recording, same run: ${(c.valid_3d_frac * 100).toFixed(1)}% of 3D points kept, jitter ${c.jitter_2nd_diff_mm.median.toFixed(2)} mm. 3D error is measured against the clean result, so clean = 0.`;
+grid();
+select(D.results[D.results.length - 1].kind + '/' + D.results[D.results.length - 1].level);
+</script>
