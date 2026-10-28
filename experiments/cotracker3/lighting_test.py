@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -235,6 +236,7 @@ def main() -> int:
     ap.add_argument("--preview", action="store_true")
     ap.add_argument("--device", default="cpu")
     ap.add_argument("--levels", nargs="*", default=list(LEVELS), choices=LEVELS)
+    ap.add_argument("--support", type=int, default=6, help="Support-grid size (0 = none); non-default writes to lighting_support<N>/")
     ap.add_argument("--threads", type=int, default=0, help="Torch CPU threads (0 = default); set when running several in parallel")
     args = ap.parse_args()
     if args.threads:
@@ -247,7 +249,7 @@ def main() -> int:
 
     run_dir = ROOT / "work" / "trial15_baseline" / args.run
     ref_dir = ROOT / "work" / "cotracker3" / args.run / REF_VARIANT
-    out_root = ROOT / "work" / "cotracker3" / "lighting" / args.run
+    out_root = ROOT / "work" / "cotracker3" / ("lighting" if args.support == 6 else f"lighting_support{args.support}") / args.run
     ref_tri = pd.read_csv(ref_dir / "tri" / "tri.csv")
     model = tc.load_model(args.device)
     sides = {}
@@ -268,16 +270,17 @@ def main() -> int:
             t0 = time.perf_counter()
             out = out_root / kind / level
             out.mkdir(parents=True, exist_ok=True)
-            res = {"kind": kind, "label": LABELS[kind], "level": level, "params": CONDITIONS[kind][LEVELS.index(level)]}
+            res = {"kind": kind, "label": LABELS[kind], "level": level, "params": CONDITIONS[kind][LEVELS.index(level)], "support_grid": args.support}
             for side, (frames, points, ref) in sides.items():
                 cond = Condition(kind, level, cv2.imread(str(frames[0])).shape[:2])
                 deg = Degraded(frames, cond)
-                tracks, vis, conf = tc.track_points(model, deg.video, points, deg.full_hw, args.device)
+                with tc.gpu_lock(args.device):
+                    tracks, vis, conf = tc.track_points(model, deg.video, points, deg.full_hw, args.device, support=args.support)
                 df = build_rows(deg, tracks, vis, conf)
                 df.to_csv(out / f"{side}.csv", index=False)
                 res[f"2d_{side}"] = score_2d(df, ref)
                 del deg
-            tri = compare.triangulate(run_dir, out / "left.csv", out / "right.csv", out / "tri", python="python")
+            tri = compare.triangulate(run_dir, out / "left.csv", out / "right.csv", out / "tri", python=os.environ.get("CT3_TRI_PYTHON", "python"))
             res["3d"] = score_3d(tri, ref_tri)
             res["seconds"] = round(time.perf_counter() - t0, 1)
             (out / "result.json").write_text(json.dumps(res, indent=2))

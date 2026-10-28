@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -195,12 +196,13 @@ def main() -> int:
         out.mkdir(parents=True, exist_ok=True)
         occ = Occlusion(spec, ref, len(frames))
         video, full_hw = tc.load_video_tensor(frames, (384, 512), occ)
-        tracks, vis, conf = tc.track_points(model, video, points, full_hw, args.device)
+        with tc.gpu_lock(args.device):
+            tracks, vis, conf = tc.track_points(model, video, points, full_hw, args.device)
         gated = pd.DataFrame(tc.build_rows(frames, tracks, vis, conf, full_hw, "dtpeak", 40, occ, gate=True))
         ungated = pd.DataFrame(tc.build_rows(frames, tracks, vis, conf, full_hw, "dtpeak", 40, occ, gate=False))
         gated.to_csv(out / "left_gated.csv", index=False)
         ungated.to_csv(out / "left_ungated.csv", index=False)
-        tri_csv = compare.triangulate(run_dir, out / "left_gated.csv", ref_dir / "right" / "tracks_2d.csv", out / "tri", python="python")
+        tri_csv = compare.triangulate(run_dir, out / "left_gated.csv", ref_dir / "right" / "tracks_2d.csv", out / "tri", python=os.environ.get("CT3_TRI_PYTHON", "python"))
         res = score(spec, occ, gated, ungated, ref, pd.read_csv(tri_csv), ref_tri)
         res["seconds"] = round(time.perf_counter() - t0, 1)
         (out / "result.json").write_text(json.dumps(res, indent=2))

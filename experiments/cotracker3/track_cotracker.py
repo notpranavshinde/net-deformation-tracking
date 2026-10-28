@@ -23,9 +23,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
 import subprocess
 import time
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Callable
 
@@ -100,12 +102,50 @@ def load_video_tensor(frames: list[Path], model_hw: tuple[int, int],
 
 
 def load_model(device: str):
+    if device.startswith("cuda"):
+        # Full fp32 on the GPU so results match CPU runs (TF32 convolutions shift tracks slightly).
+        torch.backends.cudnn.allow_tf32 = False
+        torch.backends.cuda.matmul.allow_tf32 = False
     predictor = torch.hub.load("facebookresearch/co-tracker", "cotracker3_offline")
     return predictor.model.to(device).eval()
 
 
+@contextmanager
+def gpu_lock(device: str):
+    """Let one process at a time onto the GPU when several run in parallel (a model call peaks ~17 GB).
+
+    Uses an flock on Linux; a no-op on CPU or where fcntl is unavailable.
+    """
+    try:
+        import fcntl
+    except ImportError:
+        fcntl = None
+    if not device.startswith("cuda") or fcntl is None:
+        yield
+        return
+    gpu = os.environ.get("CUDA_VISIBLE_DEVICES", "all").replace(",", "-")
+    with open(ROOT / "work" / "cotracker3" / f".gpu{gpu}.lock", "w") as fh:  # one lock per physical GPU
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            torch.cuda.empty_cache()
+            fcntl.flock(fh, fcntl.LOCK_UN)
+
+
+def support_grid(size: int, h: int, w: int) -> torch.Tensor:
+    """(1, size*size, 3) frame-0 queries on a grid, as cotracker's get_points_on_a_grid places them."""
+    margin = w / 64
+    ys = torch.linspace(margin, h - margin, size)
+    xs = torch.linspace(margin, w - margin, size)
+    gy, gx = torch.meshgrid(ys, xs, indexing="ij")
+    pts = torch.stack([gx, gy], dim=-1).reshape(1, -1, 2)
+    return torch.cat([torch.zeros_like(pts[..., :1]), pts], dim=2)
+
+
 @torch.inference_mode()
-def track_points(model, video: torch.Tensor, points: np.ndarray, full_hw: tuple[int, int], device: str):
+def track_points(model, video: torch.Tensor, points: np.ndarray, full_hw: tuple[int, int], device: str,
+                 support: int = 6):
     """Run the offline model on a video already at model resolution.
 
     ``points`` are (N, 2) full-resolution pixel coordinates queried at frame 0. Returns
@@ -118,7 +158,13 @@ def track_points(model, video: torch.Tensor, points: np.ndarray, full_hw: tuple[
     queries = torch.zeros((1, len(points), 3))
     queries[0, :, 1] = torch.from_numpy(points[:, 0] * sx)
     queries[0, :, 2] = torch.from_numpy(points[:, 1] * sy)
+    # The official predictor adds a 6 x 6 grid of support points for sparse queries; they shape
+    # the space attention, so the knot tracks differ without them. Their outputs are dropped.
+    if support:
+        queries = torch.cat([queries, support_grid(support, h, w)], dim=1)
     tracks, vis, conf, _ = model(video=video.to(device), queries=queries.to(device), iters=6)
+    n = len(points)
+    tracks, vis, conf = tracks[:, :, :n], vis[:, :, :n], conf[:, :, :n]
     tracks = tracks[0].float().cpu().numpy() / np.array([sx, sy], dtype=np.float32)
     tracks[0] = points  # the query frame is known exactly
     vis, conf = vis[0].float().cpu().numpy(), conf[0].float().cpu().numpy()
