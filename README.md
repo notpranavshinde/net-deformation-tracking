@@ -25,7 +25,7 @@ conda create -n sam2py311 python=3.11 -y
 conda activate sam2py311
 python -m pip install --upgrade pip
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
-pip install opencv-python numpy rich scipy scikit-image pandas matplotlib pillow hydra-core iopath huggingface_hub
+pip install -r requirements.txt
 cd sam2\sam2
 pip install -e .
 ```
@@ -45,7 +45,7 @@ conda create -n sam2py311 python=3.11 -y
 conda activate sam2py311
 python -m pip install --upgrade pip
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
-pip install opencv-python numpy rich scipy scikit-image pandas matplotlib pillow hydra-core iopath huggingface_hub
+pip install -r requirements.txt
 cd sam2/sam2
 pip install -e .
 ```
@@ -62,6 +62,16 @@ SAM2 model weights are not tracked in Git. The SAM2 scripts use Hugging Face
 run and then stay cached on that machine. DINO external repos are also not
 tracked; the DINO prompt scripts need their separate setup again if you return
 to them later.
+
+### Running tests
+
+From the repository root, run all standalone test scripts with:
+
+```bash
+python tools/run_tests.py
+```
+
+Use `python tools/run_tests.py --filter substring` to run matching scripts only.
 
 ## Calibration
 
@@ -228,6 +238,9 @@ experiment, and triangulate the results:
 python run_pipeline_queue.py
 ```
 
+For laptop setup plus GPU-box processing, use the split workflow in the next
+section. The plain single-machine command above still works unchanged.
+
 It asks once for the raw LEFT and RIGHT videos, then opens the Linux dual-video
 splitter using RIGHT as the cutting reference. Mark the clips in this order:
 
@@ -309,6 +322,123 @@ is recomputed instead of reusing stale files.
 The setup and objectwise scripts also accept `--corrections-json` for isolated
 correction files. Semi-auto setup accepts `--grid-cols` and `--grid-rows` to
 skip its grid-size prompts.
+
+## Split Setup and Remote Processing
+
+Use this workflow when the laptop has the raw videos and interactive display,
+but a remote GPU machine should run calibration compute, SAM2, and
+triangulation.
+
+One-time remote setup:
+
+1. Clone this repository on the GPU machine and create the Python environment
+   there using the Environment section above.
+2. On the laptop, run:
+
+```bash
+python remote_pipeline.py init
+```
+
+`init` writes the local, git-ignored `remote_config.json`, checks the remote
+environment, and asks for directories the remote machine should search for raw
+videos. It validates those directories and writes the git-ignored
+`machine_paths.json` in the remote repository automatically. An optional
+`scp_extra_args` list in `remote_config.json` can provide scp-specific
+options; if omitted, SSH port arguments are translated from `-p` to scp's
+`-P` automatically.
+
+To add or replace the remote search directories later, run:
+
+```bash
+python remote_pipeline.py configure-paths /path/to/videos /another/video/root
+```
+
+The queue runner uses those roots to find matching videos by basename and
+portable video fingerprints. Check the connection and environment with:
+
+```bash
+python remote_pipeline.py doctor
+```
+
+Per-experiment cycle:
+
+1. On the laptop, run all interactive setup stages:
+
+```powershell
+conda activate sam2py311
+python .\run_pipeline_queue.py --setup-only
+```
+
+This opens the splitter, asks for velocity labels, confirms audio sync, and
+collects every SAM2 setup prompt. Heavy calibration stages do not run locally
+in this mode. On Windows, the runner checks Python 3.11, the setup packages,
+and the OpenCV GUI backend before it creates or changes a queue. If the wrong
+environment is active, it stops and prints the exact activation and rerun
+commands.
+
+The marker setup loads both high-resolution frames and estimates LEFT and
+RIGHT marker-grid corners before opening the OpenCV review windows. This can
+take about a minute for 4K/5K recordings. Progress for each phase is streamed
+to the terminal, so leave the command running while detection is reported.
+
+If setup is interrupted with Ctrl+C, the active stage is saved as pending and
+the runner prints a resumable command. Activate `sam2py311`, then run that
+printed `--resume ... --setup-only` command; completed split, sync, and setup
+stages are retained.
+
+2. Push the portable queue to the remote machine:
+
+```bash
+python remote_pipeline.py push
+```
+
+3. Start detached remote processing:
+
+```bash
+python remote_pipeline.py run
+```
+
+When `tmux` is available, the command starts a `pipeline_<queue-id>` session.
+Attach with the command printed by `run`, for example:
+
+```bash
+ssh -t <host> tmux attach -t pipeline_<queue-id>
+```
+
+The run survives SSH disconnects. If `tmux` is not installed, the helper uses a
+`nohup` fallback.
+
+4. Watch state and logs:
+
+```bash
+python remote_pipeline.py status
+python remote_pipeline.py logs -f
+```
+
+5. Pull results and the remote queue manifest back to the laptop:
+
+```bash
+python remote_pipeline.py pull
+```
+
+Pull compares the remote queue against local state stage by stage before
+copying anything. If the remote manifest is not a safe superset of local
+progress, pull lists every divergence, saves the remote manifest as
+`queue_manifest.remote.json`, and exits without changing local files; re-run
+with `--force` to merge anyway. Any local file that a pull would overwrite
+with different content is first backed up under
+`work/pipeline_queue/<queue-id>/pull_backup_<timestamp>/`, and the adopted
+manifest keeps this machine's source-video paths.
+
+Queue directories are machine-portable: paths inside the queue are stored
+relative where possible, and source videos carry portable fingerprints. Pushes
+exclude SAM2/frame caches and unpack into the remote queue directory without
+deleting completed remote work. `--check-only` shows queue state on either
+machine:
+
+```bash
+python run_pipeline_queue.py --resume work/pipeline_queue/<queue-id> --check-only
+```
 
 ## Triangulation
 

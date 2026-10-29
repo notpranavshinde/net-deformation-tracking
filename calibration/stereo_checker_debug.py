@@ -165,6 +165,25 @@ def validate_args(args):
         raise ValueError("--max-pairs must be >= 1")
     if hasattr(args, "workers") and args.workers < 1:
         raise ValueError("--workers must be >= 1")
+    if hasattr(args, "offset_sweep") and args.offset_sweep < 0:
+        raise ValueError("--offset-sweep must be >= 0")
+    if hasattr(args, "sweep_pairs") and args.sweep_pairs < 3:
+        raise ValueError("--sweep-pairs must be >= 3")
+    if hasattr(args, "sweep_scale") and args.sweep_scale <= 0:
+        raise ValueError("--sweep-scale must be > 0")
+    if hasattr(args, "subframe_min") and hasattr(args, "subframe_max"):
+        if args.subframe_min >= args.subframe_max:
+            raise ValueError("--subframe-min must be less than --subframe-max")
+        if args.subframe_min < -1.0 or args.subframe_max > 1.0:
+            raise ValueError("subframe sweep range must stay within [-1, 1]")
+    if hasattr(args, "subframe_step") and args.subframe_step <= 0:
+        raise ValueError("--subframe-step must be > 0")
+    if hasattr(args, "subframe_refine_step") and args.subframe_refine_step <= 0:
+        raise ValueError("--subframe-refine-step must be > 0")
+    if hasattr(args, "max_stereo_rms") and args.max_stereo_rms <= 0:
+        raise ValueError("--max-stereo-rms must be > 0")
+    if hasattr(args, "min_sync_margin") and args.min_sync_margin < 0:
+        raise ValueError("--min-sync-margin must be >= 0")
 
 def downscale(frame, scale: float):
     if scale == 1.0:
@@ -1120,6 +1139,7 @@ def cmd_sync(args):
             raise RuntimeError("[SYNC] No audio peak candidates found. Try increasing --max-frames.")
         correlation = estimate_audio_frame_offset(left_audio, right_audio)
         correlation_offset = int(correlation["offset_left_minus_right"])
+        low_confidence = correlation["score_margin"] < args.min_sync_margin
 
         audio_preview_png = str(Path(args.out).with_suffix("")) + "_audio_peaks.png"
         try:
@@ -1153,6 +1173,13 @@ def cmd_sync(args):
             f"[SYNC] Audio correlation guess: LEFT-RIGHT offset={correlation_offset} frame(s), "
             f"score={correlation['score']:.3f}, margin={correlation['score_margin']:.3f}"
         )
+        if low_confidence:
+            print(
+                "\n[SYNC] *** LOW-CONFIDENCE AUDIO SYNC ***\n"
+                f"[SYNC] Correlation margin {correlation['score_margin']:.3f} is below "
+                f"--min-sync-margin {args.min_sync_margin:.3f}. Verify the offset; "
+                "run stereo with --offset-sweep before trusting this calibration.\n"
+            )
         accept_guess = bool(args.accept_sync) or prompt_yes_no(
             "[SYNC] Accept this audio correlation sync guess?", default_yes=True
         )
@@ -1182,6 +1209,7 @@ def cmd_sync(args):
         fL = pick_flash_frame(idxL, meanL)
         fR = pick_flash_frame(idxR, meanR)
         reasonL, reasonR = "flash", "flash"
+        low_confidence = False
 
     offset = fL - fR
     if offset > 0:
@@ -1214,12 +1242,17 @@ def cmd_sync(args):
         "source_start_frame": int(args.start_frame),
         "source_end_frame": int(args.end_frame) if args.end_frame is not None else None,
         "audio_correlation": correlation,
+        "low_confidence": bool(low_confidence),
     })
     print(f"[SYNC] Wrote: {args.out}")
 
-def load_sync(path: str):
+def load_sync_json(path: str) -> dict:
     with open(path, "r") as f:
-        d = json.load(f)
+        return json.load(f)
+
+
+def load_sync(path: str):
+    d = load_sync_json(path)
     return int(d["trim_left"]), int(d["trim_right"])
 
 def load_positive_indices(stats_json_path: str) -> List[int]:
@@ -1253,6 +1286,49 @@ def build_paired_indices_from_stats(trimL: int,
 
     common_g = sorted(set(left_g.keys()) & set(right_g.keys()))
     return [(left_g[g], right_g[g]) for g in common_g]
+
+
+def shifted_trims_for_stereo_offset(trimL: int, trimR: int, offset_delta: int) -> Tuple[int, int]:
+    """Return canonical non-negative trims after a LEFT-minus-RIGHT offset change.
+
+    Pairing uses global_time = source_frame - trim.  Therefore increasing the
+    LEFT-minus-RIGHT offset by one must increase trim_left - trim_right by one.
+    Canonicalizing that difference (rather than allowing a negative trim) keeps
+    this compatible with triangulation, where frame drop is derived as -trim.
+    """
+    offset_left_minus_right = int(trimL) - int(trimR) + int(offset_delta)
+    return max(offset_left_minus_right, 0), max(-offset_left_minus_right, 0)
+
+
+def update_sync_after_stereo_sweep(sync_path: str,
+                                  offset_delta: int,
+                                  rms_by_offset: dict,
+                                  usable_pairs_by_offset: dict) -> Tuple[int, int]:
+    """Persist an accepted sweep using the same trim convention as pairing."""
+    sync = load_sync_json(sync_path)
+    old_trimL, old_trimR = int(sync["trim_left"]), int(sync["trim_right"])
+    trimL, trimR = shifted_trims_for_stereo_offset(
+        old_trimL, old_trimR, offset_delta
+    )
+    sync["trim_left"] = int(trimL)
+    sync["trim_right"] = int(trimR)
+    sync["stereo_sweep"] = {
+        # This is the final LEFT-minus-RIGHT offset, not a raw frame-pair delta.
+        "applied_offset": int(trimL - trimR),
+        "offset_delta": int(offset_delta),
+        "rms_by_offset": rms_by_offset,
+        "usable_pairs_by_offset": usable_pairs_by_offset,
+    }
+    if (trimL, trimR) != (old_trimL, old_trimR):
+        sync.pop("subframe_offset", None)
+        sync.pop("subframe_sweep", None)
+        sync.pop("subframe_offset_sign_convention", None)
+        print(
+            "[STEREO] Integer trim changed; cleared fractional subframe offset "
+            "and sweep. Re-sweep the fractional offset."
+        )
+    write_json(sync_path, sync)
+    return int(trimL), int(trimR)
 
 
 def collect_stats_worker(params: dict):
@@ -1657,7 +1733,12 @@ def collect_stereo_pairs_parallel(args, paired_indices: List[Tuple[int, int]], p
     pair_list = [(int(a), int(b)) for a, b in paired_indices]
     if args.max_scan > 0:
         pair_list = pair_list[:int(args.max_scan)]
-    target_pairs = int(args.max_pairs)
+    advanced_selection = bool(
+        getattr(args, "prefer_still_pairs", False)
+        or getattr(args, "subframe_sweep", False)
+        or abs(float(getattr(args, "active_subframe_offset", 0.0))) > 1e-12
+    )
+    target_pairs = len(pair_list) if advanced_selection else int(args.max_pairs)
     if pbar is not None:
         pbar.write(
             f"[STEREO] detecting up to {len(pair_list)} reused stats pairs "
@@ -1716,6 +1797,467 @@ def collect_stereo_pairs_parallel(args, paired_indices: List[Tuple[int, int]], p
         usedL = usedL[:target_pairs]
         usedR = usedR[:target_pairs]
     return usedL, usedR, scanned
+
+
+def evenly_spaced_pairs(pairs: List[Tuple[int, int]], count: int) -> List[Tuple[int, int]]:
+    """Choose at most count source pairs while retaining coverage across the clip."""
+    if len(pairs) <= count:
+        return list(pairs)
+    positions = np.linspace(0, len(pairs) - 1, num=count, dtype=np.int64)
+    return [pairs[int(i)] for i in positions]
+
+
+def interpolate_corner_sample(sample_cache: dict, frame_idx: int, tau: float) -> Optional[Sample]:
+    """Interpolate LEFT corners at ``frame_idx + tau``.
+
+    The sign follows the integer trim convention: positive tau samples a later
+    LEFT source time and is therefore a fractional increase in
+    ``trim_left - trim_right``.  Negative tau samples the preceding LEFT frame.
+    A full-board detection is required at both interpolation endpoints.
+    """
+    frame_idx = int(frame_idx)
+    tau = float(tau)
+    base = sample_cache.get(frame_idx)
+    if base is None:
+        return None
+    if np.isclose(tau, 0.0):
+        return Sample(frame_idx, np.array(base.img, copy=True), np.array(base.obj, copy=True))
+    if abs(tau) > 1.0:
+        raise ValueError("corner interpolation requires tau in [-1, 1]")
+    neighbor_idx = frame_idx + (1 if tau > 0 else -1)
+    neighbor = sample_cache.get(neighbor_idx)
+    if neighbor is None or base.img.shape != neighbor.img.shape:
+        return None
+    board_span = np.ptp(np.asarray(base.img), axis=0)
+    board_diagonal = float(np.linalg.norm(board_span))
+    mean_corner_travel = float(np.linalg.norm(neighbor.img - base.img, axis=-1).mean())
+    if board_diagonal > 0.0 and mean_corner_travel > 0.20 * board_diagonal:
+        return None
+    weight = abs(tau)
+    corners = (1.0 - weight) * base.img + weight * neighbor.img
+    return Sample(frame_idx, corners.astype(np.float32), np.array(base.obj, copy=True))
+
+
+def corner_motion_score(sample_cache: dict, frame_idx: int) -> float:
+    """Mean per-corner motion across f-1 -> f and f -> f+1; inf if unavailable."""
+    prev_sample = sample_cache.get(int(frame_idx) - 1)
+    sample = sample_cache.get(int(frame_idx))
+    next_sample = sample_cache.get(int(frame_idx) + 1)
+    if prev_sample is None or sample is None or next_sample is None:
+        return float("inf")
+    before = np.linalg.norm(sample.img - prev_sample.img, axis=1)
+    after = np.linalg.norm(next_sample.img - sample.img, axis=1)
+    return float((np.mean(before) + np.mean(after)) / 2.0)
+
+
+def stereo_pair_motion_score(left_cache: dict, right_cache: dict,
+                             pair: Tuple[int, int]) -> float:
+    """Average board-motion score across both cameras for one integer pair."""
+    left_score = corner_motion_score(left_cache, pair[0])
+    right_score = corner_motion_score(right_cache, pair[1])
+    if not np.isfinite(left_score) or not np.isfinite(right_score):
+        return float("inf")
+    return float((left_score + right_score) / 2.0)
+
+
+def select_interpolated_pairs(pairs: List[Tuple[int, int]], left_cache: dict,
+                              right_cache: dict, tau: float, count: int,
+                              prefer_still: bool = False):
+    """Return base LEFT, interpolated LEFT, and RIGHT samples for a candidate tau."""
+    # +tau and -tau can have slightly different usable subsets because neighbors
+    # may be unavailable on opposite sides of a frame.
+    available = []
+    for idxL, idxR in pairs:
+        base_left = left_cache.get(int(idxL))
+        right = right_cache.get(int(idxR))
+        interpolated_left = interpolate_corner_sample(left_cache, idxL, tau)
+        if base_left is None or right is None or interpolated_left is None:
+            continue
+        motion = stereo_pair_motion_score(left_cache, right_cache, (idxL, idxR))
+        available.append((motion, int(idxL), int(idxR), base_left, interpolated_left, right))
+
+    if prefer_still:
+        available = [item for item in available if np.isfinite(item[0])]
+        available.sort(key=lambda item: (item[0], item[1], item[2]))
+        chosen = available[:int(count)]
+    else:
+        available.sort(key=lambda item: (item[1], item[2]))
+        if len(available) > int(count):
+            positions = np.linspace(0, len(available) - 1, num=int(count), dtype=np.int64)
+            chosen = [available[int(i)] for i in positions]
+        else:
+            chosen = available
+    return (
+        [item[3] for item in chosen],
+        [item[4] for item in chosen],
+        [item[5] for item in chosen],
+    )
+
+
+def subframe_tau_values(start: float, stop: float, step: float) -> List[float]:
+    """Return a stable inclusive floating-point grid suitable for JSON keys."""
+    count = int(np.floor((float(stop) - float(start)) / float(step) + 1e-9))
+    values = [round(float(start) + i * float(step), 10) for i in range(count + 1)]
+    if values[-1] < float(stop) - 1e-9:
+        values.append(round(float(stop), 10))
+    return values
+
+
+def format_tau(tau: float) -> str:
+    # The deduplication key has 0.01-frame precision; finer sweep steps are unsupported.
+    value = 0.0 if np.isclose(float(tau), 0.0, atol=5e-10) else float(tau)
+    return f"{value:.2f}"
+
+
+def update_sync_after_subframe_sweep(sync_path: str, tau: float,
+                                     rms_by_tau: dict,
+                                     usable_pairs_by_tau: Optional[dict] = None) -> None:
+    """Persist fractional LEFT trim after integer sync has been fixed.
+
+    Positive ``subframe_offset`` means corners were sampled at LEFT frame
+    ``f + tau`` relative to the integer-paired LEFT frame.  Thus its sign is
+    consistent with a fractional increase in ``trim_left - trim_right``.
+    """
+    sync = load_sync_json(sync_path)
+    sync["subframe_offset"] = float(tau)
+    sync["subframe_offset_sign_convention"] = (
+        "positive tau samples LEFT corners at f+tau and increases the continuous "
+        "LEFT-minus-RIGHT trim; negative tau samples LEFT at f+tau toward f-1"
+    )
+    sync["subframe_sweep"] = {"rms_by_tau": rms_by_tau}
+    if usable_pairs_by_tau is not None:
+        sync["subframe_sweep"]["usable_pairs_by_tau"] = usable_pairs_by_tau
+    write_json(sync_path, sync)
+
+
+def scale_camera_matrix(K: np.ndarray, scale_factor: float) -> np.ndarray:
+    """Scale camera intrinsics to match corners detected at another image scale."""
+    scaled = np.array(K, dtype=np.float64, copy=True)
+    scaled[0, :] *= float(scale_factor)
+    scaled[1, :] *= float(scale_factor)
+    scaled[2, :] = K[2, :]
+    return scaled
+
+
+def filtered_stats_pairs(trimL: int, trimR: int,
+                         left_pos: List[int], right_pos: List[int],
+                         start_frame: int, end_frame: Optional[int],
+                         totalL: int, totalR: int,
+                         max_scan: Optional[int] = None) -> List[Tuple[int, int]]:
+    """Build detected pairs and keep only source frames valid for this run."""
+    pairs = build_paired_indices_from_stats(trimL, trimR, left_pos, right_pos)
+    range_end = min(totalL, totalR, int(end_frame) if end_frame is not None else min(totalL, totalR))
+    pairs = [
+        (idxL, idxR)
+        for idxL, idxR in pairs
+        if idxL >= int(start_frame) + trimL
+        and idxR >= int(start_frame) + trimR
+        and idxL < range_end
+        and idxR < range_end
+    ]
+    if max_scan is not None and max_scan > 0:
+        pairs = pairs[:int(max_scan)]
+    return pairs
+
+
+def run_stereo_offset_sweep(args, trimL: int, trimR: int,
+                            left_pos: List[int], right_pos: List[int],
+                            totalL: int, totalR: int, raw_image_size: Tuple[int, int],
+                            pattern: Tuple[int, int], square_m: float,
+                            K1: np.ndarray, D1: np.ndarray, K2: np.ndarray, D2: np.ndarray):
+    """Score local trim offsets with a small, reduced-scale stereo calibration."""
+    sweep_scale = min(float(args.sweep_scale), float(args.scale))
+    intrinsic_scale = sweep_scale / float(args.scale)
+    sweep_size = (int(raw_image_size[0] * sweep_scale), int(raw_image_size[1] * sweep_scale))
+    K1_sweep = scale_camera_matrix(K1, intrinsic_scale)
+    K2_sweep = scale_camera_matrix(K2, intrinsic_scale)
+    sweep_debug_dir = os.path.join(os.path.dirname(args.out) or ".", "stereo_sweep_debug")
+    ensure_dir(sweep_debug_dir)
+
+    candidate_pairs_by_offset = {}
+    left_indices = set()
+    right_indices = set()
+    for offset_delta in range(-int(args.offset_sweep), int(args.offset_sweep) + 1):
+        candidate_trimL, candidate_trimR = shifted_trims_for_stereo_offset(
+            trimL, trimR, offset_delta
+        )
+        pairs = filtered_stats_pairs(
+            candidate_trimL, candidate_trimR, left_pos, right_pos,
+            args.start_frame, args.end_frame, totalL, totalR,
+        )
+        sample_pairs = (
+            list(pairs) if args.prefer_still_pairs
+            else evenly_spaced_pairs(pairs, int(args.sweep_pairs))
+        )
+        candidate_pairs_by_offset[offset_delta] = sample_pairs
+        left_indices.update(idxL for idxL, _idxR in sample_pairs)
+        right_indices.update(idxR for _idxL, idxR in sample_pairs)
+        if args.prefer_still_pairs:
+            left_indices.update(idxL + delta for idxL, _idxR in sample_pairs for delta in (-1, 1))
+            right_indices.update(idxR + delta for _idxL, idxR in sample_pairs for delta in (-1, 1))
+
+    print(
+        f"\n[STEREO] Offset sweep: deltas -{args.offset_sweep}..+{args.offset_sweep}, "
+        f"up to {args.sweep_pairs} evenly spaced pairs each at scale={sweep_scale:g}"
+    )
+    print(
+        f"[STEREO] Sweep corner cache: LEFT={len(left_indices)} frames, "
+        f"RIGHT={len(right_indices)} frames"
+    )
+    left_indices = {idx for idx in left_indices if idx >= 0}
+    right_indices = {idx for idx in right_indices if idx >= 0}
+    # Detect every source frame once, then reuse those samples for every offset.
+    # This keeps the sweep near the cost of a reduced stats pass rather than N full passes.
+    left_result = collect_sample_chunk_worker({
+        "video_path": args.left,
+        "idx_list": sorted(left_indices),
+        "pattern": pattern,
+        "square_m": square_m,
+        "scale": sweep_scale,
+        "label": "SWEEP_LEFT",
+        "debug_every": 0,
+        "out_dir": sweep_debug_dir,
+        "progress_queue": None,
+    })
+    right_result = collect_sample_chunk_worker({
+        "video_path": args.right,
+        "idx_list": sorted(right_indices),
+        "pattern": pattern,
+        "square_m": square_m,
+        "scale": sweep_scale,
+        "label": "SWEEP_RIGHT",
+        "debug_every": 0,
+        "out_dir": sweep_debug_dir,
+        "progress_queue": None,
+    })
+    left_samples = {int(sample.frame_idx): sample for sample in left_result["samples"]}
+    right_samples = {int(sample.frame_idx): sample for sample in right_result["samples"]}
+
+    rms_by_offset = {}
+    usable_pairs_by_offset = {}
+    print("[STEREO] Sweep table (delta is LEFT-minus-RIGHT trim adjustment):")
+    print("  delta   usable_pairs   RMS (px)")
+    for offset_delta, sample_pairs in candidate_pairs_by_offset.items():
+        if args.prefer_still_pairs:
+            _baseL, usedL, usedR = select_interpolated_pairs(
+                sample_pairs, left_samples, right_samples, 0.0,
+                int(args.sweep_pairs), prefer_still=True,
+            )
+        else:
+            usedL = [left_samples[idxL] for idxL, idxR in sample_pairs
+                     if idxL in left_samples and idxR in right_samples]
+            usedR = [right_samples[idxR] for idxL, idxR in sample_pairs
+                     if idxL in left_samples and idxR in right_samples]
+        usable = len(usedL)
+        rms = float("inf")
+        if usable >= 3:
+            try:
+                rms, _R, _T, _E, _F = stereo_calibrate(
+                    usedL, usedR, sweep_size,
+                    K1_sweep, D1, K2_sweep, D2,
+                )
+            except cv2.error as exc:
+                print(f"[STEREO] Sweep delta {offset_delta:+d}: stereoCalibrate failed ({exc}).")
+        rms_by_offset[str(offset_delta)] = None if not np.isfinite(rms) else float(rms)
+        usable_pairs_by_offset[str(offset_delta)] = int(usable)
+        rms_text = "inf" if not np.isfinite(rms) else f"{rms:.3f}"
+        print(f"  {offset_delta:+5d}   {usable:12d}   {rms_text:>8}")
+
+    finite = [
+        (float(rms), int(offset))
+        for offset, rms in rms_by_offset.items()
+        if rms is not None
+    ]
+    if not finite:
+        print("[STEREO] WARNING: no sweep candidate had enough joint detections.")
+        return None, rms_by_offset, usable_pairs_by_offset
+    best_rms, best_delta = min(finite)
+    print(f"[STEREO] Sweep best: delta {best_delta:+d}, RMS={best_rms:.3f}px")
+    return best_delta, rms_by_offset, usable_pairs_by_offset
+
+
+def run_stereo_subframe_sweep(args, paired_indices: List[Tuple[int, int]],
+                              raw_image_size: Tuple[int, int],
+                              pattern: Tuple[int, int], square_m: float,
+                              K1: np.ndarray, D1: np.ndarray,
+                              K2: np.ndarray, D2: np.ndarray):
+    """Score fractional LEFT trim with coarse and local refined grid passes."""
+    sweep_scale = min(float(args.sweep_scale), float(args.scale))
+    intrinsic_scale = sweep_scale / float(args.scale)
+    sweep_size = (int(raw_image_size[0] * sweep_scale), int(raw_image_size[1] * sweep_scale))
+    K1_sweep = scale_camera_matrix(K1, intrinsic_scale)
+    K2_sweep = scale_camera_matrix(K2, intrinsic_scale)
+    sweep_debug_dir = os.path.join(os.path.dirname(args.out) or ".", "subframe_sweep_debug")
+    ensure_dir(sweep_debug_dir)
+
+    pairs = list(paired_indices)
+    left_indices = set()
+    right_indices = set()
+    for idxL, idxR in pairs:
+        left_indices.update((int(idxL) - 1, int(idxL), int(idxL) + 1))
+        right_indices.add(int(idxR))
+        if args.prefer_still_pairs:
+            right_indices.update((int(idxR) - 1, int(idxR) + 1))
+    left_indices = {idx for idx in left_indices if idx >= 0}
+    right_indices = {idx for idx in right_indices if idx >= 0}
+
+    print(
+        f"\n[STEREO] Subframe sweep: tau {args.subframe_min:g}..{args.subframe_max:g}, "
+        f"coarse step={args.subframe_step:g}, refine step={args.subframe_refine_step:g}, "
+        f"up to {args.sweep_pairs} pairs at scale={sweep_scale:g}"
+    )
+    left_result = collect_sample_chunk_worker({
+        "video_path": args.left,
+        "idx_list": sorted(left_indices),
+        "pattern": pattern,
+        "square_m": square_m,
+        "scale": sweep_scale,
+        "label": "SUBFRAME_LEFT",
+        "debug_every": 0,
+        "out_dir": sweep_debug_dir,
+        "progress_queue": None,
+    })
+    right_result = collect_sample_chunk_worker({
+        "video_path": args.right,
+        "idx_list": sorted(right_indices),
+        "pattern": pattern,
+        "square_m": square_m,
+        "scale": sweep_scale,
+        "label": "SUBFRAME_RIGHT",
+        "debug_every": 0,
+        "out_dir": sweep_debug_dir,
+        "progress_queue": None,
+    })
+    left_cache = {int(sample.frame_idx): sample for sample in left_result["samples"]}
+    right_cache = {int(sample.frame_idx): sample for sample in right_result["samples"]}
+
+    rms_by_tau = {}
+    usable_pairs_by_tau = {}
+
+    def evaluate(tau_values: List[float]):
+        for tau in tau_values:
+            key = format_tau(tau)
+            if key in rms_by_tau:
+                continue
+            _baseL, interpL, usedR = select_interpolated_pairs(
+                pairs, left_cache, right_cache, tau, int(args.sweep_pairs),
+                prefer_still=bool(args.prefer_still_pairs),
+            )
+            usable = len(interpL)
+            rms = float("inf")
+            if usable >= 3:
+                try:
+                    rms, _R, _T, _E, _F = stereo_calibrate(
+                        interpL, usedR, sweep_size, K1_sweep, D1, K2_sweep, D2
+                    )
+                except cv2.error as exc:
+                    print(f"[STEREO] Subframe tau {tau:+.2f}: stereoCalibrate failed ({exc}).")
+            rms_by_tau[key] = None if not np.isfinite(rms) else float(rms)
+            usable_pairs_by_tau[key] = int(usable)
+
+    coarse = subframe_tau_values(args.subframe_min, args.subframe_max, args.subframe_step)
+    evaluate(coarse)
+    coarse_finite = [
+        (float(rms_by_tau[format_tau(tau)]), float(tau))
+        for tau in coarse if rms_by_tau.get(format_tau(tau)) is not None
+    ]
+    if not coarse_finite:
+        print("[STEREO] WARNING: no subframe candidate had enough joint endpoint detections.")
+        return None, rms_by_tau, usable_pairs_by_tau
+
+    _coarse_rms, coarse_best = min(coarse_finite)
+    coarse_at_endpoint = (
+        np.isclose(coarse_best, float(args.subframe_min))
+        or np.isclose(coarse_best, float(args.subframe_max))
+    )
+    if not coarse_at_endpoint:
+        refine_lo = max(float(args.subframe_min), coarse_best - float(args.subframe_step))
+        refine_hi = min(float(args.subframe_max), coarse_best + float(args.subframe_step))
+        evaluate(subframe_tau_values(refine_lo, refine_hi, args.subframe_refine_step))
+
+    print("[STEREO] Subframe sweep table (positive tau samples LEFT at f+tau):")
+    print("    tau   usable_pairs   RMS (px)")
+    finite = []
+    for key in sorted(rms_by_tau, key=float):
+        rms = rms_by_tau[key]
+        usable = usable_pairs_by_tau[key]
+        rms_text = "inf" if rms is None else f"{rms:.4f}"
+        print(f"  {float(key):+5.2f}   {usable:12d}   {rms_text:>8}")
+        if rms is not None:
+            finite.append((float(rms), float(key)))
+    if not finite:
+        return None, rms_by_tau, usable_pairs_by_tau
+    best_rms, best_tau = min(finite)
+    if (
+        np.isclose(best_tau, float(args.subframe_min))
+        or np.isclose(best_tau, float(args.subframe_max))
+    ):
+        print(
+            "[STEREO] WARNING: subframe minimum is at the configured endpoint; "
+            "the result is retained, but no extrapolation is attempted."
+        )
+    print(f"[STEREO] Subframe best: tau={best_tau:+.2f} frames, RMS={best_rms:.4f}px")
+    return best_tau, rms_by_tau, usable_pairs_by_tau
+
+
+def prepare_final_stereo_samples(args, usedL: List[Sample], usedR: List[Sample],
+                                 tau: float, pattern: Tuple[int, int],
+                                 square_m: float):
+    """Detect required neighbors, rank optional still pairs, and interpolate LEFT."""
+    pairs = [(int(left.frame_idx), int(right.frame_idx)) for left, right in zip(usedL, usedR)]
+    left_cache = {int(sample.frame_idx): sample for sample in usedL}
+    right_cache = {int(sample.frame_idx): sample for sample in usedR}
+
+    left_extra = set()
+    right_extra = set()
+    if tau > 0:
+        left_extra.update(idxL + 1 for idxL, _idxR in pairs)
+    elif tau < 0:
+        left_extra.update(idxL - 1 for idxL, _idxR in pairs)
+    if args.prefer_still_pairs:
+        left_extra.update(idxL + delta for idxL, _idxR in pairs for delta in (-1, 1))
+        right_extra.update(idxR + delta for _idxL, idxR in pairs for delta in (-1, 1))
+    left_extra = sorted(idx for idx in left_extra if idx >= 0 and idx not in left_cache)
+    right_extra = sorted(idx for idx in right_extra if idx >= 0 and idx not in right_cache)
+
+    debug_dir = os.path.join(os.path.dirname(args.out) or ".", "stereo_debug")
+    if left_extra:
+        result = collect_sample_chunk_worker({
+            "video_path": args.left,
+            "idx_list": left_extra,
+            "pattern": pattern,
+            "square_m": square_m,
+            "scale": args.scale,
+            "label": "FINAL_LEFT_NEIGHBOR",
+            "debug_every": 0,
+            "out_dir": debug_dir,
+            "progress_queue": None,
+        })
+        left_cache.update((int(sample.frame_idx), sample) for sample in result["samples"])
+    if right_extra:
+        result = collect_sample_chunk_worker({
+            "video_path": args.right,
+            "idx_list": right_extra,
+            "pattern": pattern,
+            "square_m": square_m,
+            "scale": args.scale,
+            "label": "FINAL_RIGHT_NEIGHBOR",
+            "debug_every": 0,
+            "out_dir": debug_dir,
+            "progress_queue": None,
+        })
+        right_cache.update((int(sample.frame_idx), sample) for sample in result["samples"])
+
+    baseL, interpL, selectedR = select_interpolated_pairs(
+        pairs, left_cache, right_cache, tau, int(args.max_pairs),
+        prefer_still=bool(args.prefer_still_pairs),
+    )
+    motion_scores = [
+        stereo_pair_motion_score(left_cache, right_cache, (left.frame_idx, right.frame_idx))
+        for left, right in zip(baseL, selectedR)
+    ]
+    finite_motion = [score for score in motion_scores if np.isfinite(score)]
+    return baseL, interpL, selectedR, finite_motion
 
 
 def compact_stats_for_print(stats: dict) -> dict:
@@ -1980,7 +2522,18 @@ def cmd_mono(args):
 
 def cmd_stereo(args):
     ensure_dir(os.path.dirname(args.out) or ".")
-    trimL, trimR = load_sync(args.sync)
+    sync_data = load_sync_json(args.sync)
+    trimL, trimR = int(sync_data["trim_left"]), int(sync_data["trim_right"])
+    active_subframe_offset = float(sync_data.get("subframe_offset", 0.0))
+    subframe_rms_by_tau = None
+    subframe_usable_by_tau = None
+    if args.subframe_sweep and not args.reuse_stats_indices:
+        raise RuntimeError("[STEREO] --subframe-sweep requires --reuse-stats-indices true.")
+    if sync_data.get("low_confidence") and args.offset_sweep == 0:
+        print(
+            "\n[STEREO] WARNING: sync JSON is marked low_confidence. "
+            "Run again with --offset-sweep to check the temporal pairing.\n"
+        )
     pattern = (args.cols, args.rows)
     square_m = args.square_mm / 1000.0
 
@@ -1994,8 +2547,8 @@ def cmd_stereo(args):
 
     capL = open_video(args.left)
     capR = open_video(args.right)
-    totalL, _, _ = get_video_info(capL)
-    totalR, _, _ = get_video_info(capR)
+    totalL, _, raw_image_sizeL = get_video_info(capL)
+    totalR, _, _raw_image_sizeR = get_video_info(capR)
     capL.release(); capR.release()
 
     obj_template = make_object_points(pattern, square_m)
@@ -2011,24 +2564,57 @@ def cmd_stereo(args):
         right_stats_path = os.path.join(stats_dir, "stats_right.json")
         left_pos = load_positive_indices(left_stats_path)
         right_pos = load_positive_indices(right_stats_path)
-        paired_indices = build_paired_indices_from_stats(trimL, trimR, left_pos, right_pos)
-        range_end = min(totalL, totalR, int(args.end_frame) if args.end_frame is not None else min(totalL, totalR))
-        paired_indices = [
-            (idxL, idxR)
-            for idxL, idxR in paired_indices
-            if idxL >= int(args.start_frame) + trimL
-            and idxR >= int(args.start_frame) + trimR
-            and idxL < range_end
-            and idxR < range_end
-        ]
-        if args.max_scan > 0:
-            paired_indices = paired_indices[:args.max_scan]
+        if args.offset_sweep > 0:
+            best_delta, rms_by_offset, usable_pairs_by_offset = run_stereo_offset_sweep(
+                args, trimL, trimR, left_pos, right_pos, totalL, totalR, raw_image_sizeL,
+                pattern, square_m, K1, D1, K2, D2,
+            )
+            if best_delta is not None and abs(best_delta) == int(args.offset_sweep):
+                print(
+                    "[STEREO] WARNING: the minimum is at the sweep boundary; "
+                    "the range may be too small. Keeping the existing sync trims."
+                )
+            elif best_delta not in (None, 0):
+                old_trimL, old_trimR = trimL, trimR
+                trimL, trimR = update_sync_after_stereo_sweep(
+                    args.sync, best_delta, rms_by_offset, usable_pairs_by_offset
+                )
+                print(
+                    "\n[STEREO] *** APPLYING SWEEP OFFSET ***\n"
+                    f"[STEREO] delta={best_delta:+d}; trims LEFT/RIGHT "
+                    f"{old_trimL}/{old_trimR} -> {trimL}/{trimR}\n"
+                )
+            elif best_delta == 0:
+                print("[STEREO] Sweep confirms the existing sync trim; no sync JSON changes made.")
+
+        paired_indices = filtered_stats_pairs(
+            trimL, trimR, left_pos, right_pos,
+            args.start_frame, args.end_frame, totalL, totalR, args.max_scan,
+        )
         print(
             f"[STEREO] Reusing stats indices from {stats_dir}: "
             f"left_pos={len(left_pos)}, right_pos={len(right_pos)}, paired={len(paired_indices)}"
         )
         if args.step != 5:
             print("[STEREO] NOTE: --step is ignored when --reuse-stats-indices is enabled.")
+
+        if args.subframe_sweep:
+            best_tau, subframe_rms_by_tau, subframe_usable_by_tau = run_stereo_subframe_sweep(
+                args, paired_indices, raw_image_sizeL, pattern, square_m,
+                K1, D1, K2, D2,
+            )
+            if best_tau is not None:
+                active_subframe_offset = float(best_tau)
+                update_sync_after_subframe_sweep(
+                    args.sync, active_subframe_offset,
+                    subframe_rms_by_tau, subframe_usable_by_tau,
+                )
+                print(
+                    "\n[STEREO] *** APPLYING SUBFRAME OFFSET ***\n"
+                    f"[STEREO] tau={active_subframe_offset:+.2f} frames on LEFT corners\n"
+                )
+
+    args.active_subframe_offset = float(active_subframe_offset)
 
     print("\n[STEREO] Collecting paired samples...")
     if paired_indices is not None:
@@ -2040,7 +2626,10 @@ def cmd_stereo(args):
                         args, paired_indices, pattern, square_m, args.workers, progress_queue, pbar
                     )
                     drain_progress_queue(progress_queue, pbar)
-            if len(usedL) > args.max_pairs:
+            if len(usedL) > args.max_pairs and not (
+                args.prefer_still_pairs or args.subframe_sweep
+                or abs(active_subframe_offset) > 1e-12
+            ):
                 usedL = usedL[:args.max_pairs]
                 usedR = usedR[:args.max_pairs]
         else:
@@ -2083,7 +2672,10 @@ def cmd_stereo(args):
                         cv2.imwrite(os.path.join(os.path.dirname(args.out) or ".", "stereo_debug",
                                                  f"pair_{scanned:05d}.png"), both)
 
-                    if len(usedL) >= args.max_pairs:
+                    if len(usedL) >= args.max_pairs and not (
+                        args.prefer_still_pairs or args.subframe_sweep
+                        or abs(float(getattr(args, "active_subframe_offset", 0.0))) > 1e-12
+                    ):
                         break
             finally:
                 pbar.close()
@@ -2156,12 +2748,18 @@ def cmd_stereo(args):
                         cv2.imwrite(os.path.join(os.path.dirname(args.out) or ".", "stereo_debug",
                                                  f"pair_{scanned:05d}.png"), both)
 
-                    if len(usedL) >= args.max_pairs:
+                    if len(usedL) >= args.max_pairs and not (
+                        args.prefer_still_pairs or args.subframe_sweep
+                        or abs(float(getattr(args, "active_subframe_offset", 0.0))) > 1e-12
+                    ):
                         break
 
                 pbar.close()
 
-                if len(usedL) >= args.max_pairs:
+                if len(usedL) >= args.max_pairs and not (
+                    args.prefer_still_pairs or args.subframe_sweep
+                    or abs(float(getattr(args, "active_subframe_offset", 0.0))) > 1e-12
+                ):
                     break
 
                 if pass_i < len(steps) and len(usedL) > 0:
@@ -2173,15 +2771,40 @@ def cmd_stereo(args):
         finally:
             capL.release(); capR.release()
 
-    print(f"[STEREO] scanned={scanned}, collected_pairs={len(usedL)}")
+    print(f"[STEREO] scanned={scanned}, collected_candidate_pairs={len(usedL)}")
+    finite_motion_scores = []
+    baseL_for_pre = usedL
+    if args.prefer_still_pairs or abs(active_subframe_offset) > 1e-12:
+        baseL_for_pre, usedL, usedR, finite_motion_scores = prepare_final_stereo_samples(
+            args, usedL, usedR, active_subframe_offset, pattern, square_m
+        )
+        print(
+            f"[STEREO] selected_pairs={len(usedL)}"
+            + (" (ranked by checkerboard motion)" if args.prefer_still_pairs else "")
+        )
+    elif len(usedL) > args.max_pairs:
+        usedL = usedL[:args.max_pairs]
+        usedR = usedR[:args.max_pairs]
+        baseL_for_pre = usedL
     if len(usedL) < 20:
         raise RuntimeError("[STEREO] Not enough paired detections. Record a better clip (board visible in both).")
 
     print("[STEREO] stereoCalibrate(FIX_INTRINSIC)...")
     rmsS, R, T, E, F = stereo_calibrate(usedL, usedR, image_size, K1, D1, K2, D2)
+    if abs(active_subframe_offset) > 1e-12:
+        pre_subframe_rms, _preR, _preT, _preE, _preF = stereo_calibrate(
+            baseL_for_pre, usedR, image_size, K1, D1, K2, D2
+        )
+    else:
+        pre_subframe_rms = float(rmsS)
 
     baseline_m = float(np.linalg.norm(T))
     print(f"[STEREO] RMS={rmsS:.3f}px  baseline={baseline_m*1000:.2f} mm")
+    if abs(active_subframe_offset) > 1e-12:
+        print(
+            f"[STEREO] Full-quality RMS before/after subframe interpolation: "
+            f"{pre_subframe_rms:.4f}px -> {rmsS:.4f}px"
+        )
 
     np.savez(args.out,
              image_size=np.array(image_size, np.int32),
@@ -2189,11 +2812,24 @@ def cmd_stereo(args):
              K1=K1, D1=D1, K2=K2, D2=D2,
              R=R, T=T, E=E, F=F,
              stereo_rms=np.array([rmsS], np.float32),
+             pre_subframe_rms=np.array([pre_subframe_rms], np.float32),
+             subframe_offset=np.array([active_subframe_offset], np.float32),
              baseline_m=np.array([baseline_m], np.float32),
              used_pairs=np.array([len(usedL)], np.int32))
 
     write_json(os.path.splitext(args.out)[0] + "_report.json", {
         "stereo_rms_px": float(rmsS),
+        "pre_subframe_rms_px": float(pre_subframe_rms),
+        "post_subframe_rms_px": float(rmsS),
+        "subframe_offset_frames": float(active_subframe_offset),
+        "subframe_sweep": None if subframe_rms_by_tau is None else {
+            "rms_by_tau": subframe_rms_by_tau,
+            "usable_pairs_by_tau": subframe_usable_by_tau,
+        },
+        "prefer_still_pairs": bool(args.prefer_still_pairs),
+        "mean_selected_motion_px_per_frame": (
+            float(np.mean(finite_motion_scores)) if finite_motion_scores else None
+        ),
         "baseline_m": baseline_m,
         "baseline_mm": baseline_m * 1000.0,
         "used_pairs": len(usedL),
@@ -2203,6 +2839,22 @@ def cmd_stereo(args):
 
     print(f"[STEREO] Saved: {args.out}")
     print(f"[STEREO] Report: {os.path.splitext(args.out)[0] + '_report.json'}")
+
+    if rmsS > args.max_stereo_rms:
+        print(
+            "\n[STEREO] *** QUALITY GATE FAILED ***\n"
+            f"[STEREO] Final stereo RMS {rmsS:.3f}px exceeds --max-stereo-rms "
+            f"{args.max_stereo_rms:.3f}px. Likely causes are a bad sync offset or "
+            "temporally mismatched checkerboard pairs. Recheck sync and run --offset-sweep.\n"
+        )
+        raise RuntimeError("[STEREO] Final stereo RMS failed the quality gate.")
+    if rmsS > args.warn_stereo_rms:
+        print(
+            f"\n[STEREO] WARNING: final stereo RMS {rmsS:.3f}px exceeds "
+            f"{args.warn_stereo_rms:.3f}px. Usable, but check sync (--offset-sweep) "
+            "and consider recalibrating; sub-frame camera offset inflates this on "
+            "free-running cameras.\n"
+        )
 
 def cmd_rectify(args):
     ensure_dir(args.out)
@@ -2270,6 +2922,8 @@ def main():
                     help="Sync mode: flash (brightness) or audio peak")
     sp.add_argument("--audio-sample-rate", type=int, default=16000,
                     help="Audio sample rate used for --sync-mode audio")
+    sp.add_argument("--min-sync-margin", type=float, default=0.05,
+                    help="Mark audio sync low-confidence when correlation margin is below this value")
     sp.add_argument("--use-cuda", action="store_true", help="Use OpenCV CUDA ops when available; auto-fallback to CPU")
     sp.add_argument("--show-preview", action="store_true",
                     help="Open sync preview windows. By default previews are saved without being displayed.")
@@ -2346,6 +3000,29 @@ def main():
                     help="Reuse synchronized positive detection frame indices from stats output instead of rescanning. Default: true.")
     sp.add_argument("--stats-dir", default=DEFAULT_STATS_DIR,
                     help="Directory containing stats_left.json and stats_right.json")
+    sp.add_argument("--offset-sweep", type=int, default=0,
+                    help="Test LEFT-minus-RIGHT sync adjustments in [-N, +N]; 0 disables the sweep")
+    sp.add_argument("--sweep-pairs", type=int, default=12,
+                    help="Maximum evenly spaced pairs to calibrate per sweep offset")
+    sp.add_argument("--sweep-scale", type=float, default=0.25,
+                    help="Detection scale used only while scoring offset-sweep candidates")
+    sp.add_argument("--subframe-sweep", action="store_true",
+                    help="Sweep a fractional LEFT-minus-RIGHT trim after integer pairing")
+    sp.add_argument("--subframe-min", type=float, default=-0.9,
+                    help="Minimum fractional LEFT offset in frames (default: -0.9)")
+    sp.add_argument("--subframe-max", type=float, default=0.9,
+                    help="Maximum fractional LEFT offset in frames (default: 0.9)")
+    sp.add_argument("--subframe-step", type=float, default=0.15,
+                    help="Coarse fractional sweep step in frames (default: 0.15)")
+    sp.add_argument("--subframe-refine-step", type=float, default=0.05,
+                    help="Refined sweep step around the coarse winner (default: 0.05)")
+    sp.add_argument("--prefer-still-pairs", action="store_true",
+                    help="Rank candidate pairs by checkerboard motion and select the stillest")
+    sp.add_argument("--max-stereo-rms", type=float, default=10.0,
+                    help="Fail stereo calibration when final RMS exceeds this many pixels "
+                         "(free-running GoPros with sub-frame offset rarely beat ~5px)")
+    sp.add_argument("--warn-stereo-rms", type=float, default=5.0,
+                    help="Warn (but continue) when final RMS exceeds this many pixels")
     sp.add_argument("--use-cuda", action="store_true", help="Use OpenCV CUDA ops when available; auto-fallback to CPU")
     sp.set_defaults(func=cmd_stereo)
 

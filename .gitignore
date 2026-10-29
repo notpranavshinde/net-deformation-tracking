@@ -4,6 +4,7 @@ __pycache__/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+tools/tests/_tmp/
 .conda/
 .venv/
 venv/
@@ -29,6 +30,9 @@ raw videos/
 
 # GoPro/OpenGoPro local connection artifacts
 cohn_db.json
+machine_paths.json
+remote_config.json
+.remote-pipeline-*/
 
 # SAM/checkpoint/model weights
 *.pt
@@ -56,6 +60,7 @@ triangulation/out/
 triangulation/results/
 imu_analysis/
 work/
+*.npz
 codex resume session id.txt
 
 # Generated frame/image debug dumps
