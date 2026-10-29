@@ -259,6 +259,7 @@ def main() -> int:
     ap.add_argument("--refine-radius", type=int, default=40, help="Half-window (full-res px) for --refine dtpeak")
     ap.add_argument("--out", type=Path, required=True, help="Output folder; tracks_2d.csv is written inside")
     ap.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
+    ap.add_argument("--drop-frames", action="store_true", help="Delete the extracted frame cache when done")
     args = ap.parse_args()
 
     start, end, points = load_prompts(args.run_dir, args.side)
@@ -266,7 +267,8 @@ def main() -> int:
     if model_hw[0] % 4 or model_hw[1] % 4:
         raise SystemExit("--model-res must be divisible by 4")
     video_path = args.video if args.video.is_absolute() else ROOT / args.video
-    frames = extract_frames(video_path, start, end, FRAME_CACHE / f"{video_path.stem}_{start}_{end}")
+    frame_dir = FRAME_CACHE / f"{video_path.stem}_{start}_{end}"
+    frames = extract_frames(video_path, start, end, frame_dir)
     device = args.device if args.device != "auto" else ("cuda" if torch.cuda.is_available() else "cpu")
 
     t0 = time.perf_counter()
@@ -292,6 +294,8 @@ def main() -> int:
     }
     (args.out / "run_meta.json").write_text(json.dumps(meta, indent=2))
     print(json.dumps(meta, indent=2))
+    if args.drop_frames:
+        shutil.rmtree(frame_dir, ignore_errors=True)
     return 0
 
 
