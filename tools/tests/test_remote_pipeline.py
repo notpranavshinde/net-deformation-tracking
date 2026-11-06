@@ -266,7 +266,20 @@ def test_remote_process_probe_does_not_match_itself():
 
     probe = captured["command"][-1]
     assert "pgrep -af --" in probe
-    assert "[r]un_pipeline_queue.py" in probe
+    assert "[r]un_(pipeline_queue.py" in probe
+    assert "|cotracker_queue.py --resume work/pipeline_queue/queue_a)" in probe
+
+
+def test_processing_command_per_tracker():
+    config = {"remote_python": "conda run -n env python"}
+    assert remote.processing_command(config, "queue_a") == (
+        "conda run -n env python run_pipeline_queue.py --resume work/pipeline_queue/queue_a --process-only"
+    )
+    assert remote.processing_command(config, "queue_a", "cotracker3", gpu=1) == (
+        "CUDA_VISIBLE_DEVICES=1 conda run -n env python "
+        "experiments/cotracker3/run_cotracker_queue.py --resume work/pipeline_queue/queue_a"
+    )
+    assert remote.excluded_from_push("run_001_x/cotracker3/left/tracks_2d.csv")
 
 
 def test_remote_queue_present_checks_manifest():
@@ -341,6 +354,7 @@ def main():
     test_print_line_replaces_characters_unsupported_by_console()
     test_clean_log_tail_removes_terminal_progress_noise()
     test_superset_verdicts()
+    test_processing_command_per_tracker()
     test_configure_remote_video_roots()
     tmp_parent = Path(__file__).resolve().parent / "_tmp"
     tmp_root = tmp_parent / "remote_pipeline"

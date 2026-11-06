@@ -25,6 +25,8 @@ REPO_ROOT = Path(__file__).resolve().parent
 QUEUE_ROOT = REPO_ROOT / "work" / "pipeline_queue"
 CONFIG_PATH = REPO_ROOT / "remote_config.json"
 RUNNER = REPO_ROOT / "run_pipeline_queue.py"
+COTRACKER_RUNNER = "experiments/cotracker3/run_cotracker_queue.py"
+TRACKERS = ("sam2", "cotracker3")
 
 try:
     from rich.console import Console
@@ -324,7 +326,7 @@ def excluded_from_push(rel: str) -> bool:
     parts = set(Path(rel).parts)
     if "objectwise_frames" in parts:
         return True
-    if "sam2" in parts:
+    if "sam2" in parts or "cotracker3" in parts:
         return True
     return False
 
@@ -433,13 +435,29 @@ def process_alive(config: dict, queue_id: str, verbose: bool, dry_run: bool = Fa
         return False
     # Bracket the first character so the regex matches the worker command but
     # not the pgrep/SSH probe command containing the literal regex itself.
-    pattern = f"[r]un_pipeline_queue.py --resume work/pipeline_queue/{queue_id} --process-only"
+    # Either tracker's worker counts: SAM2 (--process-only) or the CoTracker3 runner.
+    queue_rel = f"work/pipeline_queue/{queue_id}"
+    pattern = (
+        f"[r]un_(pipeline_queue.py --resume {queue_rel} --process-only"
+        f"|cotracker_queue.py --resume {queue_rel})"
+    )
     result = run_command(
         ssh_command(config, f"pgrep -af -- {shell_quote(pattern)} >/dev/null 2>&1"),
         verbose=verbose,
         dry_run=dry_run,
     )
     return result.code == 0
+
+
+def processing_command(config: dict, queue_id: str, tracker: str = "sam2", gpu: int | None = None) -> str:
+    """The remote shell command that processes a pushed queue with the chosen tracker."""
+    queue_rel = shell_quote(remote_join("work/pipeline_queue", queue_id))
+    if tracker == "sam2":
+        return f"{config['remote_python']} run_pipeline_queue.py --resume {queue_rel} --process-only"
+    if tracker == "cotracker3":
+        prefix = f"CUDA_VISIBLE_DEVICES={int(gpu)} " if gpu is not None else ""
+        return f"{prefix}{config['remote_python']} {COTRACKER_RUNNER} --resume {queue_rel}"
+    raise RemotePipelineError(f"Unknown tracker `{tracker}`; choose one of {', '.join(TRACKERS)}.")
 
 
 def remote_queue_present(config: dict, queue_id: str, verbose: bool, dry_run: bool = False) -> bool:
@@ -742,10 +760,14 @@ def pull_from_remote(
 ) -> None:
     manifest = read_json(manifest_path) if manifest_path.is_file() else {"queue_id": queue_id, "jobs": []}
     result_paths = []
+    optional_paths = set()  # CoTracker3 result dirs exist only for queues processed with it
     for job in manifest.get("jobs", []):
         slug = job.get("velocity_slug") or Path(str(job.get("result_dir", ""))).name
         if slug:
             result_paths.append(remote_join("triangulation/results", slug))
+            cotracker_rel = remote_join("triangulation/results", f"{slug}_cotracker3")
+            result_paths.append(cotracker_rel)
+            optional_paths.add(cotracker_rel)
     queue_rel = remote_join("work/pipeline_queue", queue_id)
     archive_name = f"/tmp/{queue_id}.pull.{int(time.time())}.tar.gz"
     existing_result_paths: list[str] = []
@@ -761,7 +783,7 @@ def pull_from_remote(
         existing = set(result.stdout.splitlines())
         existing_result_paths = [item for item in result_paths if item in existing]
         for item in result_paths:
-            if item not in existing:
+            if item not in existing and item not in optional_paths:
                 print_line(f"[PULL] Skipping missing remote result dir: {item}")
     archive_paths = [queue_rel, *existing_result_paths]
     print_line("[PULL] Remote paths selected:")
@@ -947,10 +969,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         )
     session = f"pipeline_{queue_id}"
     log_rel = remote_join("work/pipeline_queue", queue_id, "remote_run.log")
-    process_cmd = (
-        f"{config['remote_python']} run_pipeline_queue.py --resume "
-        f"{shell_quote(remote_join('work/pipeline_queue', queue_id))} --process-only"
-    )
+    process_cmd = processing_command(config, queue_id, args.tracker, args.gpu)
     attach = f"ssh -t {config['host']} tmux attach -t {session}"
     if remote_tmux_present(config, args.verbose, args.dry_run):
         if tmux_session_alive(config, session, args.verbose, args.dry_run):
@@ -966,7 +985,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     result = run_command(ssh_command(config, remote_shell(config, command)), verbose=args.verbose, dry_run=args.dry_run)
     if result.code != 0:
         raise RemotePipelineError(translate_ssh_failure(result, config))
-    print_line(f"[RUN] Started remote processing for {queue_id}.")
+    print_line(f"[RUN] Started remote {args.tracker} processing for {queue_id}.")
     print_line(f"[RUN] Attach: {attach}")
     return 0
 
@@ -1065,6 +1084,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     run = sub.add_parser("run", help="Start remote processing detached.")
     add_queue_arg(run)
+    run.add_argument("--tracker", choices=TRACKERS, default="sam2", help="Marker tracker for the 2D stage (default sam2).")
+    run.add_argument("--gpu", type=int, help="With --tracker cotracker3: GPU index to use (default: first visible).")
     run.add_argument("--dry-run", action="store_true", help="Print launch commands without starting remote processing.")
     run.set_defaults(func=cmd_run)
 
@@ -1077,7 +1098,7 @@ def build_parser() -> argparse.ArgumentParser:
     logs.add_argument("-f", "--follow", action="store_true", help="Follow the remote log with tail -f.")
     logs.set_defaults(func=cmd_logs)
 
-    pull = sub.add_parser("pull", help="Pull results, queue logs, SAM2 tracks, and remote manifest back locally.")
+    pull = sub.add_parser("pull", help="Pull results (SAM2 and CoTracker3), queue logs, tracks, and remote manifest back locally.")
     add_queue_arg(pull)
     pull.add_argument("--dry-run", action="store_true", help="Print pull commands and selected paths without changing local files.")
     pull.add_argument("--force", action="store_true", help="Merge the remote pull even when its manifest conflicts with local state.")

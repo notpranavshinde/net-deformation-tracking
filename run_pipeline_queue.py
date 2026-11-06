@@ -694,6 +694,7 @@ def find_video_by_signature(recorded):
         for candidate in candidates:
             if candidate.is_file() and signatures_match(recorded, video_signature(candidate)):
                 matches.append(candidate.resolve())
+    matches = sorted(set(matches))  # nested video roots find the same file more than once
     if len(matches) == 1:
         return matches[0]
     if len(matches) > 1:
