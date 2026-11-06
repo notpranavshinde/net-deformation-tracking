@@ -24,6 +24,10 @@ from rich.progress import (
     TimeRemainingColumn,
 )
 
+# OpenCV's implicit OpenCL path makes every detection worker open a GPU context: on a busy
+# shared box that halves the speed and can fail with CL_MEM_OBJECT_ALLOCATION_FAILURE.
+cv2.ocl.setUseOpenCL(False)
+
 
 _CUDA_STATUS: Optional[bool] = None
 _CUDA_FALLBACK_WARNED = False
