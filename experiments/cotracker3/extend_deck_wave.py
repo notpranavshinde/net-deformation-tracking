@@ -1,4 +1,4 @@
-"""Append the first wave-test result (A = 0.05 m, F = 0.25, trial 2) to the CoTracker3 deck.
+"""Append the first wave-test result (A = 0.05 m, 0.5 Hz, trial 2) to the CoTracker3 deck.
 Edits nothing else in the deck. Render the video first with make_wave_media.py.
 
     python experiments/cotracker3/extend_deck_wave.py <in.pptx> <out.pptx>
@@ -113,7 +113,7 @@ def main() -> int:
     s = prs.slides.add_slide(d.layout(prs, "SECTION"))
     d.text(s, "05", d.MX, 2.75, 1.4, 1.0, size=54, color=d.ORANGE, bold=True, head=True, anchor=MSO_ANCHOR.MIDDLE)
     s.placeholders[100].text = "Wave test"
-    s.placeholders[101].text = "First wave run through the full pipeline: A = 0.05 m, F = 0.25, trial 2. Preliminary."
+    s.placeholders[101].text = "First wave run through the full pipeline: A = 0.05 m, 0.5 Hz (2 s period), trial 2. Preliminary."
 
     # Video + key numbers, same layout as the tow-tracking slide
     s = prs.slides.add_slide(d.layout(prs, "CONTENT"))
@@ -133,7 +133,7 @@ def main() -> int:
         d.dot(s, x, y + 0.07, 0.18, d.GREEN)
         d.text(s, k, x + 0.35, y, 5.5, 0.35, size=15, bold=True, head=True)
         d.text(s, v, x + 0.35, y + 0.33, d.W - d.MX - x - 0.35, 0.5, size=14, color=d.MUTED)
-    d.notes(s, "Wave test 2 at A = 0.05 m (the queue still labels it A_0.1; renamed afterwards). Queue made with run_pipeline_queue.py "
+    d.notes(s, "Wave test 2 at A = 0.05 m, 0.5 Hz (the queue still labels it A_0.1_F_0.25; both labels were wrong). Queue made with run_pipeline_queue.py "
                "--setup-only on the laptop, processed on the Linux box with remote_pipeline.py run --tracker cotracker3. "
                "Same CoTracker3 settings as the tow runs: offline model, 384 x 512 input, dtpeak snap radius 40, hidden points not snapped.")
 
@@ -147,9 +147,10 @@ def main() -> int:
                 [f"row {r + 1}" for r in range(GRID)], [round(v) for v in per_row],
                 [d.HEX["green"]] * GRID, "0")
     d.text(s, f"Displacement about each knot's mean position, along the main direction of motion ({share * 100:.1f}% of the bottom row's "
-              f"motion lies on one line). Swing = 5th to 95th percentile. Dominant period about {1 / peak:.0f} s ({peak:.2f} Hz).",
+              f"motion lies on one line). Swing = 5th to 95th percentile. "
+              f"Measured {peak:.2f} Hz vs commanded 0.50 Hz; 5 steady cycles plus ramp up and down, 14 s, as commanded.",
            d.MX, 6.25, d.W - 2 * d.MX, 0.6, size=13, color=d.MUTED)
-    d.notes(s, "Preliminary, one trial. No reference or FEM comparison for the wave case yet. The main direction of motion is mostly "
+    d.notes(s, "Commanded motion: amplitude 0.05 m, period 2.0 s, 5 steady cycles + 1 ramp up + 1 ramp down, 14 s, tow speed 0. The FFT of a 20 s clip resolves about 0.05 Hz, so 0.49 Hz matches 0.50 Hz. Preliminary, one trial. No reference or FEM comparison for the wave case yet. The main direction of motion is mostly "
                "along the camera axis with a vertical component, i.e. the net swings toward and away from the cameras.")
 
     prs.save(dst)
