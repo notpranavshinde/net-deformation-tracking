@@ -75,7 +75,7 @@ def time_chart(slide, along, x, y, w, h):
     gf.name = "wave time chart"
     ch = gf.chart
     ch.has_title = True
-    ch.chart_title.text_frame.text = "Displacement over time, middle column of knots (mm)"
+    ch.chart_title.text_frame.text = "Displacement relative to the carriage, middle column (mm)"
     f = ch.chart_title.text_frame.paragraphs[0].runs[0].font
     f.size, f.bold, f.color.rgb = Pt(14), False, RGBColor.from_string(d.HEX["ink"])
     ch.has_legend = True
@@ -120,7 +120,7 @@ def main() -> int:
     d.title(s, "The pipeline runs end to end on a wave test")
     d.video(s, "wave_tracking", d.MX, 1.3, 5.2, 5.5, left=True)
     x = 6.28
-    d.text(s, "Left camera, played at half speed. Green dots are CoTracker3 after the snap; lines join grid neighbours.",
+    d.text(s, "Left camera, which rides on the carriage, played at half speed. Green dots are CoTracker3 after the snap; lines join grid neighbours.",
            x, 1.35, d.W - d.MX - x, 0.8, size=14, color=d.MUTED)
     stats = [("Clip", f"{n_frames} frames ({n_frames / FPS:.1f} s), 144 knots queried once in frame 0"),
              ("3D points kept", f"{summary['valid_pct']:.1f}% ({summary['valid_3d_obs']:,} of {summary['total_matched_obs']:,})"),
@@ -139,18 +139,19 @@ def main() -> int:
 
     # Motion
     s = prs.slides.add_slide(d.layout(prs, "CONTENT"))
-    d.title(s, "The net swings with the wave, most at the bottom")
+    d.title(s, "Relative to the carriage, the net swings most at the bottom")
     time_chart(s, along, d.MX, 1.25, 7.9, 4.85)
     rows = np.nanpercentile(along, 95, axis=0) - np.nanpercentile(along, 5, axis=0)
     per_row = [float(np.nanmedian(rows[r * GRID:(r + 1) * GRID])) for r in range(GRID)]
-    d.add_chart(s, 8.75, 1.25, d.W - d.MX - 8.75, 4.85, "Swing by row, top to bottom (mm)",
+    d.add_chart(s, 8.75, 1.25, d.W - d.MX - 8.75, 4.85, "Swing by row, vs the carriage (mm)",
                 [f"row {r + 1}" for r in range(GRID)], [round(v) for v in per_row],
                 [d.HEX["green"]] * GRID, "0")
-    d.text(s, f"Displacement about each knot's mean position, along the main direction of motion ({share * 100:.1f}% of the bottom row's "
-              f"motion lies on one line). Swing = 5th to 95th percentile. "
-              f"Measured {peak:.2f} Hz vs commanded 0.50 Hz; 5 steady cycles plus ramp up and down, 14 s, as commanded.",
+    d.text(s, f"The cameras move with the carriage, so these numbers exclude its own ±50 mm motion. Displacement about each knot's mean "
+              f"position along the main direction of motion ({share * 100:.1f}% of the bottom row's motion). Swing = 5th to 95th percentile. "
+              f"Measured {peak:.2f} Hz vs commanded 0.50 Hz; 5 steady cycles plus ramps, 14 s.",
            d.MX, 6.25, d.W - 2 * d.MX, 0.6, size=13, color=d.MUTED)
-    d.notes(s, "Commanded motion: amplitude 0.05 m, period 2.0 s, 5 steady cycles + 1 ramp up + 1 ramp down, 14 s, tow speed 0. The FFT of a 20 s clip resolves about 0.05 Hz, so 0.49 Hz matches 0.50 Hz. Preliminary, one trial. No reference or FEM comparison for the wave case yet. The main direction of motion is mostly "
+    d.notes(s, "Commanded motion: amplitude 0.05 m, period 2.0 s, 5 steady cycles + 1 ramp up + 1 ramp down, 14 s, tow speed 0. The FFT of a 20 s clip resolves about 0.05 Hz, so 0.49 Hz matches 0.50 Hz. Preliminary, one trial. No reference or FEM comparison for the wave case yet. The cameras are mounted on the carriage, so all 3D motion is relative to the carriage: the top row, near the attachment, "
+               "moves little; the bottom row moves up to 140 mm peak to peak relative to it. The main direction of motion is mostly "
                "along the camera axis with a vertical component, i.e. the net swings toward and away from the cameras.")
 
     prs.save(dst)
