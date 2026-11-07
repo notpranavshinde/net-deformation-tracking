@@ -248,8 +248,13 @@ def bootstrap_mesh(
     setup_check_frames: int = 7,
     setup_check_min_hits: int = 2,
     cluster_radius_factor: float = 0.28,
+    color_points: tuple[np.ndarray, np.ndarray] | None = None,
 ) -> BootstrapResult:
-    """Establish identities from a deterministic multi-frame setup check."""
+    """Establish identities from a deterministic multi-frame setup check.
+
+    ``color_points`` (left, right) are pixels known to sit on markers, used to learn the marker
+    colour; default is the setup hints, which must then mostly sit on markers.
+    """
     def image_list(value):
         if isinstance(value, np.ndarray):
             return [value]
@@ -263,7 +268,8 @@ def bootstrap_mesh(
     hints = [np.asarray(setup_left, float).reshape(-1, 2), np.asarray(setup_right, float).reshape(-1, 2)]
     if any(len(value) != len(topology) for value in hints):
         raise ValueError("Setup point counts must equal topology node count")
-    models = [MarkerColorModel().fit(side_images[0], points) for side_images, points in zip(images, hints)]
+    color = hints if color_points is None else [np.asarray(value, float).reshape(-1, 2) for value in color_points]
+    models = [MarkerColorModel().fit(side_images[0], points) for side_images, points in zip(images, color)]
     detections, candidate_hits = [], []
     for side_images, model, roi, points in zip(images, models, (left_roi, right_roi), hints):
         by_frame = [
