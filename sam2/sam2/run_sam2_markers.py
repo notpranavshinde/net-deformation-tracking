@@ -69,6 +69,14 @@ try:
 except Exception:
     detect_candidates_on_processed_frame = None
 
+# Repo root goes last so its sam2/ folder cannot shadow the installed sam2 package.
+if str(THIS_DIR.parents[1]) not in sys.path:
+    sys.path.append(str(THIS_DIR.parents[1]))
+try:
+    from nettrack import grid_grow
+except Exception:
+    grid_grow = None
+
 # ---- CONFIG ----
 DEFAULT_OUT_DIR = Path("out")
 DEFAULT_LOCAL_SETUP_DIR = Path("work") / "manual_sam2_setup"
@@ -1860,6 +1868,55 @@ def _generate_grid_prompts_from_detection(
         "assigned_lattice": int(lattice_count),
         "assigned_anchors": int(anchor_count),
         "assigned_inferred": int(expected - detected_count - lattice_count - anchor_count),
+        "points": meta_points,
+    }
+    return prompts, meta
+
+
+def _generate_grid_prompts_by_growing(side: str, frame_bgr: np.ndarray, corners, cols: int, rows: int):
+    """Full-grid prompts from nettrack.grid_grow: knots labelled one at a time from their labelled
+    neighbours, so a bulging net does not shift rows the way a grid stretched between the corners
+    does. Knots with no marker found are marked "lattice" (orange in the review window)."""
+    corners_xy = np.asarray(corners, dtype=np.float64).reshape(4, 2)
+    detections = grid_grow.detect(frame_bgr, corners_xy, cols, rows)
+    if len(detections) < 0.5 * cols * rows:
+        raise RuntimeError(f"only {len(detections)} markers detected")
+    points, gap = grid_grow.grow_grid(detections, corners_xy, cols, rows)
+
+    # The walk starts at the top-left; it should end on the other three reviewed corners.
+    spacing = float(np.median(np.linalg.norm(np.diff(points.reshape(rows, cols, 2), axis=1), axis=2)))
+    corner_ids = {"top-right": cols - 1, "bottom-left": (rows - 1) * cols, "bottom-right": rows * cols - 1}
+    corner_xy = {"top-right": corners_xy[1], "bottom-left": corners_xy[2], "bottom-right": corners_xy[3]}
+    corner_miss = {}
+    for name, idx in corner_ids.items():
+        miss = float(np.linalg.norm(points[idx] - corner_xy[name]))
+        if miss > 0.45 * spacing:
+            corner_miss[name] = round(miss, 1)
+            gap[idx] = True
+    if corner_miss:
+        print(f"[WARN][{side.upper()}] grid growing ended away from the reviewed corners {corner_miss} px; "
+              "check those rows and columns, or the corner clicks.")
+
+    prompts, meta_points = [], []
+    for idx, (x, y) in enumerate(points):
+        x = max(0.0, min(float(frame_bgr.shape[1] - 1), float(x)))
+        y = max(0.0, min(float(frame_bgr.shape[0] - 1), float(y)))
+        prompts.append(_make_prompt_point(x, y, 1))
+        meta_points.append({
+            "obj_id": idx, "row": idx // cols, "col": idx % cols,
+            "source": "lattice" if gap[idx] else "detected",
+            "confidence": 0.0 if gap[idx] else 1.0, "x": x, "y": y,
+            "lattice_source": "grid_grow", "anchor_locked": False,
+        })
+    n_gap = int(gap.sum())
+    print(f"[INFO][{side.upper()}] semi-auto grid growing: {cols * rows - n_gap}/{cols * rows} knots on a detected marker, "
+          f"{n_gap} to check (orange); {len(detections)} markers detected.")
+    meta = {
+        "side": side, "cols": int(cols), "rows": int(rows),
+        "detector": {"method": "nettrack.grid_grow", "candidates": int(len(detections))},
+        "assignment": {"method": "grid_grow", "corner_miss_px": corner_miss},
+        "assigned_detected": int(cols * rows - n_gap), "assigned_lattice": n_gap,
+        "assigned_anchors": 0, "assigned_inferred": 0,
         "points": meta_points,
     }
     return prompts, meta
@@ -6229,8 +6286,16 @@ def main():
             left_corner_xy = [_coerce_point_pair(p, prefer_local=False) for p in left_corners]
             right_corner_xy = [_coerce_point_pair(p, prefer_local=False) for p in right_corners]
 
-            left_points, left_meta = _generate_grid_prompts_from_detection("left", left_first, left_corner_xy, cols, rows)
-            right_points, right_meta = _generate_grid_prompts_from_detection("right", right_first, right_corner_xy, cols, rows)
+            generated = {}
+            for side, frame, corner_xy in (("left", left_first, left_corner_xy), ("right", right_first, right_corner_xy)):
+                try:
+                    if grid_grow is None:
+                        raise RuntimeError("nettrack could not be imported")
+                    generated[side] = _generate_grid_prompts_by_growing(side, frame, corner_xy, cols, rows)
+                except Exception as exc:
+                    print(f"[WARN][{side.upper()}] Grid growing failed ({exc}); using the corner-stretched grid.")
+                    generated[side] = _generate_grid_prompts_from_detection(side, frame, corner_xy, cols, rows)
+            (left_points, left_meta), (right_points, right_meta) = generated["left"], generated["right"]
 
             print(
                 f"[INFO] Review generated {expected_points} prompts per side. "
