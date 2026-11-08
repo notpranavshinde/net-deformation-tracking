@@ -105,7 +105,7 @@ def run_tracking(q, manifest, job, view, args, settings) -> bool:
             continue
         out = Path(view["sam2_out"]) / side
         command = [
-            args.python, str(TRACK_SCRIPT),
+            args.python, "-u", str(TRACK_SCRIPT),  # unbuffered, so the log shows progress as it happens
             "--run-dir", job["run_dir"], "--side", side, "--video", job[f"{side}_video"],
             "--model-res", settings["model_res"], "--refine", settings["refine"],
             "--refine-radius", str(settings["refine_radius"]),

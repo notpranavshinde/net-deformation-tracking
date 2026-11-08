@@ -327,6 +327,7 @@ def main() -> int:
     device = args.device if args.device != "auto" else ("cuda" if torch.cuda.is_available() else "cpu")
 
     t0 = time.perf_counter()
+    print(f"[INFO] Loading {len(frames)} frames at {model_hw[1]}x{model_hw[0]}", flush=True)
     video, full_hw = load_video_tensor(frames, model_hw, dtype=torch.uint8)
     t_load = time.perf_counter() - t0
     model = load_model(device)
