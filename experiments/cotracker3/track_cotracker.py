@@ -88,8 +88,9 @@ def read_frame(path: Path, t: int, occluder: Occluder | None) -> np.ndarray:
 
 
 def load_video_tensor(frames: list[Path], model_hw: tuple[int, int],
-                      occluder: Occluder | None = None) -> tuple[torch.Tensor, tuple[int, int]]:
-    """Load frames resized straight to the model resolution as a (1, T, 3, H, W) float tensor."""
+                      occluder: Occluder | None = None, dtype=torch.float32) -> tuple[torch.Tensor, tuple[int, int]]:
+    """Load frames resized straight to the model resolution as a (1, T, 3, H, W) tensor
+    (float by default; uint8 keeps long clips small in RAM, see track_points_windowed)."""
 
     h, w = model_hw
     video = np.empty((len(frames), h, w, 3), dtype=np.uint8)
@@ -98,7 +99,7 @@ def load_video_tensor(frames: list[Path], model_hw: tuple[int, int],
         bgr = read_frame(path, t, occluder)
         full_hw = bgr.shape[:2]
         video[t] = cv2.cvtColor(cv2.resize(bgr, (w, h), interpolation=cv2.INTER_AREA), cv2.COLOR_BGR2RGB)
-    return torch.from_numpy(video).permute(0, 3, 1, 2)[None].float(), full_hw
+    return torch.from_numpy(video).permute(0, 3, 1, 2)[None].to(dtype), full_hw
 
 
 def load_model(device: str):
@@ -145,10 +146,11 @@ def support_grid(size: int, h: int, w: int) -> torch.Tensor:
 
 @torch.inference_mode()
 def track_points(model, video: torch.Tensor, points: np.ndarray, full_hw: tuple[int, int], device: str,
-                 support: int = 6):
+                 support: int = 6, query_frames: np.ndarray | None = None):
     """Run the offline model on a video already at model resolution.
 
-    ``points`` are (N, 2) full-resolution pixel coordinates queried at frame 0. Returns
+    ``points`` are (N, 2) full-resolution pixel coordinates queried at frame 0, or at
+    ``query_frames`` (one frame index per point) when given. Returns
     full-resolution tracks (T, N, 2), visibility probability (T, N) and confidence (T, N).
     Mirrors CoTrackerPredictor._compute_sparse_tracks without its boolean threshold.
     """
@@ -156,6 +158,8 @@ def track_points(model, video: torch.Tensor, points: np.ndarray, full_hw: tuple[
     _, _, _, h, w = video.shape
     sx, sy = (w - 1) / (full_hw[1] - 1), (h - 1) / (full_hw[0] - 1)
     queries = torch.zeros((1, len(points), 3))
+    if query_frames is not None:
+        queries[0, :, 0] = torch.from_numpy(np.asarray(query_frames, dtype=np.float32))
     queries[0, :, 1] = torch.from_numpy(points[:, 0] * sx)
     queries[0, :, 2] = torch.from_numpy(points[:, 1] * sy)
     # The official predictor adds a 6 x 6 grid of support points for sparse queries; they shape
@@ -166,10 +170,59 @@ def track_points(model, video: torch.Tensor, points: np.ndarray, full_hw: tuple[
     n = len(points)
     tracks, vis, conf = tracks[:, :, :n], vis[:, :, :n], conf[:, :, :n]
     tracks = tracks[0].float().cpu().numpy() / np.array([sx, sy], dtype=np.float32)
-    tracks[0] = points  # the query frame is known exactly
     vis, conf = vis[0].float().cpu().numpy(), conf[0].float().cpu().numpy()
-    vis[0] = 1.0
+    qf = np.zeros(n, int) if query_frames is None else np.asarray(query_frames, int)
+    tracks[qf, np.arange(n)] = points  # the query frame is known exactly
+    if query_frames is None:
+        vis[0] = 1.0
     return tracks, vis, conf
+
+
+def track_points_windowed(model, video: torch.Tensor, points: np.ndarray, full_hw: tuple[int, int], device: str,
+                          frames: list[Path], window: int = 600, overlap: int = 64, refine_radius: int = 40):
+    """track_points over overlapping windows of at most ``window`` frames.
+
+    The offline model holds features for every frame on the GPU, so a long clip runs out of
+    memory (4630 frames needed over 40 GB). A clip that fits in one window is one plain
+    track_points call. Each later window queries every knot at the overlap frame where the
+    previous window saw it most clearly, snapped to the knot centre, so errors do not carry
+    over; the two windows hand over in the middle of the overlap.
+    """
+
+    total = video.shape[1]
+    if total <= window:
+        return track_points(model, video.float(), points, full_hw, device)
+    if not 0 < overlap < window // 2:
+        raise ValueError("overlap must be between 0 and half the window")
+    n = len(points)
+    tracks = np.zeros((total, n, 2), np.float32)
+    vis = np.zeros((total, n), np.float32)
+    conf = np.zeros((total, n), np.float32)
+    start, query_pts, query_t, keep_from = 0, points, None, 0
+    while True:
+        end = min(start + window, total)
+        print(f"[INFO] Tracking frames {start}-{end - 1} of {total}", flush=True)
+        t, v, c = track_points(model, video[:, start:end].float(), query_pts, full_hw, device, query_frames=query_t)
+        if device.startswith("cuda"):
+            torch.cuda.empty_cache()
+        if end == total:
+            tracks[start + keep_from:], vis[start + keep_from:], conf[start + keep_from:] = t[keep_from:], v[keep_from:], c[keep_from:]
+            return tracks, vis, conf
+        nxt = end - overlap
+        hand = nxt + overlap // 2 - start  # local frame where the next window takes over
+        tracks[start + keep_from:start + hand] = t[keep_from:hand]
+        vis[start + keep_from:start + hand] = v[keep_from:hand]
+        conf[start + keep_from:start + hand] = c[keep_from:hand]
+        # Re-query each knot where it is clearest in the overlap, snapped to the marker when visible.
+        local = nxt - start + np.argmax(v[nxt - start:] * c[nxt - start:], axis=0)
+        query_pts = t[local, np.arange(n)].copy()
+        for i, lt in enumerate(local):
+            if v[lt, i] > VIS_THRESHOLD:
+                hit = refine_dtpeak(read_frame(frames[start + lt], start + lt, None), *query_pts[i], refine_radius)
+                if hit is not None:
+                    query_pts[i] = hit[:2]
+        query_t = local - (nxt - start)
+        start, keep_from = nxt, overlap // 2
 
 
 def refine_dtpeak(bgr: np.ndarray, u: float, v: float, radius: int) -> tuple[float, float, float, float] | None:
@@ -260,6 +313,8 @@ def main() -> int:
     ap.add_argument("--out", type=Path, required=True, help="Output folder; tracks_2d.csv is written inside")
     ap.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
     ap.add_argument("--drop-frames", action="store_true", help="Delete the extracted frame cache when done")
+    ap.add_argument("--window", type=int, default=600, help="Longest stretch of frames tracked in one model call (GPU memory)")
+    ap.add_argument("--overlap", type=int, default=64, help="Frames shared by consecutive windows")
     args = ap.parse_args()
 
     start, end, points = load_prompts(args.run_dir, args.side)
@@ -272,11 +327,12 @@ def main() -> int:
     device = args.device if args.device != "auto" else ("cuda" if torch.cuda.is_available() else "cpu")
 
     t0 = time.perf_counter()
-    video, full_hw = load_video_tensor(frames, model_hw)
+    video, full_hw = load_video_tensor(frames, model_hw, dtype=torch.uint8)
     t_load = time.perf_counter() - t0
     model = load_model(device)
     t1 = time.perf_counter()
-    tracks, vis, conf = track_points(model, video, points, full_hw, device)
+    tracks, vis, conf = track_points_windowed(model, video, points, full_hw, device, frames,
+                                              args.window, args.overlap, args.refine_radius)
     t_track = time.perf_counter() - t1
     t2 = time.perf_counter()
     rows = build_rows(frames, tracks, vis, conf, full_hw, args.refine, args.refine_radius)
@@ -287,7 +343,7 @@ def main() -> int:
     meta = {
         "side": args.side, "video": str(video_path), "frame_range": [start, end],
         "model": "offline", "model_res": list(model_hw), "refine": args.refine,
-        "refine_radius": args.refine_radius, "device": device,
+        "refine_radius": args.refine_radius, "device": device, "window": args.window, "overlap": args.overlap,
         "n_frames": int(tracks.shape[0]), "n_points": int(tracks.shape[1]),
         "seconds": {"load": round(t_load, 2), "track": round(t_track, 2), "refine": round(t_refine, 2)},
         "n_params_m": round(sum(p.numel() for p in model.parameters()) / 1e6, 2),
