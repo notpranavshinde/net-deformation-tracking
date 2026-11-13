@@ -1881,12 +1881,17 @@ def _generate_grid_prompts_by_growing(side: str, frame_bgr: np.ndarray, corners,
     detections = grid_grow.detect(frame_bgr, corners_xy, cols, rows)
     if len(detections) < 0.5 * cols * rows:
         raise RuntimeError(f"only {len(detections)} markers detected")
-    points, gap = grid_grow.grow_grid(detections, corners_xy, cols, rows)
+    grow_info = {}
+    points, gap = grid_grow.grow_grid(detections, corners_xy, cols, rows, grow_info)
+    for note in grow_info["notes"]:
+        print(f"[INFO][{side.upper()}] grid growing: {note}")
 
-    # The walk starts at the top-left; it should end on the other three reviewed corners.
+    # The edges are walked between the reviewed corners (some may have moved one knot in, see the
+    # notes above); the grid should end on the corners the walk settled on.
+    used = grow_info["corners"]
     spacing = float(np.median(np.linalg.norm(np.diff(points.reshape(rows, cols, 2), axis=1), axis=2)))
     corner_ids = {"top-right": cols - 1, "bottom-left": (rows - 1) * cols, "bottom-right": rows * cols - 1}
-    corner_xy = {"top-right": corners_xy[1], "bottom-left": corners_xy[2], "bottom-right": corners_xy[3]}
+    corner_xy = {"top-right": used[1], "bottom-left": used[2], "bottom-right": used[3]}
     corner_miss = {}
     for name, idx in corner_ids.items():
         miss = float(np.linalg.norm(points[idx] - corner_xy[name]))
@@ -1914,7 +1919,8 @@ def _generate_grid_prompts_by_growing(side: str, frame_bgr: np.ndarray, corners,
     meta = {
         "side": side, "cols": int(cols), "rows": int(rows),
         "detector": {"method": "nettrack.grid_grow", "candidates": int(len(detections))},
-        "assignment": {"method": "grid_grow", "corner_miss_px": corner_miss},
+        "assignment": {"method": "grid_grow", "corner_miss_px": corner_miss, "notes": grow_info["notes"],
+                       "corners_used": [[round(float(v), 1) for v in c] for c in used]},
         "assigned_detected": int(cols * rows - n_gap), "assigned_lattice": n_gap,
         "assigned_anchors": 0, "assigned_inferred": 0,
         "points": meta_points,

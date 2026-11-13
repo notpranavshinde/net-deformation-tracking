@@ -50,9 +50,27 @@ def test_missing_and_duplicate_markers():
     assert np.all(np.linalg.norm(points[missing] - truth[missing], axis=1) < 0.45 * 270.0)
 
 
+def test_reflected_top_row_and_missed_edge_marker():
+    """As in a real right camera view: the top row reflected in the water surface just above the net,
+    the automatic top corners on that reflection, and a marker on the right edge not detected."""
+    truth = bulged_net()
+    top = truth[:12]
+    reflection = top + (top - truth[12:24]) * 0.55  # mirrored above the top row, compressed
+    det = np.vstack([np.delete(truth, [119], axis=0), reflection])
+    corners = np.array([reflection[0], reflection[11], truth[132], truth[143]])
+    info = {}
+    points, gap = grow_grid(det, corners, 12, 12, info)
+    assert np.flatnonzero(gap).tolist() == [119], np.flatnonzero(gap)
+    ok = ~gap
+    assert np.allclose(points[ok], truth[ok])
+    assert np.allclose(info["corners"][:2], truth[[0, 11]])
+    assert any("reflection" in note for note in info["notes"]), info["notes"]
+
+
 def main():
     test_bulged_net_labels()
     test_missing_and_duplicate_markers()
+    test_reflected_top_row_and_missed_edge_marker()
     print("nettrack grid-grow tests passed")
 
 
