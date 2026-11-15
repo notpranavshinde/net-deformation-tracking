@@ -13,6 +13,13 @@ from dataclasses import dataclass
 from multiprocessing import Manager
 from typing import List, Tuple, Optional
 
+# OpenCV's implicit OpenCL path makes every detection worker open a GPU context: on a busy
+# shared box that halves the speed and fails with "can't create cl_mem handle" or
+# CL_MEM_OBJECT_ALLOCATION_FAILURE. cv2.ocl.setUseOpenCL(False) only covers the calling thread,
+# not OpenCV's own worker threads, so switch OpenCL off for the whole process before cv2 loads
+# (worker processes inherit it).
+os.environ.setdefault("OPENCV_OPENCL_DEVICE", "disabled")
+
 import cv2
 import numpy as np
 from rich.progress import (
@@ -24,8 +31,6 @@ from rich.progress import (
     TimeRemainingColumn,
 )
 
-# OpenCV's implicit OpenCL path makes every detection worker open a GPU context: on a busy
-# shared box that halves the speed and can fail with CL_MEM_OBJECT_ALLOCATION_FAILURE.
 cv2.ocl.setUseOpenCL(False)
 
 
