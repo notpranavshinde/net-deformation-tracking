@@ -1084,7 +1084,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     run = sub.add_parser("run", help="Start remote processing detached.")
     add_queue_arg(run)
-    run.add_argument("--tracker", choices=TRACKERS, default="sam2", help="Marker tracker for the 2D stage (default sam2).")
+    run.add_argument("--tracker", choices=TRACKERS, default="cotracker3", help="Marker tracker for the 2D stage (default cotracker3; sam2 for the old tracker).")
     run.add_argument("--gpu", type=int, help="With --tracker cotracker3: GPU index to use (default: first visible).")
     run.add_argument("--dry-run", action="store_true", help="Print launch commands without starting remote processing.")
     run.set_defaults(func=cmd_run)
