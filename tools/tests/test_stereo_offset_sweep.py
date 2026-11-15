@@ -139,8 +139,43 @@ def test_still_pair_scoring_and_selection_order():
     assert [item.frame_idx for item in base] == [10]
 
 
+def test_offset_estimate_from_board_visibility():
+    # The board is in view in bursts; LEFT sees each burst 35 source frames earlier than RIGHT.
+    rng = np.random.default_rng(0)
+    right = sorted({int(f) for start in (300, 420, 560, 700) for f in range(start, start + rng.integers(40, 80))})
+    right = [f for f in right if rng.random() > 0.1]  # some frames missed
+    left = [f - 35 for f in right if rng.random() > 0.1]
+    offset, margin = stereo.estimate_offset_from_detections(left, right)
+    assert offset == -35, offset
+    assert margin > 0
+    # Same sign as the trims: pairing with trim_left - trim_right == offset lines the bursts up.
+    trim_left, trim_right = stereo.shifted_trims_for_stereo_offset(0, 0, offset)
+    pairs = stereo.build_paired_indices_from_stats(trim_left, trim_right, left, right)
+    assert pairs and all(r - l == 35 for l, r in pairs)
+    assert stereo.estimate_offset_from_detections([], right) == (None, 0.0)
+
+
+def test_queue_detects_quality_gate_failure_in_last_run():
+    spec = importlib.util.spec_from_file_location("run_pipeline_queue", ROOT / "run_pipeline_queue.py")
+    queue = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(queue)
+    temp_root = ROOT / "tools" / "tests" / "_tmp"
+    temp_root.mkdir(parents=True, exist_ok=True)
+    log = temp_root / "stereo_gate.log"
+    try:
+        log.write_text("$ python stereo_checker_debug.py stereo\n[STEREO] *** QUALITY GATE FAILED ***\n")
+        assert queue.stereo_failed_quality_gate(log)
+        log.write_text(log.read_text() + "$ python stereo_checker_debug.py stereo\nFileNotFoundError: mono.npz\n")
+        assert not queue.stereo_failed_quality_gate(log)  # only the last run counts
+        assert not queue.stereo_failed_quality_gate(temp_root / "missing.log")
+    finally:
+        log.unlink(missing_ok=True)
+
+
 def main():
     test_pairing_shift_sign_convention()
+    test_offset_estimate_from_board_visibility()
+    test_queue_detects_quality_gate_failure_in_last_run()
     test_sync_sweep_update_round_trip()
     test_subframe_interpolation_sign_and_planted_tau_recovery()
     test_subframe_interpolation_rejects_corner_order_flip()

@@ -1309,6 +1309,36 @@ def shifted_trims_for_stereo_offset(trimL: int, trimR: int, offset_delta: int) -
     return max(offset_left_minus_right, 0), max(-offset_left_minus_right, 0)
 
 
+def estimate_offset_from_detections(left_pos: List[int], right_pos: List[int],
+                                    max_lag: int = 600) -> Tuple[Optional[int], float]:
+    """LEFT-minus-RIGHT source-frame offset that best lines up when each camera sees the board.
+
+    The board enters and leaves view at the same moments in both cameras, so the detected-frame
+    sequences line up at the true offset (no calibration needed). Returns (offset, margin): margin
+    is how much better the best lag scores than the best lag more than 5 frames away from it,
+    as a fraction of the best score.
+    """
+    if not left_pos or not right_pos:
+        return None, 0.0
+    n = max(max(left_pos), max(right_pos)) + 1
+    a = np.zeros(n)
+    b = np.zeros(n)
+    a[list(left_pos)] = 1.0
+    b[list(right_pos)] = 1.0
+    a -= a.mean()
+    b -= b.mean()
+    lags = np.arange(-min(max_lag, n - 1), min(max_lag, n - 1) + 1)
+    scores = np.array([
+        float(np.dot(a[max(0, k):n + min(0, k)], b[max(0, -k):n - max(0, k)])) for k in lags
+    ])
+    best = int(np.argmax(scores))
+    if scores[best] <= 0:
+        return None, 0.0
+    far = np.abs(lags - lags[best]) > 5
+    runner_up = float(scores[far].max()) if far.any() else 0.0
+    return int(lags[best]), float((scores[best] - runner_up) / scores[best])
+
+
 def update_sync_after_stereo_sweep(sync_path: str,
                                   offset_delta: int,
                                   rms_by_offset: dict,
@@ -2573,6 +2603,15 @@ def cmd_stereo(args):
         right_stats_path = os.path.join(stats_dir, "stats_right.json")
         left_pos = load_positive_indices(left_stats_path)
         right_pos = load_positive_indices(right_stats_path)
+        if args.offset_sweep_auto:
+            estimate, margin = estimate_offset_from_detections(left_pos, right_pos)
+            needed = 0 if estimate is None else abs(estimate - (trimL - trimR))
+            args.offset_sweep = int(min(400, max(int(args.offset_sweep), needed + 10, 15)))
+            print(
+                f"[STEREO] Auto offset sweep: board visibility puts LEFT-minus-RIGHT at "
+                f"{estimate if estimate is not None else 'unknown'} frame(s) (margin {margin:.2f}); "
+                f"current sync has {trimL - trimR}. Sweeping +-{args.offset_sweep}."
+            )
         if args.offset_sweep > 0:
             best_delta, rms_by_offset, usable_pairs_by_offset = run_stereo_offset_sweep(
                 args, trimL, trimR, left_pos, right_pos, totalL, totalR, raw_image_sizeL,
@@ -3011,6 +3050,9 @@ def main():
                     help="Directory containing stats_left.json and stats_right.json")
     sp.add_argument("--offset-sweep", type=int, default=0,
                     help="Test LEFT-minus-RIGHT sync adjustments in [-N, +N]; 0 disables the sweep")
+    sp.add_argument("--offset-sweep-auto", action="store_true",
+                    help="Size the offset sweep to reach the offset implied by when each camera sees the "
+                         "board (stats detections); at least --offset-sweep, at most 400 frames")
     sp.add_argument("--sweep-pairs", type=int, default=12,
                     help="Maximum evenly spaced pairs to calibrate per sweep offset")
     sp.add_argument("--sweep-scale", type=float, default=0.25,

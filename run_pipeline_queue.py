@@ -1982,6 +1982,23 @@ def calibration_command(calibration, stage_name):
     return command
 
 
+def stereo_failed_quality_gate(log_path):
+    """True when the last stereo run in this log stopped at the RMS quality gate."""
+    try:
+        text = Path(log_path).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+    last_run = text.rsplit("stereo_checker_debug.py", 1)[-1]
+    return "QUALITY GATE FAILED" in last_run
+
+
+def file_sha256(path):
+    try:
+        return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+    except OSError:
+        return None
+
+
 def prepare_calibration(manifest_path, manifest, stage_names=None):
     calibration = manifest["preprocessing"]["calibration"]
     stage_names = tuple(stage_names or ("sync", "stats", "mono", "stereo"))
@@ -2009,6 +2026,30 @@ def prepare_calibration(manifest_path, manifest, stage_names=None):
             logs_dir / f"{stage_name}.log",
         )
         outputs = calibration_stage_outputs(calibration, stage_name)
+        if (
+            return_code != 0
+            and stage_name == "stereo"
+            and not stage.get("auto_offset_sweep")
+            and stereo_failed_quality_gate(logs_dir / "stereo.log")
+        ):
+            # A failed RMS gate is nearly always a wrong sync offset. Sweep once, with a range wide
+            # enough to reach the offset implied by when each camera sees the board; if the sweep
+            # corrects sync.json, stats/mono/stereo are redone with it on the pass below.
+            print(
+                "\n[CALIBRATION] Stereo RMS failed the quality gate; checking the sync offset "
+                "with an automatic offset sweep."
+            )
+            stage["auto_offset_sweep"] = utc_now()
+            save_manifest(manifest_path, manifest)
+            sync_before = file_sha256(Path(calibration["sync_json"]))
+            return_code = run_logged(
+                [*calibration_command(calibration, stage_name), "--offset-sweep-auto"],
+                REPO_ROOT / "calibration",
+                logs_dir / f"{stage_name}.log",
+            )
+            if file_sha256(Path(calibration["sync_json"])) != sync_before:
+                print("[CALIBRATION] The sweep corrected the sync offset; redoing stats, mono and stereo with it.")
+                return prepare_calibration(manifest_path, manifest, stage_names)
         if return_code == 0 and all(
             path.is_file() and path.stat().st_size > 0 for path in outputs
         ):
