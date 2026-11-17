@@ -202,8 +202,13 @@ def run_command(
         return CommandResult(124, exc.stdout or "", exc.stderr or f"Timed out after {timeout}s")
 
 
+# Give up on a connection that never opens, or that goes silent, instead of waiting forever.
+# ssh keeps the first value it sees for an option, so the configured extra args still win.
+SSH_LIVENESS_ARGS = ["-o", "ConnectTimeout=20", "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=4"]
+
+
 def ssh_command(config: dict, remote_shell: str, *, tty: bool = False) -> list[str]:
-    command = ["ssh", *config.get("ssh_extra_args", [])]
+    command = ["ssh", *config.get("ssh_extra_args", []), *SSH_LIVENESS_ARGS]
     if tty:
         command.append("-t")
     command.extend([config["host"], remote_shell])
@@ -234,7 +239,7 @@ def scp_command(config: dict, source: str, dest: str) -> list[str]:
     extra_args = config.get("scp_extra_args")
     if extra_args is None:
         extra_args = derive_scp_args(config.get("ssh_extra_args", []))
-    return ["scp", *extra_args, source, dest]
+    return ["scp", *extra_args, *SSH_LIVENESS_ARGS, source, dest]
 
 
 def remote_shell(config: dict, command: str) -> str:

@@ -163,9 +163,16 @@ def test_queue_detects_quality_gate_failure_in_last_run():
     temp_root.mkdir(parents=True, exist_ok=True)
     log = temp_root / "stereo_gate.log"
     try:
-        log.write_text("$ python stereo_checker_debug.py stereo\n[STEREO] *** QUALITY GATE FAILED ***\n")
-        assert queue.stereo_failed_quality_gate(log)
-        log.write_text(log.read_text() + "$ python stereo_checker_debug.py stereo\nFileNotFoundError: mono.npz\n")
+        log.write_text(
+            "\n[2026-11-15T23:11:38+00:00] $ python stereo_checker_debug.py stereo\n"
+            "[STEREO] *** QUALITY GATE FAILED ***\n"
+            "Traceback (most recent call last):\n"
+            '  File "/repo/calibration/stereo_checker_debug.py", line 2898, in cmd_stereo\n'
+            "RuntimeError: [STEREO] Final stereo RMS failed the quality gate.\n"
+        )
+        assert queue.stereo_failed_quality_gate(log)  # the traceback names the script too
+        log.write_text(log.read_text() + "\n[2026-11-15T23:20:00+00:00] $ python stereo_checker_debug.py stereo\n"
+                       "FileNotFoundError: mono.npz\n")
         assert not queue.stereo_failed_quality_gate(log)  # only the last run counts
         assert not queue.stereo_failed_quality_gate(temp_root / "missing.log")
     finally:

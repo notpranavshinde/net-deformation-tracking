@@ -208,8 +208,8 @@ def test_configure_remote_video_roots():
     finally:
         remote.run_command = original_run_command
 
-    assert captured["command"][:4] == ["ssh", "-i", "gpu-key", "gpu-box"]
-    assert captured["command"][4].startswith("cd /remote/repo && python3 -c ")
+    assert captured["command"][:-1] == ["ssh", "-i", "gpu-key", *remote.SSH_LIVENESS_ARGS, "gpu-box"]
+    assert captured["command"][-1].startswith("cd /remote/repo && python3 -c ")
     assert json.loads(captured["input_text"]) == {
         "video_roots": ["/data/videos", "/mnt/archive"]
     }
@@ -243,6 +243,7 @@ def test_scp_command_honors_explicit_extra_args():
         "2200",
         "-o",
         "Compression=no",
+        *remote.SSH_LIVENESS_ARGS,
         "source",
         "dest",
     ]

@@ -1988,7 +1988,7 @@ def stereo_failed_quality_gate(log_path):
         text = Path(log_path).read_text(encoding="utf-8", errors="replace")
     except OSError:
         return False
-    last_run = text.rsplit("stereo_checker_debug.py", 1)[-1]
+    last_run = text.rsplit("] $ ", 1)[-1]  # run_logged starts each run with "[<time>] $ <command>"
     return "QUALITY GATE FAILED" in last_run
 
 
