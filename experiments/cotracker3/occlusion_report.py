@@ -12,7 +12,7 @@ while visible knots are snapped to the marker. Written to ``<result>/occlusion/`
                          camera: when, how long, the reappearance gap and the 3D error
   summary.json           the totals: hidden share by camera and row, stretch lengths,
                          reappearance gaps, 3D error with both / one / no camera seeing the knot
-  occlusion_timeline.png hidden knot-frames over time, both cameras
+  occlusion_timeline.png hidden knot-frames over time, both cameras on the stereo frame axis
 
 Reappearance gap: the distance from the model's guess on the last hidden frame to the snapped
 marker on the next frame (knots normally move a few px per frame; ``normal_step_px`` in the
@@ -144,6 +144,7 @@ def write_report(result_dir: Path, tracks_dir: Path) -> Path:
             "normal_step_px": stats(np.hypot(steps.u, steps.v)[both_vis]),
             "refine_radius_px": radius,
             "first_source_frame": first_source,
+            "track_frame_minus_gframe": int((tri[f"frame_{s}"] - tri.gframe).median()),
         }
     knot.to_csv(out / "knot_frames.csv", index=False)
 
@@ -186,14 +187,19 @@ def write_report(result_dir: Path, tracks_dir: Path) -> Path:
     for ax, side in zip(axes, SIDES):
         t = tracks[side]
         hid = (t.pivot(index="obj_id", columns="frame", values="visible") == 0).reindex(range(GRID * GRID))
-        ax.imshow(hid.to_numpy(dtype=float), aspect="auto", interpolation="nearest", cmap=cmap, vmin=0, vmax=1)
+        shift = cameras[side]["track_frame_minus_gframe"]  # plot on the stereo frame axis so both panels line up
+        x0, x1 = hid.columns.min() - shift - 0.5, hid.columns.max() - shift + 0.5
+        ax.imshow(hid.to_numpy(dtype=float), aspect="auto", interpolation="nearest", cmap=cmap, vmin=0, vmax=1,
+                  extent=(x0, x1, GRID * GRID - 0.5, -0.5))
+        ax.set_xlim(tri.gframe.min() - 0.5, tri.gframe.max() + 0.5)
         for r in range(1, GRID):
             ax.axhline(r * GRID - 0.5, color="#ffffff", lw=0.6)
         ax.set_yticks([r * GRID + GRID / 2 - 0.5 for r in range(GRID)], [f"row {r}" for r in range(GRID)], fontsize=7)
         c = cameras[side]
         ax.set_title(f"{side} camera: hidden (blue) {c['hidden_pct']:.1f}% of knot-frames, "
                      f"{c['stretches']} hidden stretches", fontsize=10, loc="left")
-        ax.set_xlabel(f"track frame (video frame = {c['first_source_frame']} + track frame)")
+        ax.set_xlabel(f"stereo frame (gframe); {side} video frame = gframe + "
+                      f"{c['first_source_frame'] + c['track_frame_minus_gframe']}")
     fig.suptitle(f"CoTracker3 visibility, {result_dir.name}", fontsize=11)
     plt.tight_layout()
     fig.savefig(out / "occlusion_timeline.png", dpi=120)
