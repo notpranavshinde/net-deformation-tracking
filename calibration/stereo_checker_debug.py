@@ -1391,6 +1391,8 @@ def update_sync_after_stereo_sweep(sync_path: str,
         sync.pop("subframe_offset", None)
         sync.pop("subframe_sweep", None)
         sync.pop("subframe_offset_sign_convention", None)
+        sync.pop("subframe_offset_from_sweep", None)
+        sync.pop("subframe_offset_from_sweep_note", None)
         print(
             "[STEREO] Integer trim changed; cleared fractional subframe offset "
             "and sweep. Re-sweep the fractional offset."
@@ -1975,6 +1977,38 @@ def format_tau(tau: float) -> str:
     # The deduplication key has 0.01-frame precision; finer sweep steps are unsupported.
     value = 0.0 if np.isclose(float(tau), 0.0, atol=5e-10) else float(tau)
     return f"{value:.2f}"
+
+
+def fractional_offset_from_sweep(rms_by_offset: dict, best_delta: int) -> Optional[float]:
+    """Fraction of a frame between the best whole-frame offset and the true one.
+
+    With a moving board the sweep RMS grows about linearly either side of the true offset, so
+    the table is a V. A line through the two offsets left of the best one and a line through
+    the two right of it meet at the true offset. Returned relative to ``best_delta`` (positive
+    means LEFT lines up at f + fraction), or None when the table is too short there.
+    """
+    rms = {int(k): float(v) for k, v in rms_by_offset.items() if v is not None and np.isfinite(float(v))}
+    d = int(best_delta)
+    if not all(k in rms for k in (d - 2, d - 1, d + 1, d + 2)):
+        return None
+    left_slope = rms[d - 1] - rms[d - 2]     # per frame, negative on the falling arm
+    right_slope = rms[d + 2] - rms[d + 1]    # positive on the rising arm
+    if left_slope >= 0 or right_slope <= 0:
+        return None
+    # rms[d-1] + left_slope * (x - (d-1)) == rms[d+1] + right_slope * (x - (d+1))
+    x = (rms[d + 1] - rms[d - 1] + left_slope * (d - 1) - right_slope * (d + 1)) / (left_slope - right_slope)
+    return float(np.clip(x - d, -0.5, 0.5))
+
+
+def record_fractional_offset(sync_path: str, fraction: float) -> None:
+    """Store the fraction for triangulation; the calibration itself stays on whole frames."""
+    sync = load_sync_json(sync_path)
+    sync["subframe_offset_from_sweep"] = round(float(fraction), 3)
+    sync["subframe_offset_from_sweep_note"] = (
+        "fraction of a frame from the V of the offset-sweep table; positive means LEFT frame f lines "
+        "up with RIGHT at f + fraction. Triangulation shifts LEFT tracks by it."
+    )
+    write_json(sync_path, sync)
 
 
 def update_sync_after_subframe_sweep(sync_path: str, tau: float,
@@ -2663,6 +2697,14 @@ def cmd_stereo(args):
                 )
             elif best_delta == 0:
                 print("[STEREO] Sweep confirms the existing sync trim; no sync JSON changes made.")
+            if best_delta is not None and abs(best_delta) < int(args.offset_sweep):
+                fraction = fractional_offset_from_sweep(rms_by_offset, best_delta)
+                if fraction is not None:
+                    record_fractional_offset(args.sync, fraction)
+                    print(
+                        f"[STEREO] The cameras are {fraction:+.2f} frame off the whole-frame sync "
+                        "(from the sweep table); triangulation will shift LEFT tracks by it."
+                    )
 
         paired_indices = filtered_stats_pairs(
             trimL, trimR, left_pos, right_pos,

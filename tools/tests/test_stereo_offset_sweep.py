@@ -162,6 +162,17 @@ def test_audio_sync_ignores_a_sound_only_one_camera_heard():
     assert result["windows_agreeing"] >= result["windows"] // 2
 
 
+def test_fraction_from_sweep_table_v():
+    # A V with its tip at -0.53: the whole-frame best is -1, so the fraction is +0.47.
+    table = {str(d): 0.3 + 1.2 * abs(d + 0.53) for d in range(-5, 6)}
+    assert abs(stereo.fractional_offset_from_sweep(table, -1) - 0.47) < 1e-9
+    centred = {str(d): 0.3 + 1.2 * abs(d) for d in range(-5, 6)}
+    assert abs(stereo.fractional_offset_from_sweep(centred, 0)) < 1e-9
+    assert stereo.fractional_offset_from_sweep(table, -4) is None  # no second point past the best
+    flat = {str(d): 1.0 for d in range(-5, 6)}
+    assert stereo.fractional_offset_from_sweep(flat, 0) is None
+
+
 def test_offset_estimate_from_board_visibility():
     # The board is in view in bursts; LEFT sees each burst 35 source frames earlier than RIGHT.
     rng = np.random.default_rng(0)
@@ -176,6 +187,57 @@ def test_offset_estimate_from_board_visibility():
     pairs = stereo.build_paired_indices_from_stats(trim_left, trim_right, left, right)
     assert pairs and all(r - l == 35 for l, r in pairs)
     assert stereo.estimate_offset_from_detections([], right) == (None, 0.0)
+
+
+def test_queue_keeps_stats_and_mono_after_a_small_sweep_correction():
+    spec = importlib.util.spec_from_file_location("run_pipeline_queue_keep", ROOT / "run_pipeline_queue.py")
+    queue = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(queue)
+    tmp = ROOT / "tools" / "tests" / "_tmp" / "queue_keep"
+    import shutil
+    shutil.rmtree(tmp, ignore_errors=True)
+    (tmp / "stats").mkdir(parents=True)
+    try:
+        calibration = {
+            "mode": "generated", "work_dir": str(tmp), "sync_json": str(tmp / "sync.json"),
+            "stats_dir": str(tmp / "stats"), "mono_npz": str(tmp / "mono.npz"),
+            "stereo_npz": str(tmp / "stereo.npz"), "settings": {},
+            "stages": {name: {"status": "pending"} for name in ("sync", "stats", "mono", "stereo")},
+        }
+        manifest = {"preprocessing": {"calibration": calibration}}
+        (tmp / "sync.json").write_text(json.dumps({"trim_left": 1, "trim_right": 0}))
+        for name in ("stats/stats_left.json", "stats/stats_right.json", "mono.npz", "mono_report.json"):
+            (tmp / name).write_text("x")
+
+        def fingerprint(manifest_, stage_name):  # stands in for the video/settings hash
+            deps = {"sync": [], "stats": ["sync"], "mono": ["sync", "stats"], "stereo": ["sync", "stats", "mono"]}
+            return "|".join(queue.file_sha256(p_) or "-" for d in deps[stage_name]
+                            for p_ in queue.calibration_stage_outputs(calibration, d))
+
+        calls = []
+
+        def run_logged(command, cwd, log_path, use_pty=True):
+            stage = command[2]
+            calls.append(stage)
+            if stage == "stereo":  # the sweep moves the sync by one frame and records a fraction
+                (tmp / "sync.json").write_text(json.dumps(
+                    {"trim_left": 0, "trim_right": 0, "subframe_offset_from_sweep": 0.47}))
+                (tmp / "stereo.npz").write_text("x")
+                (tmp / "stereo_report.json").write_text("x")
+            return 0
+
+        queue.calibration_stage_fingerprint = fingerprint
+        queue.calibration_command = lambda calibration_, stage_name: ["python", "x.py", stage_name]
+        queue.run_logged = run_logged
+        queue.save_manifest = lambda *a, **k: None
+        for name in ("sync", "stats", "mono"):
+            calibration["stages"][name].update({"status": "complete", "fingerprint": fingerprint(manifest, name)})
+
+        assert queue.prepare_calibration(tmp / "m.json", manifest)
+        assert calls == ["stereo"], calls  # no rescan of stats or mono
+        assert all(queue.calibration_stage_complete(manifest, n) for n in ("sync", "stats", "mono", "stereo"))
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 def test_queue_detects_quality_gate_failure_in_last_run():
@@ -205,8 +267,10 @@ def test_queue_detects_quality_gate_failure_in_last_run():
 def main():
     test_pairing_shift_sign_convention()
     test_offset_estimate_from_board_visibility()
+    test_fraction_from_sweep_table_v()
     test_audio_sync_ignores_a_sound_only_one_camera_heard()
     test_queue_detects_quality_gate_failure_in_last_run()
+    test_queue_keeps_stats_and_mono_after_a_small_sweep_correction()
     test_sync_sweep_update_round_trip()
     test_subframe_interpolation_sign_and_planted_tau_recovery()
     test_subframe_interpolation_rejects_corner_order_flip()

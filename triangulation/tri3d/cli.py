@@ -15,7 +15,7 @@ from .io_tracks import (
     load_track_csv,
     write_triangulation_csv,
 )
-from .matching import match_frame_observations
+from .matching import match_frame_observations, shift_track_subframe
 from .syncmap import detect_sync_from_videos, load_calibration_sync
 from .triangulate import triangulate_observations
 from .viz_scene import visualize_existing_rows
@@ -183,6 +183,15 @@ def main(argv: Sequence[str] | None = None) -> None:
     left_drop, right_drop, sync_info = _resolve_sync(args)
     left = load_track_csv(args.left, args.quality_min)
     right = load_track_csv(args.right, args.quality_min)
+    tau = float(sync_info.get("subframe_offset", 0.0) or 0.0)
+    if abs(tau) >= 0.1:  # below a tenth of a frame the shift is not worth dropping track ends
+        before = len(left)
+        left = shift_track_subframe(left, tau)
+        sync_info["left_tracks_shifted_by_frames"] = tau
+        print(
+            f"[INFO] Subframe sync: LEFT positions moved {tau:+.2f} frame along each track "
+            f"({before - len(left)} of {before} observations had no neighbouring frame)"
+        )
     keys, left_keyed, right_keyed = match_frame_observations(left, right, left_drop, right_drop)
     print(f"[INFO] Matched observations: {len(keys)}")
     rows, errors = triangulate_observations(

@@ -420,6 +420,14 @@ def signatures_match(recorded, current, require_video_meta=True):
     return True
 
 
+def sync_trim_difference(path):
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+        return int(data["trim_left"]) - int(data["trim_right"])
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
 def file_sha256(path):
     p = Path(path)
     h = hashlib.sha256()
@@ -1976,7 +1984,8 @@ def calibration_command(calibration, stage_name):
             *workers,
             "--reuse-stats-indices", "true",
             "--stats-dir", calibration["stats_dir"],
-            # Audio sync is good to a few frames; the board pins down the exact one.
+            # Audio sync is good to a few frames; the board pins down the exact one and the
+            # fraction of a frame left over (used by triangulation).
             "--offset-sweep", str(STEREO_OFFSET_SWEEP),
         ])
     else:
@@ -1995,6 +2004,14 @@ def stereo_failed_quality_gate(log_path):
         return False
     last_run = text.rsplit("] $ ", 1)[-1]  # run_logged starts each run with "[<time>] $ <command>"
     return "QUALITY GATE FAILED" in last_run
+
+
+def sync_trim_difference(path):
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+        return int(data["trim_left"]) - int(data["trim_right"])
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
 
 
 def file_sha256(path):
@@ -2026,6 +2043,7 @@ def prepare_calibration(manifest_path, manifest, stage_names=None, sync_redos=0)
         stage.update({"status": "running", "started_at": utc_now(), "error": None})
         save_manifest(manifest_path, manifest)
         sync_before = file_sha256(Path(calibration["sync_json"]))
+        trims_before = sync_trim_difference(calibration["sync_json"])
         return_code = run_logged(
             calibration_command(calibration, stage_name),
             REPO_ROOT / "calibration",
@@ -2052,6 +2070,34 @@ def prepare_calibration(manifest_path, manifest, stage_names=None, sync_redos=0)
                 REPO_ROOT / "calibration",
                 logs_dir / f"{stage_name}.log",
             )
+        shift = None
+        if trims_before is not None and sync_trim_difference(calibration["sync_json"]) is not None:
+            shift = sync_trim_difference(calibration["sync_json"]) - trims_before
+        if (
+            stage_name == "stereo"
+            and return_code == 0
+            and file_sha256(Path(calibration["sync_json"])) != sync_before
+            and shift is not None
+            and abs(shift) <= STEREO_OFFSET_SWEEP
+            and all(path.is_file() and path.stat().st_size > 0 for path in outputs)
+        ):
+            # Stats hold board detections by video frame and mono is per camera, so a small sync
+            # change leaves both valid (at most a few frames at the clip start go unscanned), and
+            # stereo already calibrated with the new sync. Record that instead of rescanning.
+            print(
+                f"[CALIBRATION] Stereo moved the sync by {shift:+d} frame(s) or recorded the fraction of a "
+                "frame; the board detections are by video frame and mono is per camera, so stats and "
+                "mono are kept as they are."
+            )
+            for name in ("stats", "mono", "stereo"):
+                calibration["stages"][name].update({
+                    "status": "complete",
+                    "completed_at": utc_now(),
+                    "error": None,
+                    "fingerprint": calibration_stage_fingerprint(manifest, name),
+                })
+            save_manifest(manifest_path, manifest)
+            continue
         if stage_name != "sync" and file_sha256(Path(calibration["sync_json"])) != sync_before and sync_redos < 2:
             print("[CALIBRATION] The sweep corrected the sync offset; redoing stats, mono and stereo with it.")
             return prepare_calibration(manifest_path, manifest, stage_names, sync_redos + 1)

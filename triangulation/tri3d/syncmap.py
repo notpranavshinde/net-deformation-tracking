@@ -266,4 +266,10 @@ def load_calibration_sync(sync_json_path: str) -> tuple[int, int, dict[str, Any]
     for key in ("left_flash", "right_flash", "left_reason", "right_reason", "scale"):
         if key in data:
             info[key] = data[key]
+    # Fraction of a frame from the stereo subframe sweep: LEFT is sampled at frame + subframe_offset.
+    # Fraction of a frame: LEFT frame f lines up with RIGHT at f + fraction. From the stereo
+    # subframe sweep when it was run, else from the V of the whole-frame offset sweep.
+    fraction = float(data.get("subframe_offset", 0.0) or data.get("subframe_offset_from_sweep", 0.0) or 0.0)
+    if fraction != 0.0:
+        info["subframe_offset"] = fraction
     return left_drop, right_drop, info
