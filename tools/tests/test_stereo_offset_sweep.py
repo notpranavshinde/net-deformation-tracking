@@ -139,6 +139,29 @@ def test_still_pair_scoring_and_selection_order():
     assert [item.frame_idx for item in base] == [10]
 
 
+def test_audio_sync_ignores_a_sound_only_one_camera_heard():
+    # 30 s of noise; the same 6 knocks in both tracks, LEFT hears each 1.2 s (about 36 frames)
+    # later in its own recording. RIGHT alone has a much louder sound near its start.
+    rate, fps, seconds, lag_s = 16000, 30000 / 1001, 30, 1.2
+    rng = np.random.default_rng(1)
+    left = rng.normal(0, 300, rate * seconds).astype(np.float32)
+    right = rng.normal(0, 300, rate * seconds).astype(np.float32)
+    knock = (rng.normal(0, 1, 800) * np.exp(-np.arange(800) / 150) * 6000).astype(np.float32)
+    for t in (3.0, 7.5, 11.0, 16.2, 21.7, 26.0):
+        r0 = int(t * rate)
+        right[r0:r0 + 800] += knock
+        left[r0 + int(lag_s * rate):r0 + int(lag_s * rate) + 800] += knock * 0.7
+    right[int(0.7 * rate):int(0.7 * rate) + 800] += knock * 4  # start-up sound, RIGHT only
+
+    def audio(signal):
+        return {"audio_rate": rate, "video_fps": fps, "signal": signal}
+
+    result = stereo.estimate_audio_frame_offset(audio(left), audio(right))
+    assert abs(result["offset_frames"] - lag_s * fps) < 0.2, result
+    assert result["offset_left_minus_right"] == round(lag_s * fps)
+    assert result["windows_agreeing"] >= result["windows"] // 2
+
+
 def test_offset_estimate_from_board_visibility():
     # The board is in view in bursts; LEFT sees each burst 35 source frames earlier than RIGHT.
     rng = np.random.default_rng(0)
@@ -182,6 +205,7 @@ def test_queue_detects_quality_gate_failure_in_last_run():
 def main():
     test_pairing_shift_sign_convention()
     test_offset_estimate_from_board_visibility()
+    test_audio_sync_ignores_a_sound_only_one_camera_heard()
     test_queue_detects_quality_gate_failure_in_last_run()
     test_sync_sweep_update_round_trip()
     test_subframe_interpolation_sign_and_planted_tau_recovery()

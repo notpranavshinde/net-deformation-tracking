@@ -532,6 +532,7 @@ def extract_audio_envelope(
             "max_scan_frames": int(max_scan_frames),
             "frame_offset": int(start_frame),
             "env": env_smooth.astype(np.float32),
+            "signal": signal,
         }
     finally:
         try:
@@ -585,52 +586,74 @@ def find_audio_peak_candidates(env_smooth: np.ndarray,
     return selected
 
 
-def estimate_audio_frame_offset(left_audio: dict, right_audio: dict, max_lag_frames: int = 120):
-    """Estimate integer LEFT-minus-RIGHT lag from the complete audio envelopes."""
-    frame_count = min(
-        int(left_audio["max_scan_frames"]),
-        int(right_audio["max_scan_frames"]),
-    )
-    if frame_count < 3:
+def audio_onset_strength(signal: np.ndarray, audio_rate: int, hop_s: float = 0.001) -> np.ndarray:
+    """Rise in log loudness per 1 ms step: sharp sounds (the bang, a splash, a knock) stand out,
+    steady noise (motor, water) does not."""
+    hop = max(1, int(round(audio_rate * hop_s)))
+    n = len(signal) // hop
+    rms = np.sqrt(np.mean(np.square(signal[:n * hop].reshape(n, hop), dtype=np.float64), axis=1))
+    loud = np.log1p(rms)
+    rise = np.maximum(np.diff(loud, prepend=loud[:1]), 0.0)
+    return rise - rise.mean()
+
+
+def _onset_xcorr(left: np.ndarray, right: np.ndarray, max_lag: int):
+    """Correlation of left[t + lag] with right[t] for lag in [-max_lag, max_lag]."""
+    size = 1 << int(np.ceil(np.log2(len(left) + len(right))))
+    cc = np.fft.irfft(np.fft.rfft(left, size) * np.conj(np.fft.rfft(right, size)), size)
+    lags = np.arange(-max_lag, max_lag + 1)
+    return lags, cc[lags % size]
+
+
+def estimate_audio_frame_offset(left_audio: dict, right_audio: dict, max_lag_s: float = 10.0,
+                                window_s: float = 8.0):
+    """LEFT-minus-RIGHT frame offset from the sharp sounds both cameras heard.
+
+    Both soundtracks are reduced to onset strength at 1 ms and cross-correlated, so a bang or
+    knock heard by both lines up to the millisecond while steady noise adds little. A sound only
+    one camera recorded (its own start-up beep, handling) cannot line up with anything. The
+    clip is also cut into overlapping stretches that are each matched on their own; the share
+    that agree with the overall offset (within one frame) says how much to trust it.
+    """
+    rate = int(left_audio["audio_rate"])
+    if int(right_audio["audio_rate"]) != rate:
+        raise RuntimeError("[SYNC] Left and right audio were extracted at different rates.")
+    fps = float(left_audio["video_fps"])
+    left = audio_onset_strength(left_audio["signal"], rate)
+    right = audio_onset_strength(right_audio["signal"], rate)
+    steps_per_s = 1000
+    n = min(len(left), len(right))
+    if n < 3 * steps_per_s:
         raise RuntimeError("[SYNC] Audio range is too short for correlation sync.")
+    max_lag = int(min(max_lag_s * steps_per_s, n // 2))
+    one_frame = steps_per_s / fps
 
-    def sample_per_frame(audio):
-        env = np.asarray(audio["env"], dtype=np.float64)
-        audio_rate = float(audio["audio_rate"])
-        video_fps = float(audio["video_fps"])
-        sample_indices = np.rint(
-            (np.arange(frame_count, dtype=np.float64) + 0.5) * audio_rate / video_fps
-        ).astype(np.int64)
-        sample_indices = np.clip(sample_indices, 0, len(env) - 1)
-        values = np.log1p(env[sample_indices])
-        values -= np.mean(values)
-        std = float(np.std(values))
-        if std <= 1e-12:
-            raise RuntimeError("[SYNC] Audio envelope has no usable variation.")
-        return values / std
+    lags, vals = _onset_xcorr(left, right, max_lag)
+    best = int(np.argmax(vals))
+    best_lag = int(lags[best])
+    away = np.abs(lags - best_lag) > max(100, 3 * one_frame)
+    runner_up = float(vals[away].max()) if away.any() else float("nan")
+    peak_ratio = float(vals[best] / runner_up) if runner_up > 0 else float("inf")
 
-    left_values = sample_per_frame(left_audio)
-    right_values = sample_per_frame(right_audio)
-    max_lag = min(max(1, int(max_lag_frames)), frame_count // 3)
-    scores = {}
-    for lag in range(-max_lag, max_lag + 1):
-        if lag >= 0:
-            left_slice = left_values[lag:]
-            right_slice = right_values[:frame_count - lag]
-        else:
-            left_slice = left_values[:frame_count + lag]
-            right_slice = right_values[-lag:]
-        scores[lag] = float(np.mean(left_slice * right_slice))
-
-    ranked = sorted(scores.items(), key=lambda item: item[1], reverse=True)
-    best_lag, best_score = ranked[0]
-    runner_up_score = ranked[1][1] if len(ranked) > 1 else float("nan")
+    window = int(window_s * steps_per_s)
+    window_offsets = []
+    for start in range(0, max(1, len(right) - window + 1), window // 2):
+        masked = np.zeros_like(right)
+        masked[start:start + window] = right[start:start + window]
+        wl, wv = _onset_xcorr(left, masked, max_lag)
+        window_offsets.append(round(float(wl[int(np.argmax(wv))]) / one_frame, 2))
+    offset_frames = best_lag / one_frame
+    agree = sum(abs(o - offset_frames) <= 1.0 for o in window_offsets)
     return {
-        "offset_left_minus_right": int(best_lag),
-        "score": float(best_score),
-        "runner_up_score": float(runner_up_score),
-        "score_margin": float(best_score - runner_up_score),
-        "max_lag_frames": int(max_lag),
+        "method": "audio-onset-correlation-1ms",
+        "offset_left_minus_right": int(round(offset_frames)),
+        "offset_frames": round(float(offset_frames), 3),
+        "score": round(peak_ratio, 4),
+        "score_margin": round(peak_ratio - 1.0, 4),
+        "windows": len(window_offsets),
+        "windows_agreeing": int(agree),
+        "window_offsets_frames": window_offsets,
+        "max_lag_frames": int(round(max_lag / one_frame)),
     }
 
 
@@ -1146,9 +1169,10 @@ def cmd_sync(args):
 
         if len(candL) == 0 or len(candR) == 0:
             raise RuntimeError("[SYNC] No audio peak candidates found. Try increasing --max-frames.")
-        correlation = estimate_audio_frame_offset(left_audio, right_audio)
+        correlation = estimate_audio_frame_offset(left_audio, right_audio, max_lag_s=args.max_sync_lag_s)
         correlation_offset = int(correlation["offset_left_minus_right"])
-        low_confidence = correlation["score_margin"] < args.min_sync_margin
+        agreeing = correlation["windows_agreeing"] / max(1, correlation["windows"])
+        low_confidence = correlation["score_margin"] < args.min_sync_margin or agreeing < 0.5
 
         audio_preview_png = str(Path(args.out).with_suffix("")) + "_audio_peaks.png"
         try:
@@ -1179,15 +1203,18 @@ def cmd_sync(args):
         fR_guess = int(matched_right["frame_idx"])
         fL_guess = fR_guess + correlation_offset
         print(
-            f"[SYNC] Audio correlation guess: LEFT-RIGHT offset={correlation_offset} frame(s), "
-            f"score={correlation['score']:.3f}, margin={correlation['score_margin']:.3f}"
+            f"[SYNC] Audio correlation guess: LEFT-RIGHT offset={correlation_offset} frame(s) "
+            f"({correlation['offset_frames']:+.2f}), peak {correlation['score']:.2f}x the next best; "
+            f"{correlation['windows_agreeing']}/{correlation['windows']} stretches of the clip agree "
+            f"(each: {correlation['window_offsets_frames']})"
         )
         if low_confidence:
             print(
                 "\n[SYNC] *** LOW-CONFIDENCE AUDIO SYNC ***\n"
-                f"[SYNC] Correlation margin {correlation['score_margin']:.3f} is below "
-                f"--min-sync-margin {args.min_sync_margin:.3f}. Verify the offset; "
-                "run stereo with --offset-sweep before trusting this calibration.\n"
+                f"[SYNC] Peak margin {correlation['score_margin']:.3f} (need {args.min_sync_margin:.3f}) or "
+                f"{correlation['windows_agreeing']}/{correlation['windows']} stretches agreeing (need half). "
+                "Few sharp sounds were heard by both cameras. If you pick peaks by hand, pick the same "
+                "sound in both lists; stereo calibration will sweep the offset if its RMS fails.\n"
             )
         accept_guess = bool(args.accept_sync) or prompt_yes_no(
             "[SYNC] Accept this audio correlation sync guess?", default_yes=True
@@ -1195,8 +1222,10 @@ def cmd_sync(args):
         if args.accept_sync:
             print("[SYNC] Automatically accepted audio correlation offset.")
         if not accept_guess:
-            chooseL = prompt_audio_choice("LEFT", candL, default_rank=1)
-            chooseR = prompt_audio_choice("RIGHT", candR, default_rank=1)
+            # Default to the pair that agrees with the correlation, not simply the earliest peaks:
+            # the earliest is often one camera's own start-up sound, which the other never heard.
+            chooseL = prompt_audio_choice("LEFT", candL, default_rank=candL.index(matched_left) + 1)
+            chooseR = prompt_audio_choice("RIGHT", candR, default_rank=candR.index(matched_right) + 1)
             fL = int(candL[chooseL]["frame_idx"])
             fR = int(candR[chooseR]["frame_idx"])
             reasonL = f"audio-peak-candidate-{chooseL + 1}"
@@ -2970,8 +2999,11 @@ def main():
                     help="Sync mode: flash (brightness) or audio peak")
     sp.add_argument("--audio-sample-rate", type=int, default=16000,
                     help="Audio sample rate used for --sync-mode audio")
-    sp.add_argument("--min-sync-margin", type=float, default=0.05,
-                    help="Mark audio sync low-confidence when correlation margin is below this value")
+    sp.add_argument("--min-sync-margin", type=float, default=0.1,
+                    help="Mark audio sync low-confidence when the correlation peak is less than this "
+                         "much above the next best (0.1 = 10%%)")
+    sp.add_argument("--max-sync-lag-s", type=float, default=10.0,
+                    help="Largest start-time difference between the cameras to search, in seconds")
     sp.add_argument("--use-cuda", action="store_true", help="Use OpenCV CUDA ops when available; auto-fallback to CPU")
     sp.add_argument("--show-preview", action="store_true",
                     help="Open sync preview windows. By default previews are saved without being displayed.")

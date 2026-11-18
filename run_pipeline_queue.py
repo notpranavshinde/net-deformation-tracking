@@ -1976,10 +1976,15 @@ def calibration_command(calibration, stage_name):
             *workers,
             "--reuse-stats-indices", "true",
             "--stats-dir", calibration["stats_dir"],
+            # Audio sync is good to a few frames; the board pins down the exact one.
+            "--offset-sweep", str(STEREO_OFFSET_SWEEP),
         ])
     else:
         raise ValueError(f"Unknown calibration stage: {stage_name}")
     return command
+
+
+STEREO_OFFSET_SWEEP = 5  # frames either side of the audio sync that stereo always checks
 
 
 def stereo_failed_quality_gate(log_path):
@@ -1999,7 +2004,7 @@ def file_sha256(path):
         return None
 
 
-def prepare_calibration(manifest_path, manifest, stage_names=None):
+def prepare_calibration(manifest_path, manifest, stage_names=None, sync_redos=0):
     calibration = manifest["preprocessing"]["calibration"]
     stage_names = tuple(stage_names or ("sync", "stats", "mono", "stereo"))
     if calibration.get("mode") == "existing":
@@ -2020,6 +2025,7 @@ def prepare_calibration(manifest_path, manifest, stage_names=None):
             continue
         stage.update({"status": "running", "started_at": utc_now(), "error": None})
         save_manifest(manifest_path, manifest)
+        sync_before = file_sha256(Path(calibration["sync_json"]))
         return_code = run_logged(
             calibration_command(calibration, stage_name),
             REPO_ROOT / "calibration",
@@ -2041,15 +2047,14 @@ def prepare_calibration(manifest_path, manifest, stage_names=None):
             )
             stage["auto_offset_sweep"] = utc_now()
             save_manifest(manifest_path, manifest)
-            sync_before = file_sha256(Path(calibration["sync_json"]))
             return_code = run_logged(
                 [*calibration_command(calibration, stage_name), "--offset-sweep-auto"],
                 REPO_ROOT / "calibration",
                 logs_dir / f"{stage_name}.log",
             )
-            if file_sha256(Path(calibration["sync_json"])) != sync_before:
-                print("[CALIBRATION] The sweep corrected the sync offset; redoing stats, mono and stereo with it.")
-                return prepare_calibration(manifest_path, manifest, stage_names)
+        if stage_name != "sync" and file_sha256(Path(calibration["sync_json"])) != sync_before and sync_redos < 2:
+            print("[CALIBRATION] The sweep corrected the sync offset; redoing stats, mono and stereo with it.")
+            return prepare_calibration(manifest_path, manifest, stage_names, sync_redos + 1)
         if return_code == 0 and all(
             path.is_file() and path.stat().st_size > 0 for path in outputs
         ):
