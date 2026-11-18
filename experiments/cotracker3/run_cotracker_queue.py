@@ -16,6 +16,7 @@ repo root), so the queue's path handling and checks apply. SAM2 outputs and SAM2
 state are left alone:
   tracks   <run dir>/cotracker3/{left,right}/tracks_2d.csv
   results  <SAM2 result dir>_cotracker3/   e.g. triangulation/results/v_0.3mps_a_cotracker3
+           with occlusion/: how the model handled hidden knots (see occlusion_report.py)
 A finished run is skipped on resume; changing the videos, setup or tracker settings re-runs it.
 """
 
@@ -30,6 +31,8 @@ import sys
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))
+import occlusion_report  # noqa: E402
 TRACK_SCRIPT = HERE / "track_cotracker.py"
 TRACKER_META = "queue_cotracker_meta.json"
 TRACKER_VERSION = 1  # bump when track_cotracker.py output changes
@@ -166,6 +169,10 @@ def main() -> int:
         if not run_tracking(q, manifest, job, view, args, settings) or not q.run_triangulation(manifest_path, manifest, view):
             failed.append(job["velocity"])
             continue
+        try:
+            print(f"[OK] Occlusion report: {occlusion_report.write_report(Path(view['result_dir']), Path(view['sam2_out']))}")
+        except Exception as exc:  # the 3D result stands without it
+            print(f"[WARN] Occlusion report failed: {exc}")
         done.append(job["velocity"])
         print(f"[OK] Results: {view['result_dir']}")
 
