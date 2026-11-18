@@ -885,13 +885,13 @@ def _extract_orange_components(frame_bgr: np.ndarray,
         (weak_mask > 0).astype(np.uint8),
         connectivity=8,
     )
-    mask = np.zeros_like(weak_mask)
-    for label in range(1, weak_count):
-        component_pixels = weak_labels == label
-        area = int(weak_stats[label, cv2.CC_STAT_AREA])
-        strong_overlap = int(np.count_nonzero(strong_u8[component_pixels]))
-        if area >= 10 and strong_overlap >= max(3, int(round(area * 0.008))):
-            mask[component_pixels] = 255
+    # Keep weak components with enough strong seeds. Counted for all labels at once: comparing
+    # the whole frame against each label in turn took ~30 s on a 25 MP frame.
+    weak_area = weak_stats[:, cv2.CC_STAT_AREA]
+    strong_overlap = np.bincount(weak_labels[strong_u8 > 0], minlength=weak_count)
+    keep = (weak_area >= 10) & (strong_overlap >= np.maximum(3, np.round(weak_area * 0.008)))
+    keep[0] = False
+    mask = np.where(keep[weak_labels], 255, 0).astype(weak_mask.dtype)
 
     n_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(
         (mask > 0).astype(np.uint8),
@@ -908,10 +908,18 @@ def _extract_orange_components(frame_bgr: np.ndarray,
         if aspect > 6.0 or extent < 0.09:
             continue
         cx, cy = centroids[label]
-        component_mask = (labels == label).astype(np.uint8)
+        # Distance transform on the component's box plus a 1 px zero border, except where the box
+        # meets the crop edge: same result as on the whole crop, which is all zero around the
+        # component and treats its own edge as not background.
+        bx, by, bw, bh = (int(vv) for vv in stats[label, :4])
+        lab_h, lab_w = labels.shape
+        px0, py0 = int(bx > 0), int(by > 0)
+        px1, py1 = int(bx + bw < lab_w), int(by + bh < lab_h)
+        component_mask = np.zeros((bh + py0 + py1, bw + px0 + px1), dtype=np.uint8)
+        component_mask[py0:py0 + bh, px0:px0 + bw] = labels[by:by + bh, bx:bx + bw] == label
         distance = cv2.distanceTransform(component_mask, cv2.DIST_L2, 5)
         _min_value, interior_radius, _min_loc, interior_xy = cv2.minMaxLoc(distance)
-        interior_x, interior_y = interior_xy
+        interior_x, interior_y = interior_xy[0] - px0 + bx, interior_xy[1] - py0 + by
         components.append(
             {
                 "component_id": int(label),
