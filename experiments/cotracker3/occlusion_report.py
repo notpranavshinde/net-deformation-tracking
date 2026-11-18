@@ -16,9 +16,10 @@ while visible knots are snapped to the marker. Written to ``<result>/occlusion/`
 
 Reappearance gap: the distance from the model's guess on the last hidden frame to the snapped
 marker on the next frame (knots normally move a few px per frame; ``normal_step_px`` in the
-summary gives the scale). The snap only searches ``refine_radius`` px around the model's own
-estimate, so ``model_miss_px`` (model estimate vs snapped marker on the reappearance frame)
-cannot exceed it; stretches near that limit are flagged ``at_search_limit``.
+summary gives the scale). The snap only searches a square of +-``refine_radius`` px around the
+model's own estimate, so ``model_miss_px`` (model estimate vs snapped marker on the reappearance
+frame) is limited by it; stretches where either axis is near that limit are flagged
+``at_search_limit`` and may have missed by more.
 
 Runs by itself on the queue's run_cotracker_queue.py output; to backfill a result:
 
@@ -70,16 +71,18 @@ def stretches(t: pd.DataFrame, side: str, first_source: int, radius: float) -> l
                 j += 1
             back = j < len(vis)
             gap = miss = np.nan
+            limit = False
             if back and snapped[j]:
                 gap = float(np.hypot(u[j] - u[j - 1], v[j] - v[j - 1]))
                 miss = float(np.hypot(u[j] - uc[j], v[j] - vc[j]))
+                limit = max(abs(u[j] - uc[j]), abs(v[j] - vc[j])) >= 0.9 * radius
             rows.append({
                 "camera": side, "obj_id": int(oid), "row": int(oid) // GRID, "col": int(oid) % GRID,
                 "first_frame": int(f[i]), "last_frame": int(f[j - 1]), "n_frames": int(j - i),
                 "first_source_frame": first_source + int(f[i]), "last_source_frame": first_source + int(f[j - 1]),
                 "from_clip_start": bool(i == 0), "reappeared": bool(back),
                 "reappear_gap_px": gap, "model_miss_px": miss,
-                "at_search_limit": bool(np.isfinite(miss) and miss >= 0.9 * radius),
+                "at_search_limit": bool(limit),
             })
             i = j
     return rows
@@ -133,6 +136,7 @@ def write_report(result_dir: Path, tracks_dir: Path) -> Path:
             "hidden_pct_by_row": [round(100 * float(hidden[t.obj_id // GRID == r].mean()), 2) for r in range(GRID)],
             "knots_ever_hidden": int(t[hidden].obj_id.nunique()),
             "stretches": len(st),
+            "stretches_3plus_frames": int(sum(x["n_frames"] >= 3 for x in st)),
             "stretch_frames": stats([x["n_frames"] for x in st]),
             "reappear_gap_px": stats([x["reappear_gap_px"] for x in st]),
             "model_miss_px": stats([x["model_miss_px"] for x in st]),
